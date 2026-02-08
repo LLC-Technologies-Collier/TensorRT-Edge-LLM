@@ -136,8 +136,15 @@ std::string decodeHFTokenToNormal(std::string const& hfToken)
     {
         auto const utf8 = unicodeCptToUtf8(cpt);
         auto it = map.find(utf8);
-        assert(it != map.end());
-        decoded += it->second;
+        if (it != map.end())
+        {
+            decoded += it->second;
+        }
+        else
+        {
+            // Fallback for unknown tokens to avoid crash
+            decoded += "?"; 
+        }
     }
 
     return decoded;

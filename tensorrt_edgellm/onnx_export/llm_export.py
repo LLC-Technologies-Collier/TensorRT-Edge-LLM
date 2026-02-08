@@ -76,7 +76,8 @@ def save_d2t_for_eagle3_draft(draft_model: nn.Module, output_dir: str) -> None:
 
 def create_dummy_inputs(model: nn.Module, is_eagle_base: bool,
                         is_eagle_draft: bool,
-                        use_prompt_tuning: bool) -> Dict[str, Any]:
+                        use_prompt_tuning: bool,
+                        torch_dtype: torch.dtype = torch.float16) -> Dict[str, Any]:
     """
     Create dummy inputs for ONNX export.
     
@@ -96,7 +97,7 @@ def create_dummy_inputs(model: nn.Module, is_eagle_base: bool,
     image_token_len = 2
 
     print(
-        f"Creating dummy inputs with batch_size={batch_size}, seq_len={seq_len}, past_len={past_len}"
+        f"Creating dummy inputs with batch_size={batch_size}, seq_len={seq_len}, past_len={past_len}, dtype={torch_dtype}"
     )
 
     # Get model configuration
@@ -129,7 +130,7 @@ def create_dummy_inputs(model: nn.Module, is_eagle_base: bool,
                                      num_kv_heads,
                                      seq_len,
                                      head_dim,
-                                     dtype=torch.float16,
+                                     dtype=torch_dtype,
                                      device=device)
         past_key_values.append(past_key_value)
 
@@ -455,6 +456,7 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
 
 def export_llm_model(model_dir: str,
                      output_dir: str,
+                     dtype: str = "fp16",
                      device: str = "cuda",
                      is_eagle_base: bool = False,
                      reduced_vocab_dir: Optional[str] = None,
@@ -506,7 +508,8 @@ def export_llm_model(model_dir: str,
     dummy_inputs = create_dummy_inputs(model,
                                        is_eagle_base=is_eagle_base,
                                        is_eagle_draft=False,
-                                       use_prompt_tuning=use_prompt_tuning)
+                                       use_prompt_tuning=use_prompt_tuning,
+                                       torch_dtype=model.torch_dtype)
 
     # Export to ONNX
     export_model_to_onnx(model,
@@ -632,7 +635,8 @@ def export_draft_model(draft_model_dir: str,
         draft_model,
         is_eagle_base=False,
         is_eagle_draft=True,
-        use_prompt_tuning=use_prompt_tuning)
+        use_prompt_tuning=use_prompt_tuning,
+        torch_dtype=draft_model.torch_dtype)
     export_model_to_onnx(draft_model,
                          draft_dummy_inputs,
                          output_dir,

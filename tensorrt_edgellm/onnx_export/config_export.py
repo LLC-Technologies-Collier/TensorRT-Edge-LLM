@@ -34,7 +34,7 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
 
     # Handle LongRoPE (rope_scaling already validated in required_fields)
     rope_scaling = config_dict["rope_scaling"]
-    if rope_scaling and rope_scaling.get("type", None) == "longrope":
+    if rope_scaling and (rope_scaling.get("type", None) == "longrope" or rope_scaling.get("rope_type", None) == "longrope"):
         if "original_max_position_embeddings" not in config_dict:
             raise KeyError(
                 f"Required field 'original_max_position_embeddings' not found in config"
@@ -45,6 +45,8 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     # Handle head_dim
     if "head_dim" in config_dict:
         llm_config["head_dim"] = config_dict["head_dim"]
+    elif "head_size" in config_dict:
+        llm_config["head_dim"] = config_dict["head_size"]
     else:
         print(
             "Warning: head_dim not found in config, calculating as hidden_size // num_attention_heads"
@@ -79,6 +81,8 @@ def _export_eagle_base_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     # Handle head_dim
     if "head_dim" in config_dict:
         eagle_config["head_dim"] = config_dict["head_dim"]
+    elif "head_size" in config_dict:
+        eagle_config["head_dim"] = config_dict["head_size"]
     else:
         print(
             "Warning: head_dim not found in config, calculating as hidden_size // num_attention_heads"
@@ -112,6 +116,8 @@ def _export_eagle_draft_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     # Handle head_dim
     if "head_dim" in config_dict:
         draft_config["head_dim"] = config_dict["head_dim"]
+    elif "head_size" in config_dict:
+        draft_config["head_dim"] = config_dict["head_size"]
     else:
         print(
             "Warning: head_dim not found in config, calculating as hidden_size // num_attention_heads"

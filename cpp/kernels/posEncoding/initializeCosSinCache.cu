@@ -87,6 +87,7 @@ void initializeNormalRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, f
     {
     case 64: kernelPtr = (void*) initializeNormalRopeCosSinKernel<64>; break;
     case 128: kernelPtr = (void*) initializeNormalRopeCosSinKernel<128>; break;
+    case 256: kernelPtr = (void*) initializeNormalRopeCosSinKernel<256>; break;
     default:
         throw std::runtime_error(
             "Un-implemented rotaryDim for initializeNormalRopeCosSin: " + std::to_string(rotaryDim));

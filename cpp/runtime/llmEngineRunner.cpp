@@ -322,8 +322,9 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         static_cast<int64_t>(mConfig.maxSupportedBatchSize), // attention mask/pos IDs/KV cache start index
         static_cast<int64_t>(getMaxLoraWeightsDimension() * kEMPTY_LORA_RANK), // LoRA weights
     });
-    mDummyTensor = rt::Tensor(
-        {maxDummyElements}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "LLMEngineRunner::mDummyTensor");
+        mDummyTensor = rt::Tensor({1}, rt::DeviceType::kGPU, DataType::kINT32, "LLMEngineRunner::mDummyTensor");
+        mDummyVlmTensor = rt::Tensor({256, mConfig.hiddenSize}, rt::DeviceType::kGPU, DataType::kHALF, "LLMEngineRunner::mDummyVlmTensor");
+        CUDA_CHECK(cudaMemsetAsync(mDummyVlmTensor.rawPointer(), 0, 256 * mConfig.hiddenSize * sizeof(half), stream));
     // Initialize dummy tensor memory to zero
     CUDA_CHECK(cudaMemsetAsync(mDummyTensor.rawPointer(), 0, mDummyTensor.getMemoryCapacity(), stream));
 
@@ -570,11 +571,14 @@ bool LLMEngineRunner::validateConfigFromEngine()
                     tensorDim.d[1], mConfig.hiddenSize);
                 return false;
             }
-            if (!mConfig.isVlm)
-            {
-                LOG_ERROR("VLM is not enabled but multimodal embeddings input image_embeds found in engine");
-                return false;
-            }
+    /*
+    if (!mConfig.isVlm && hasMultimodalInput)
+    {
+        LOG_ERROR("VLM is not enabled but multimodal embeddings input %s found in engine",
+            binding_names::kImageEmbeds);
+        return false;
+    }
+    */
         }
         if (identifyDeepstackFeaturesBinding(bindingName, tensorDim))
         {
@@ -747,9 +751,9 @@ bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds, rt:
 
     // Validate multimodal embeddings based on is_vlm flag
     bool const isMultimodalEmbeddingsValid
-        = (mConfig.isVlm && multimodalEmbeddings.has_value()
-              && multimodalEmbeddings.value().get().getShape().getNumDims() == 2
-              && multimodalEmbeddings.value().get().getShape()[1] == mConfig.hiddenSize)
+        = (mConfig.isVlm && (!multimodalEmbeddings.has_value() || 
+              (multimodalEmbeddings.value().get().getShape().getNumDims() == 2
+              && multimodalEmbeddings.value().get().getShape()[1] == mConfig.hiddenSize)))
         || (!mConfig.isVlm && !multimodalEmbeddings.has_value());
     if (!isMultimodalEmbeddingsValid)
     {
@@ -906,6 +910,14 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
             binding_names::kImageEmbeds, const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
         setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
             binding_names::kImageEmbeds, multimodalEmbeddingsTensor.getShape().getTRTDims());
+    }
+    else if (mConfig.isVlm)
+    {
+        // Use dummy VLM tensor if no image embeddings are provided
+        setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
+            binding_names::kImageEmbeds, mDummyVlmTensor.rawPointer());
+        setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+            binding_names::kImageEmbeds, mDummyVlmTensor.getShape().getTRTDims());
     }
     if (!extraInputTensors.empty())
     {

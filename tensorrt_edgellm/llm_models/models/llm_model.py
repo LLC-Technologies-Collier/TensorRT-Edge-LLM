@@ -72,7 +72,15 @@ class EdgeLLMModel(nn.Module):
         # Copy all the basic attributes
         self.config = hf_model.config
         self.padding_idx = self.config.pad_token_id
-        self.vocab_size = self.config.vocab_size
+        
+        # Handle vocab_size for multimodal models (e.g. Gemma 3)
+        if hasattr(self.config, "vocab_size"):
+            self.vocab_size = self.config.vocab_size
+        elif hasattr(self.config, "text_config") and hasattr(self.config.text_config, "vocab_size"):
+            self.vocab_size = self.config.text_config.vocab_size
+        else:
+            self.vocab_size = self.config.vocab_size
+            
         self.is_eagle_base = is_eagle_base
         self.use_prompt_tuning = use_prompt_tuning
 

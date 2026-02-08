@@ -391,7 +391,8 @@ bool LLMInferenceRuntime::handleRequest(
     SamplingParams params(
         activeBatchSize, mEngineConfig.outputVocabSize, request.temperature, request.topK, request.topP);
     auto sampleTokens = [&]() {
-        trt_edgellm::topKtopPSamplingFromLogits(mOutputLogits, mSelectedIndices, params, mSamplingWorkspace, stream);
+        trt_edgellm::topKtopPSamplingFromLogits(
+            mOutputLogits, mSelectedIndices, params, mSamplingWorkspace, stream, request.randomSeed, generationIter);
         // Apply vocabulary mapping if reduced vocabulary is used
         if (mEngineConfig.reducedVocabSize > 0)
         {

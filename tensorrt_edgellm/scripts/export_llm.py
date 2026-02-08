@@ -56,6 +56,12 @@ def main() -> None:
                         required=True,
                         help="Path to save the exported ONNX model")
     parser.add_argument(
+        "--dtype",
+        type=str,
+        default="fp16",
+        choices=["fp16", "bf16"],
+        help="Data type to use for the model (fp16 or bf16).")
+    parser.add_argument(
         "--device",
         type=str,
         required=False,
@@ -91,6 +97,7 @@ def main() -> None:
         # Export model(s)
         export_llm_model(model_dir=args.model_dir,
                          output_dir=args.output_dir,
+                         dtype=args.dtype,
                          device=args.device,
                          is_eagle_base=args.is_eagle_base,
                          reduced_vocab_dir=args.reduced_vocab_dir,

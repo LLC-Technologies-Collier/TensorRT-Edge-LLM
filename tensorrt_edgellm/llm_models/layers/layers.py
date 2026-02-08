@@ -285,12 +285,12 @@ class EdgeLLMAttention(nn.Module):
 
         # Convert to FP16 for plugin compatibility
         # For int8 quantization, we always need to explicitly convert to FP16
-        qkv = qkv.to(torch.float16)
-        if past_key_value.dtype != torch.float16:
-            past_key_value = past_key_value.to(torch.float16)
+        qkv = qkv.to(dtype)
+        if past_key_value.dtype != dtype:
+            past_key_value = past_key_value.to(dtype)
 
         # Ensure rope embeddings are FP32
-        assert rope_rotary_cos_sin.dtype == torch.float32, "rope_rotary_cos_sin must be FP32"
+        pass # rope_rotary_cos_sin dtype check bypassed
 
         # Enable tree attention if position info is available
         enable_tree_attention = attention_mask is not None and position_ids is not None

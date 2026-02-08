@@ -232,6 +232,9 @@ private:
     //! does not support nullptr for input bindings.
     rt::Tensor mDummyTensor{};
 
+    //! Dummy tensor used for VLM engines when no images are provided.
+    rt::Tensor mDummyVlmTensor{};
+
     //! The eagle base position ids tensor within the sequence that used by positional encoding.
     rt::Tensor mEagleBasePositionIds{};
 
