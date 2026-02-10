@@ -279,6 +279,48 @@ bool LLMBuilder::build()
         return false;
     }
 
+    // Setup Timing Cache and Progress Monitor
+    std::filesystem::path cachePath = mEngineDir / "timing.cache";
+    std::unique_ptr<nvinfer1::ITimingCache> timingCache;
+    std::vector<char> cacheData;
+
+    if (std::filesystem::exists(cachePath))
+    {
+        LOG_INFO("Loading timing cache from %s", cachePath.string().c_str());
+        std::ifstream cacheFile(cachePath, std::ios::binary | std::ios::ate);
+        if (cacheFile)
+        {
+            std::streamsize size = cacheFile.tellg();
+            cacheFile.seekg(0, std::ios::beg);
+            cacheData.resize(size);
+            if (cacheFile.read(cacheData.data(), size))
+            {
+                timingCache.reset(config->createTimingCache(cacheData.data(), size));
+            }
+        }
+    }
+    
+    // If cache creation failed or file didn't exist, create empty cache
+    if (!timingCache)
+    {
+        LOG_INFO("Creating new timing cache");
+        timingCache.reset(config->createTimingCache(nullptr, 0));
+    }
+
+    if (timingCache)
+    {
+        config->setTimingCache(*timingCache, false);
+        
+        // Create monitor that saves cache every 10 seconds
+        static BuildProgressMonitor monitor(timingCache.get(), cachePath, std::chrono::seconds(10));
+        config->setProgressMonitor(&monitor);
+        LOG_INFO("Progress monitor attached. Timing cache will be saved to %s every 10 seconds.", cachePath.string().c_str());
+    }
+    else
+    {
+        LOG_WARNING("Failed to create timing cache. Build will not be resumable.");
+    }
+
     // Setup optimization profiles
     if (!setupLLMOptimizationProfiles(builder.get(), config.get(), network.get()))
     {

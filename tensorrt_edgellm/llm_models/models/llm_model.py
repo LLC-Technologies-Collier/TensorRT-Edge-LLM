@@ -78,8 +78,8 @@ class EdgeLLMModel(nn.Module):
 
         # Replace decoder layers with our custom ones
         self.layers = nn.ModuleList([
-            EdgeLLMDecoderLayer(hf_layer, self.torch_dtype, eagle3_draft=False)
-            for hf_layer in hf_model.layers
+            EdgeLLMDecoderLayer(hf_layer, index=i, torch_dtype=self.torch_dtype, eagle3_draft=False)
+            for i, hf_layer in enumerate(hf_model.layers)
         ])
 
         # Set max_position_embeddings on attention modules from the model's config

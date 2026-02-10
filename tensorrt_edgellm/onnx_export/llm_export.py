@@ -103,6 +103,8 @@ def save_embedding_table(base_model: nn.Module, output_dir: str) -> None:
 def create_dummy_inputs(model: nn.Module,
                         is_eagle_base: bool,
                         is_eagle_draft: bool,
+                        use_prompt_tuning: bool,
+                        torch_dtype: torch.dtype = torch.float16,
                         fp8_kv_cache: bool = False) -> Dict[str, Any]:
     """
     Create dummy inputs for ONNX export.
@@ -152,13 +154,13 @@ def create_dummy_inputs(model: nn.Module,
     # Create dummy past key values
     past_key_values = []
     for _ in range(num_layers):
-        # Only FP16 KV Cache is supported for now. More precision will be supported in the future.
+        # Only FP16/BF16 KV Cache is supported.
         past_key_value = torch.randn(batch_size,
                                      2,
                                      num_kv_heads,
                                      seq_len,
                                      head_dim,
-                                     dtype=torch.float16,
+                                     dtype=torch_dtype,
                                      device=device)
         if fp8_kv_cache:
             past_key_value = past_key_value.to(torch.float8_e4m3fn)
@@ -207,13 +209,22 @@ def create_dummy_inputs(model: nn.Module,
                                 device=device)
     base_inputs['inputs_embeds'] = inputs_embeds
 
+    # Create image_embeds for all models (needed for ONNX export alignment)
+    if use_prompt_tuning:
+        image_token_len = 1 # Dummy value
+        image_embeds = torch.randn(image_token_len,
+                                   hidden_size,
+                                   dtype=torch_dtype,
+                                   device=device)
+        base_inputs['image_embeds'] = image_embeds
+
     # For Qwen3VL and Qwen3OmniThinker, add deepstack visual embeds
     if model_config.model_type in ["qwen3_vl_text", "qwen3_omni_text"]:
         deepstack_visual_embeds = [
             torch.randn(batch_size,
                         seq_len,
                         hidden_size,
-                        dtype=torch.float16,
+                        dtype=torch_dtype,
                         device=device) for _ in range(3)
         ]
         base_inputs['deepstack_visual_embeds'] = deepstack_visual_embeds
@@ -456,6 +467,7 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
 
 def export_llm_model(model_dir: str,
                      output_dir: str,
+                     dtype: str = "fp16",
                      device: str = "cuda",
                      is_eagle_base: bool = False,
                      reduced_vocab_dir: Optional[str] = None,
@@ -497,7 +509,7 @@ def export_llm_model(model_dir: str,
     # Load model
     model, tokenizer, processor = load_llm_model(
         model_dir,
-        dtype='fp16',
+        dtype=dtype,
         device=device,
         is_eagle_base=is_eagle_base,
         reduced_vocab_size=reduced_vocab_size,
@@ -509,6 +521,8 @@ def export_llm_model(model_dir: str,
     dummy_inputs = create_dummy_inputs(model,
                                        is_eagle_base=is_eagle_base,
                                        is_eagle_draft=False,
+                                       use_prompt_tuning=use_prompt_tuning,
+                                       torch_dtype=model.torch_dtype,
                                        fp8_kv_cache=fp8_kv_cache)
 
     # Export to ONNX
@@ -632,9 +646,12 @@ def export_draft_model(draft_model_dir: str,
 
     # Export draft model
     print(f"Exporting draft model to {output_dir}")
-    draft_dummy_inputs = create_dummy_inputs(draft_model,
-                                             is_eagle_base=False,
-                                             is_eagle_draft=True)
+    draft_dummy_inputs = create_dummy_inputs(
+        draft_model,
+        is_eagle_base=False,
+        is_eagle_draft=True,
+        use_prompt_tuning=use_prompt_tuning,
+        torch_dtype=draft_model.torch_dtype)
     export_model_to_onnx(draft_model,
                          draft_dummy_inputs,
                          output_dir,

@@ -153,7 +153,7 @@ onnx.defs.register_schema(attention_plugin_schema)
 @symbolic_helper.parse_args("v", "v", "v", "v", "v", "i", "i", "b", "i", "b",
                             "v", "v", "v")
 def symbolic_attention_plugin(
-    g: torch.onnx._internal.torchscript_exporter.jit_utils.GraphContext,
+    g: torch.onnx._internal.jit_utils.GraphContext,
     qkv: torch._C.Value,
     past_key_value: torch._C.Value,
     context_lengths: torch._C.Value,
@@ -282,8 +282,8 @@ def attention_plugin(
     assert past_key_value.shape[
         4] == head_size, f"head_size of kv_cache {past_key_value.shape[4]} should be equal to head_size of qkv {head_size}"
 
-    assert qkv.dtype == torch.float16, f"qkv {qkv.dtype} should be in float16"
-    assert past_key_value.dtype == torch.float16 or past_key_value.dtype == torch.float8_e4m3fn, f"past_key_value {past_key_value.dtype} should be in float16, float8_e4m3fn"
+    assert qkv.dtype in [torch.float16, torch.bfloat16], f"qkv {qkv.dtype} should be in float16 or bfloat16"
+    assert past_key_value.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn], f"past_key_value {past_key_value.dtype} should be in float16, bfloat16, or float8_e4m3fn"
 
     # Dummy implementation for ONNX export, this is not used in the actual inference
     attn_output = torch.zeros(batch_size,
