@@ -335,7 +335,7 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
 
     bool const isSm8x = (smVersion == fmha_v2::kSM_80 || smVersion == fmha_v2::kSM_86 || smVersion == fmha_v2::kSM_87
         || smVersion == fmha_v2::kSM_89);
-    bool const isSm10x = (smVersion == fmha_v2::kSM_100 || smVersion == fmha_v2::kSM_101);
+    bool const isSm10x = (smVersion == fmha_v2::kSM_100 || smVersion == fmha_v2::kSM_101 || smVersion == 110);
     bool const isSm12x = (smVersion == fmha_v2::kSM_120 || smVersion == fmha_v2::kSM_121);
     check::check((isSm8x || isSm10x || isSm12x), "Other SMs are not supported by context FMHA-v2 kernels");
     // Handle kernel selection under different context.
@@ -410,7 +410,7 @@ void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params)
 bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t sm, nvinfer1::DataType dataType)
 {
     bool const checkType = dataType == DataType::kHALF;
-    bool const checkHeadSize = headSize == 128 || headSize == 64;
+    bool const checkHeadSize = headSize == 128 || headSize == 64 || headSize == 256;
 
     return checkType && checkHeadSize;
 }

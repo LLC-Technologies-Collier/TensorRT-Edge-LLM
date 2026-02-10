@@ -17,9 +17,11 @@
 
 #pragma once
 
+#include <iostream>
 #include "multimodal/modelTypes.h"
 #include <NvInfer.h>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -32,6 +34,85 @@ namespace trt_edgellm
 
 namespace builder
 {
+
+/*!
+ * @brief Custom Progress Monitor that periodically saves the timing cache
+ */
+class BuildProgressMonitor : public nvinfer1::IProgressMonitor
+{
+public:
+    BuildProgressMonitor(nvinfer1::ITimingCache* cache, std::filesystem::path const& cachePath,
+        std::chrono::seconds saveInterval = std::chrono::seconds(10))
+        : mCache(cache)
+        , mCachePath(cachePath)
+        , mSaveInterval(saveInterval)
+        , mLastSaveTime(std::chrono::steady_clock::now())
+    {
+    }
+
+    void phaseStart(char const* phaseName, char const* parentPhase, int32_t nbSteps) noexcept override
+    {
+        // No-op
+    }
+
+    void phaseFinish(char const* phaseName) noexcept override
+    {
+        checkAndSave();
+    }
+
+    bool stepComplete(char const* phaseName, int32_t step) noexcept override
+    {
+        checkAndSave();
+        return true;
+    }
+
+private:
+    void checkAndSave() noexcept
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (now - mLastSaveTime >= mSaveInterval)
+        {
+            saveCache();
+            mLastSaveTime = now;
+        }
+    }
+
+    void saveCache() noexcept
+    {
+        if (mCache && !mCachePath.empty())
+        {
+            try
+            {
+                auto blob = std::unique_ptr<nvinfer1::IHostMemory>(mCache->serialize());
+                if (blob)
+                {
+                    auto tmpPath = mCachePath;
+                    tmpPath += ".tmp";
+                    {
+                        std::ofstream cacheFile(tmpPath, std::ios::binary);
+                        if (cacheFile)
+                        {
+                            cacheFile.write(static_cast<char*>(blob->data()), blob->size());
+                            cacheFile.flush();
+                            cacheFile.close();
+                        }
+                    }
+                    std::filesystem::rename(tmpPath, mCachePath);
+                    std::cout << "[BuildProgressMonitor] Timing cache flushed to " << mCachePath << std::endl;
+                }
+            }
+            catch (...)
+            {
+                // Suppress exceptions in noexcept
+            }
+        }
+    }
+
+    nvinfer1::ITimingCache* mCache;
+    std::filesystem::path mCachePath;
+    std::chrono::seconds mSaveInterval;
+    std::chrono::steady_clock::time_point mLastSaveTime;
+};
 
 //! Configuration structure for LLM model building.
 //! Contains all parameters needed to configure the TensorRT engine building process
