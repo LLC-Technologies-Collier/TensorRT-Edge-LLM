@@ -244,6 +244,9 @@ private:
     //! runtime design clean, we will route unused output tensors to this dummy tensor.
     rt::Tensor mDummyOutputTensor{};
 
+    //! Dummy tensor used for VLM engines when no images are provided.
+    rt::Tensor mDummyVlmTensor{};
+
     //! The eagle base position ids tensor within the sequence that used by positional encoding.
     rt::Tensor mEagleBasePositionIds{};
 

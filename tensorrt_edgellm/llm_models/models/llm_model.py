@@ -30,7 +30,8 @@ import torch
 from torch import nn
 
 from ..layers.gather_nd import custom_gather_nd
-from ..layers.layers import EdgeLLMDecoderLayer
+from ..layers.layers import (EdgeLLMDecoderLayer, PromptTuningEmbedding,
+                             Qwen3VLDeepStackProcess)
 from ..layers.reduced_lm_head import reduce_lm_head
 
 
@@ -56,20 +57,32 @@ class EdgeLLMModel(nn.Module):
 
     def __init__(self,
                  hf_model: nn.Module,
-                 is_eagle_base: bool = False) -> None:
+                 is_eagle_base: bool = False,
+                 use_prompt_tuning: bool = False) -> None:
         """
         Initialize the EdgeLLM model.
         
         Args:
             hf_model: The original model (LlamaForCausalLM, Qwen2ForCausalLM, etc.)
             is_eagle_base: Whether this is an EAGLE3 base model
+            use_prompt_tuning: Whether to enable prompt tuning support
         """
         super().__init__()
 
         # Copy all the basic attributes
         self.config = hf_model.config
-        self.vocab_size = self.config.vocab_size
+        self.padding_idx = self.config.pad_token_id
+        
+        # Handle vocab_size for multimodal models (e.g. Gemma 3)
+        if hasattr(self.config, "vocab_size"):
+            self.vocab_size = self.config.vocab_size
+        elif hasattr(self.config, "text_config") and hasattr(self.config.text_config, "vocab_size"):
+            self.vocab_size = self.config.text_config.vocab_size
+        else:
+            self.vocab_size = self.config.vocab_size
+            
         self.is_eagle_base = is_eagle_base
+        self.use_prompt_tuning = use_prompt_tuning
 
         # Keep all the original components
         self.torch_dtype = hf_model.dtype
@@ -78,8 +91,8 @@ class EdgeLLMModel(nn.Module):
 
         # Replace decoder layers with our custom ones
         self.layers = nn.ModuleList([
-            EdgeLLMDecoderLayer(hf_layer, index=i, torch_dtype=self.torch_dtype, eagle3_draft=False)
-            for i, hf_layer in enumerate(hf_model.layers)
+            EdgeLLMDecoderLayer(hf_layer, self.torch_dtype, eagle3_draft=False)
+            for hf_layer in hf_model.layers
         ])
 
         # Set max_position_embeddings on attention modules from the model's config
@@ -93,13 +106,15 @@ class EdgeLLMModel(nn.Module):
 
     def forward(
         self,
-        inputs_embeds: torch.Tensor,
         past_key_values: Tuple[torch.FloatTensor, ...],
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        image_embeds: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
         output_hidden_states: bool = False,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], Optional[Tuple[
@@ -108,19 +123,35 @@ class EdgeLLMModel(nn.Module):
         Forward pass of the EdgeLLM model.
         
         Args:
-            inputs_embeds: Input embeddings (batch_size, seq_len, hidden_size)
-            past_key_values: Past KV cache, list of (batch_size, 2, num_kv_heads, max_position_embeddings, head_dim)
-            rope_rotary_cos_sin: RoPE embeddings (batch_size, seq_len, head_dim)
-            context_lengths: Current position in cache (batch_size,)
-            kvcache_start_index: Start index of KV cache (batch_size,)
-            position_ids: Position IDs (batch_size, seq_len), optional
-            attention_mask: Attention mask (batch_size, seq_len, seq_len + past_len), optional
-            deepstack_visual_embeds: Deepstack visual embeddings for Qwen3VL, list of 3 tensors, each (batch_size, seq_len, hidden_size), optional
+            past_key_values: Past key-value cache for efficient decoding
+                           List of tensors, each with shape (batch_size, 2, num_kv_heads, max_position_embeddings, head_dim)
+            rope_rotary_cos_sin: RoPE rotary embeddings, shape (batch_size, seq_len, rotary_dim)
+            context_lengths: Context length tensor indicating current position in cache, shape (batch_size,)
+            kvcache_start_index: Start index of KV cache of shape (kv_cache_start_batch_size, 1), required
+            position_ids: Position IDs for positional encoding, shape (batch_size, seq_len), optional
+            attention_mask: Attention mask for the decoder layers, shape (batch_size, seq_len, seq_len + past_len), optional
+            input_ids: Input token IDs of shape (batch_size, seq_len), optional (used for standard models and prompt tuning)
+            image_embeds: Image embeddings tensor of shape (image_token_len, hidden_size), optional (used with prompt tuning)
+            inputs_embeds: Input embeddings tensor of shape (batch_size, seq_len, hidden_size), optional (legacy support)
+            deepstack_visual_embeds: List of deepstack visual embeddings tensors, each with shape (visual_seqlen, hidden_size), optional (used with deepstack processing)
             output_hidden_states: Whether to output hidden states from all layers
             
         Returns:
-            (hidden_states, present_key_values, all_hidden_states)
+            Tuple[torch.Tensor, Tuple[torch.Tensor, ...], Optional[Tuple[torch.Tensor, ...]]]: (hidden_states, present_key_values, all_hidden_states)
+                - hidden_states: Final hidden states, shape (batch_size, seq_len, hidden_size)
+                - present_key_values: Updated key-value cache, tuple of tensors
+                - all_hidden_states: Hidden states from all layers (if output_hidden_states=True), tuple of tensors
         """
+
+        # Handle input embeddings
+        if inputs_embeds is None:
+            if self.use_prompt_tuning:
+                # For prompt tuning models, use prompt_tuning_embedding
+                inputs_embeds = PromptTuningEmbedding(self.embed_tokens)(
+                    input_ids, image_embeds)
+            else:
+                # For standard models, use embed_tokens
+                inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
         present_key_values = ()
@@ -150,10 +181,13 @@ class EdgeLLMModel(nn.Module):
             # Apply deepstack processing for Qwen3VL and Qwen3OmniThinker
             if deepstack_visual_embeds is not None and idx in range(
                     len(deepstack_visual_embeds)):
-                assert self.config.model_type in [
-                    "qwen3_vl_text", "qwen3_omni_text"
-                ], "Qwen3VLTextModel or Qwen3OmniTextModel is required for deepstack processing"
-                hidden_states = hidden_states + deepstack_visual_embeds[idx]
+                assert self.config.model_type == "qwen3_vl_text", "Qwen3VLTextModel is required for deepstack processing"
+                hidden_states = Qwen3VLDeepStackProcess(
+                    self.embed_tokens.num_embeddings)(
+                        input_ids,
+                        hidden_states,
+                        deepstack_visual_embeds[idx],
+                    )
 
         # Apply final normalization
         hidden_states = self.norm(hidden_states)
@@ -182,6 +216,7 @@ class EdgeLLMModelForCausalLM(nn.Module):
     def __init__(self,
                  hf_model: nn.Module,
                  is_eagle_base: bool = False,
+                 use_prompt_tuning: bool = False,
                  reduced_vocab_size: Optional[int] = None,
                  vocab_map: Optional[torch.Tensor] = None) -> None:
         """
@@ -190,26 +225,30 @@ class EdgeLLMModelForCausalLM(nn.Module):
         Args:
             hf_model: The original model (LlamaForCausalLM, Qwen2ForCausalLM, etc.)
             is_eagle_base: Whether this is an EAGLE3 base model
+            use_prompt_tuning: Whether to enable prompt tuning support
             reduced_vocab_size: Size of the reduced vocabulary (optional)
             vocab_map: Tensor of shape (reduced_vocab_size,) with int32 indices for vocabulary reduction (optional)
         """
         super().__init__()
 
-        # Auto-detect VLM models and extract language model
-        if hasattr(hf_model, 'language_model'):
-            # VLM model with language_model attribute
-            language_model = hf_model.language_model
-            self.config = hf_model.config.text_config
+        if use_prompt_tuning:
+            if hasattr(hf_model, 'language_model'):
+                language_model = hf_model.language_model
+                self.config = hf_model.config.text_config
+            else:
+                # Phi4MM uses the model.model attribute instead of language_model
+                language_model = hf_model.model
+                self.config = hf_model.config
             if hasattr(hf_model.config, "quantization_config"):
                 self.config.quantization_config = hf_model.config.quantization_config
         else:
-            # Standard model or Phi4MM (uses model.model attribute)
             language_model = hf_model.model
             self.config = hf_model.config
         self.torch_dtype = hf_model.dtype
 
         # Create EdgeLLMModel with the original model
-        self.model = EdgeLLMModel(language_model, is_eagle_base)
+        self.model = EdgeLLMModel(language_model, is_eagle_base,
+                                  use_prompt_tuning)
 
         # Handle lm_head with optional vocabulary reduction
         if reduced_vocab_size is not None and vocab_map is not None:

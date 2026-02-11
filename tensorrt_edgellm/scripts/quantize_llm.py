@@ -61,7 +61,7 @@ def main() -> None:
         help="Quantization method to use")
     parser.add_argument("--dtype",
                         type=str,
-                        choices=["fp16"],
+                        choices=["fp16", "bf16"],
                         required=False,
                         default="fp16",
                         help="Model data type for loading")

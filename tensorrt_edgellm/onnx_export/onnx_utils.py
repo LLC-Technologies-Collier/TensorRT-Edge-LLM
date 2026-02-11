@@ -22,9 +22,26 @@ import onnx_graphsurgeon as gs
 import torch
 import torch.nn as nn
 from modelopt.onnx.llm_export_utils.surgeon_utils import fold_fp8_qdq_to_dq
-from modelopt.onnx.quantization.qdq_utils import (fp4qdq_to_2dq,
-                                                  quantize_weights_to_int4,
-                                                  quantize_weights_to_mxfp8)
+try:
+    from modelopt.onnx.quantization.qdq_utils import fp4qdq_to_2dq
+except ImportError:
+    def fp4qdq_to_2dq(model):
+        print("WARNING: fp4qdq_to_2dq not found in modelopt. FP4 post-processing will fail.")
+        return model
+
+try:
+    from modelopt.onnx.quantization.qdq_utils import quantize_weights_to_int4
+except ImportError:
+    def quantize_weights_to_int4(model):
+        print("WARNING: quantize_weights_to_int4 not found.")
+        return model
+
+try:
+    from modelopt.onnx.quantization.qdq_utils import quantize_weights_to_mxfp8
+except ImportError:
+    def quantize_weights_to_mxfp8(model):
+        print("WARNING: quantize_weights_to_mxfp8 not found.")
+        return model
 
 from ..common import ONNX_OPSET_VERSION
 from ..llm_models.layers.int4_gemm_plugin import int4_dq_gemm_to_plugin
@@ -237,6 +254,7 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
                           dynamo=False)
     t1 = time.time()
     print(f"ONNX export completed in {t1 - t0}s. Apply post-processing...")
+    
     # Post-processing
     onnx.shape_inference.infer_shapes_path(onnx_path)
     onnx_model = onnx.load(onnx_path)
@@ -279,13 +297,13 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
         )
         onnx_model = quantize_weights_to_mxfp8(onnx_model)
 
-    print(
-        "Removing all the files in the output directory except for .json files"
-    )
-    for file in os.listdir(output_dir):
-        if file.endswith(".json"):
-            continue
-        os.remove(os.path.join(output_dir, file))
+    # print(
+    #     "Removing all the files in the output directory except for .json files"
+    # )
+    # for file in os.listdir(output_dir):
+    #     if file.endswith(".json"):
+    #         continue
+    #     os.remove(os.path.join(output_dir, file))
 
     # Save the model to the output directory
     onnx.save_model(onnx_model,

@@ -273,6 +273,24 @@ bool LLMBuilder::build()
 #if NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 6
     config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
 #endif
+
+    // Enable Weight Streaming to reduce GPU memory pressure
+    config->setFlag(nvinfer1::BuilderFlag::kWEIGHT_STREAMING);
+    // Enable Refit to allow building with dummy weights (saving host RAM) and refitting later
+    config->setFlag(nvinfer1::BuilderFlag::kREFIT);
+    LOG_INFO("Weight Streaming and Refit enabled.");
+
+    // Apply memory limits to prevent system-wide OOM on Jetson Thor
+    // With Weight Streaming active, we can safely use larger pools for better tactic selection
+    // WORKSPACE: 16GB (Power of 2) - GPU scratchpad for high-performance algorithms
+    // TACTIC_DRAM: 8GB (Power of 2) - Memory used for profiling/timing during build
+    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 16ULL << 30);
+    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kTACTIC_DRAM, 8ULL << 30);
+
+    // Disable external tactic sources (cuBLAS, cuDNN) to reduce memory footprint
+    config->setTacticSources(0);
+
+    LOG_INFO("Memory limits optimized: Workspace=16GB, TacticDRAM=8GB. External tactic sources disabled.");
     if (!config)
     {
         LOG_ERROR("Failed to create builder config.");
@@ -311,14 +329,14 @@ bool LLMBuilder::build()
     {
         config->setTimingCache(*timingCache, false);
         
-        // Create monitor that saves cache every 10 seconds
+        // Create monitor that saves cache every 10 seconds and guards memory
         static BuildProgressMonitor monitor(timingCache.get(), cachePath, std::chrono::seconds(10));
         config->setProgressMonitor(&monitor);
         LOG_INFO("Progress monitor attached. Timing cache will be saved to %s every 10 seconds.", cachePath.string().c_str());
     }
     else
     {
-        LOG_WARNING("Failed to create timing cache. Build will not be resumable.");
+        LOG_WARNING("Failed to create timing cache. Progress will not be saved.");
     }
 
     // Setup optimization profiles

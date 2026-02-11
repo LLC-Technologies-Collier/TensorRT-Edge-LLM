@@ -69,3 +69,13 @@ target_include_directories(NvInfer_edgellm_plugin
 target_link_libraries(NvInfer_edgellm_plugin commonLibraryExt edgellmKernels
                       ${CUDA_DRIVER_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)
+
+# Installation rules
+install(TARGETS edgellmKernels edgellmCore edgellmTokenizer edgellmBuilder NvInfer_edgellm_plugin
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+        RUNTIME DESTINATION bin)
+
+install(DIRECTORY builder common kernels multimodal profiler profiling runtime sampler tokenizer plugins
+        DESTINATION include
+        FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")

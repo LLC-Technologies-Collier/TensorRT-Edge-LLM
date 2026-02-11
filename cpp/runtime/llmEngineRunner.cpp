@@ -322,6 +322,12 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         static_cast<int64_t>(getMaxLoraWeightsDimension() * kEMPTY_LORA_RANK), // LoRA weights
     };
 
+    if (mConfig.isVlm)
+    {
+        mDummyVlmTensor = rt::Tensor({256, mConfig.hiddenSize}, rt::DeviceType::kGPU, DataType::kHALF, "LLMEngineRunner::mDummyVlmTensor");
+        CUDA_CHECK(cudaMemsetAsync(mDummyVlmTensor.rawPointer(), 0, 256 * mConfig.hiddenSize * sizeof(half), stream));
+    }
+
     // Add deepstack_embeds size for generation profile
     // Use maxVerifyTreeSize for eagle or 1 for vanilla decoding
     if (mConfig.numDeepstackFeatures > 0)
@@ -722,10 +728,9 @@ bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputsEmbeds,
         return false;
     }
 
-    // Validate deepstack embeds for Qwen3-VL (these are already embedded)
-    int32_t deepstackEmbedsCount = static_cast<int32_t>(deepstackEmbeds.size());
-    if ((deepstackEmbedsCount != mConfig.numDeepstackFeatures) && (deepstackEmbedsCount != 0))
-    {
+// Validate deepstack embeds for Qwen3-VL (these are already embedded)
+int32_t deepstackEmbedsCount = static_cast<int32_t>(deepstackEmbeds.size());
+if ((deepstackEmbedsCount != mConfig.numDeepstackFeatures) && (deepstackEmbedsCount != 0))    {
         LOG_ERROR("Invalid deepstack embeds count. Expected either %d or 0, got %d", mConfig.numDeepstackFeatures,
             deepstackEmbedsCount);
         return false;

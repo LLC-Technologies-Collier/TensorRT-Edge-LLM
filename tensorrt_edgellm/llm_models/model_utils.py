@@ -36,8 +36,38 @@ from transformers import (AutoConfig, AutoModelForCausalLM,
                           AutoTokenizer, PreTrainedModel)
 
 from .models.eagle3_draft import Eagle3DraftModel
+from .models.gemma_model import EdgeGemma3ModelForCausalLM
+from .models.nemotron_model import EdgeNemotronModelForCausalLM
 from .models.llm_model import EdgeLLMModelForCausalLM
 
+# --- PATCH START ---
+# Patch mamba_ssm rmsnorm_fn to bypass Triton JIT error on sm_110a
+try:
+    import mamba_ssm.ops.triton.layernorm_gated
+    print("Patching mamba_ssm rmsnorm_fn...")
+    
+    def naive_rmsnorm_fn(x, weight, bias=None, z=None, eps=1e-6, group_size=None, norm_before_gate=False, is_rms_norm=True):
+        dtype = x.dtype
+        x = x.float()
+        if z is not None:
+            z = z.float()
+            x = x * torch.nn.functional.silu(z) 
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + eps)
+        if weight is not None:
+            weight = weight.float()
+            x = x * weight
+        if bias is not None:
+            bias = bias.float()
+            x = x + bias
+        return x.to(dtype)
+
+    mamba_ssm.ops.triton.layernorm_gated.rmsnorm_fn = naive_rmsnorm_fn
+except ImportError:
+    pass
+except Exception as e:
+    print(f"Failed to patch mamba_ssm: {e}")
+# --- PATCH END ---
 
 def is_nvfp4_linear(module: nn.Module) -> bool:
     """Check if the module is a quantized linear layer with NVFP4 quantization. The test is designed for identification purpose only, not designed to be comprehensive.
@@ -132,6 +162,16 @@ def _is_qwen3_omni_model(model_dir: str) -> bool:
     """Check if the model is a Qwen3 Omni model by checking config.json for model_type."""
     cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     return getattr(cfg, "model_type", None) == "qwen3_omni"
+
+
+def _is_gemma_model(dir_path: str) -> bool:
+    """Check if the model is a Gemma model."""
+    return _check_model_type(dir_path, "gemma")
+
+
+def _is_nemotron_model(dir_path: str) -> bool:
+    """Check if the model is a Nemotron model."""
+    return _check_model_type(dir_path, "nemotron")
 
 
 # Models that require explicit chat template because auto-extraction fails
@@ -355,7 +395,7 @@ def load_llm_model(
     is_eagle_base: bool,
     reduced_vocab_size: Optional[int] = None,
     vocab_map: Optional[torch.Tensor] = None
-) -> tuple[nn.Module, AutoTokenizer, Optional[AutoProcessor]]:
+) -> tuple[nn.Module, bool, AutoTokenizer, Optional[AutoProcessor]]:
     """
     Load a language model (standard or EAGLE base).
     
@@ -368,7 +408,7 @@ def load_llm_model(
         vocab_map: Tensor of shape (reduced_vocab_size,) with int32 indices for vocabulary reduction (optional)
         
     Returns:
-        tuple: (model, tokenizer, processor)
+        tuple: (model, use_prompt_tuning, tokenizer, processor)
         processor will be None if AutoProcessor cannot be loaded from the model directory
     """
     # Determine model type and print message
@@ -378,22 +418,33 @@ def load_llm_model(
         print(f"Loading standard model from {model_dir}")
 
     model, tokenizer, processor = load_hf_model(model_dir, dtype, device)
+    use_prompt_tuning = is_vlm(model_dir)
     set_dynamic_quant(model, dtype)
 
     # Create EdgeLLMModelForCausalLM wrapper.
-    if _is_qwen3_omni_model(model_dir):
+    if _is_gemma_model(model_dir):
+        edge_model = EdgeGemma3ModelForCausalLM(model, is_eagle_base,
+                                             use_prompt_tuning, reduced_vocab_size,
+                                             vocab_map)
+    elif _is_nemotron_model(model_dir):
+        edge_model = EdgeNemotronModelForCausalLM(model, is_eagle_base,
+                                             use_prompt_tuning, reduced_vocab_size,
+                                             vocab_map)
+    elif _is_qwen3_omni_model(model_dir):
         edge_model = EdgeLLMModelForCausalLM(model.thinker, is_eagle_base,
-                                             reduced_vocab_size, vocab_map)
+                                             use_prompt_tuning, reduced_vocab_size,
+                                             vocab_map)
     else:
         edge_model = EdgeLLMModelForCausalLM(model, is_eagle_base,
-                                             reduced_vocab_size, vocab_map)
+                                             use_prompt_tuning, reduced_vocab_size,
+                                             vocab_map)
 
     del model
     gc.collect()
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-    return edge_model, tokenizer, processor
+    return edge_model, use_prompt_tuning, tokenizer, processor
 
 
 def load_eagle3_draft_model(draft_model_dir: str, base_model_dir: str,
@@ -414,8 +465,6 @@ def load_eagle3_draft_model(draft_model_dir: str, base_model_dir: str,
     # Convert dtype string to torch dtype
     if dtype == "fp16":
         torch_dtype = torch.float16
-    elif dtype == "bf16":
-        torch_dtype = torch.bfloat16
     else:
         raise ValueError(f"Unsupported dtype: {dtype}")
 
