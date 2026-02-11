@@ -97,7 +97,7 @@ def create_dummy_inputs(model: nn.Module, is_eagle_base: bool,
     image_token_len = 2
 
     print(
-        f"Creating dummy inputs with batch_size={batch_size}, seq_len={seq_len}, past_len={past_len}"
+        f"Creating dummy inputs with batch_size={batch_size}, seq_len={seq_len}, past_len={past_len}, dtype={torch_dtype}"
     )
 
     # Get model configuration
@@ -124,7 +124,7 @@ def create_dummy_inputs(model: nn.Module, is_eagle_base: bool,
     # Create dummy past key values
     past_key_values = []
     for _ in range(num_layers):
-        # Only FP16/BF16 KV Cache is supported.
+        # Only FP16 KV Cache is supported for now. More precision will be supported in the future.
         past_key_value = torch.randn(batch_size,
                                      2,
                                      num_kv_heads,
@@ -180,7 +180,7 @@ def create_dummy_inputs(model: nn.Module, is_eagle_base: bool,
     if use_prompt_tuning:
         image_embeds = torch.randn(image_token_len,
                                    hidden_size,
-                                   dtype=torch_dtype,
+                                   dtype=torch.float16,
                                    device=device)
         base_inputs['image_embeds'] = image_embeds
 
@@ -188,7 +188,7 @@ def create_dummy_inputs(model: nn.Module, is_eagle_base: bool,
         deepstack_visual_embeds = [
             torch.randn(image_token_len,
                         hidden_size,
-                        dtype=torch_dtype,
+                        dtype=torch.float16,
                         device=device) for _ in range(3)
         ]
         base_inputs['deepstack_visual_embeds'] = deepstack_visual_embeds
@@ -496,7 +496,7 @@ def export_llm_model(model_dir: str,
     # Load model
     model, use_prompt_tuning, tokenizer, processor = load_llm_model(
         model_dir,
-        dtype=dtype,
+        dtype='fp16',
         device=device,
         is_eagle_base=is_eagle_base,
         reduced_vocab_size=reduced_vocab_size,

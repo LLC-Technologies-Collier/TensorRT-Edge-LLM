@@ -18,10 +18,12 @@
 #pragma once
 
 #include <iostream>
+#include <fstream>
+#include <malloc.h>
+#include <cuda_runtime.h>
 #include "multimodal/modelTypes.h"
 #include <NvInfer.h>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -36,7 +38,7 @@ namespace builder
 {
 
 /*!
- * @brief Custom Progress Monitor that periodically saves the timing cache
+ * @brief Custom Progress Monitor that periodically saves the timing cache and monitors system memory
  */
 class BuildProgressMonitor : public nvinfer1::IProgressMonitor
 {
@@ -47,12 +49,15 @@ public:
         , mCachePath(cachePath)
         , mSaveInterval(saveInterval)
         , mLastSaveTime(std::chrono::steady_clock::now())
+        , mLastReleaseTime(std::chrono::steady_clock::now() - std::chrono::seconds(60))
     {
     }
 
     void phaseStart(char const* phaseName, char const* parentPhase, int32_t nbSteps) noexcept override
     {
-        // No-op
+        mCurrentPhaseName = phaseName ? phaseName : "Unknown";
+        mCurrentPhaseSteps = nbSteps > 0 ? nbSteps : 1;
+        std::cout << "[BuildProgressMonitor] Starting phase: " << mCurrentPhaseName << " (" << nbSteps << " steps)" << std::endl;
     }
 
     void phaseFinish(char const* phaseName) noexcept override
@@ -63,10 +68,113 @@ public:
     bool stepComplete(char const* phaseName, int32_t step) noexcept override
     {
         checkAndSave();
+        
+        float progress = (static_cast<float>(step + 1) / static_cast<float>(mCurrentPhaseSteps)) * 100.0f;
+        printf("[BuildProgressMonitor] Phase: %s | Progress: %.2f%% (%d/%d)\n", mCurrentPhaseName.c_str(), progress, step + 1, mCurrentPhaseSteps);
+
+        // Proactive Memory Management: Trim if RAM is low or swap starts being used
+        if (isMemoryPressureHigh())
+        {
+            releaseSpareMemory();
+        }
+
+        // Active Memory Guard: Abort if system memory is critically low
+        if (isMemoryCritical())
+        {
+            saveCache(); // Ensure we save before quitting
+            return false; // Signal TensorRT to stop
+        }
+        
         return true;
     }
 
 private:
+    bool isMemoryPressureHigh() noexcept
+    {
+        try {
+            std::ifstream meminfo("/proc/meminfo");
+            std::string line;
+            size_t available_kb = 0;
+            size_t swap_free_kb = 0;
+            size_t swap_total_kb = 0;
+            
+            while (std::getline(meminfo, line))
+            {
+                if (line.compare(0, 13, "MemAvailable:") == 0)
+                {
+                    std::stringstream ss(line.substr(13));
+                    ss >> available_kb;
+                }
+                else if (line.compare(0, 10, "SwapTotal:") == 0)
+                {
+                    std::stringstream ss(line.substr(10));
+                    ss >> swap_total_kb;
+                }
+                else if (line.compare(0, 9, "SwapFree:") == 0)
+                {
+                    std::stringstream ss(line.substr(9));
+                    ss >> swap_free_kb;
+                }
+            }
+
+            // Pressure threshold: < 10GB RAM OR > 5% Swap used
+            bool ram_pressure = (available_kb < 10485760);
+            bool swap_pressure = (swap_total_kb > 0 && swap_free_kb < (swap_total_kb * 95 / 100));
+            
+            return ram_pressure || swap_pressure;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool isMemoryCritical() noexcept
+    {
+        try {
+            std::ifstream meminfo("/proc/meminfo");
+            std::string line;
+            size_t available_kb = 0;
+            size_t swap_free_kb = 0;
+            size_t swap_total_kb = 0;
+            
+            while (std::getline(meminfo, line))
+            {
+                if (line.compare(0, 13, "MemAvailable:") == 0)
+                {
+                    std::stringstream ss(line.substr(13));
+                    ss >> available_kb;
+                }
+                else if (line.compare(0, 10, "SwapTotal:") == 0)
+                {
+                    std::stringstream ss(line.substr(10));
+                    ss >> swap_total_kb;
+                }
+                else if (line.compare(0, 9, "SwapFree:") == 0)
+                {
+                    std::stringstream ss(line.substr(9));
+                    ss >> swap_free_kb;
+                }
+            }
+
+            // RAM is critically low (< 1GB)
+            bool ram_critical = (available_kb < 1048576);
+
+            // Swap is critically low (usage reached 20%, i.e. Free < 80% of Total)
+            bool swap_critical = (swap_total_kb > 0 && swap_free_kb < (swap_total_kb * 8 / 10));
+
+            if (ram_critical || swap_critical)
+            {
+                std::cout << "[BuildProgressMonitor] CRITICAL MEMORY DETECTED:" << std::endl;
+                if (ram_critical) std::cout << "  - Available RAM: " << (available_kb / 1024) << " MB (threshold: 1024 MB)" << std::endl;
+                if (swap_critical) std::cout << "  - Swap Free: " << (swap_free_kb / 1024) << " MB (threshold: " << (swap_total_kb * 8 / 1024 / 10) << " MB)" << std::endl;
+                std::cout << "[BuildProgressMonitor] Aborting build to save progress and prevent crash." << std::endl;
+                return true;
+            }
+        } catch (...) {
+            return false;
+        }
+        return false;
+    }
+
     void checkAndSave() noexcept
     {
         auto now = std::chrono::steady_clock::now();
@@ -74,6 +182,40 @@ private:
         {
             saveCache();
             mLastSaveTime = now;
+        }
+    }
+
+    void releaseSpareMemory() noexcept
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (now - mLastReleaseTime < std::chrono::seconds(30))
+        {
+            return;
+        }
+        mLastReleaseTime = now;
+
+        std::cout << "[BuildProgressMonitor] High memory pressure. Triggering proactive release." << std::endl;
+        try {
+            // 1. Synchronize to ensure all profiling/tactics are done
+            cudaDeviceSynchronize();
+
+            // 2. Trim CUDA memory pool (if using async allocator)
+            int device = 0;
+            if (cudaGetDevice(&device) == cudaSuccess)
+            {
+                cudaMemPool_t memPool;
+                if (cudaDeviceGetDefaultMemPool(&memPool, device) == cudaSuccess)
+                {
+                    cudaMemPoolTrimTo(memPool, 0);
+                }
+            }
+
+            // 3. Trim host heap
+#ifdef __linux__
+            malloc_trim(0);
+#endif
+        } catch (...) {
+            // ignore
         }
     }
 
@@ -100,6 +242,9 @@ private:
                     std::filesystem::rename(tmpPath, mCachePath);
                     std::cout << "[BuildProgressMonitor] Timing cache flushed to " << mCachePath << std::endl;
                 }
+
+                // Release memory back to OS
+                releaseSpareMemory();
             }
             catch (...)
             {
@@ -112,6 +257,9 @@ private:
     std::filesystem::path mCachePath;
     std::chrono::seconds mSaveInterval;
     std::chrono::steady_clock::time_point mLastSaveTime;
+    std::chrono::steady_clock::time_point mLastReleaseTime;
+    std::string mCurrentPhaseName;
+    int32_t mCurrentPhaseSteps{1};
 };
 
 //! Configuration structure for LLM model building.

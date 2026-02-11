@@ -274,7 +274,7 @@ def quantize_llm(
     data_loader = get_llm_calib_dataloader(tokenizer=tokenizer,
                                            dataset_dir=dataset_dir,
                                            batch_size=batch_size,
-                                           num_samples=512,
+                                           num_samples=8,
                                            max_length=512)
     quant_config = get_llm_quant_config(quantization, lm_head_quantization)
     model = quantize_model(model, quant_config, data_loader)
@@ -318,7 +318,7 @@ def quantize_draft(
     data_loader = get_llm_calib_dataloader(tokenizer=tokenizer,
                                            dataset_dir=dataset_dir,
                                            batch_size=batch_size,
-                                           num_samples=512,
+                                           num_samples=8,
                                            max_length=512)
     quant_config = get_llm_quant_config(quantization, lm_head_quantization)
     model = quantize_draft_model(base_model, draft_model, quant_config,
@@ -375,7 +375,7 @@ def quantize_and_save_llm(model_dir: str,
         processor.save_pretrained(output_dir)
 
     # Save the quant config
-    quant_config = get_quant_config(dict(model.named_modules()))
+    quant_config = get_quant_config(model)
     with open(os.path.join(output_dir, "hf_quant_config.json"), "w") as f:
         json.dump(quant_config, f)
 

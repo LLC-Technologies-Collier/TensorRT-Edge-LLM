@@ -49,9 +49,9 @@ set_ifndef(CUDA_VERSION 12.8)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_VERSION})
 
 if(NOT DEFINED AARCH64_BUILD)
-  set(CMAKE_CUDA_ARCHITECTURES 87;110) # Jetson Orin / Thor
+  set(CMAKE_CUDA_ARCHITECTURES 87) # Jetson Thor / Orin
 else()
-  set(CMAKE_CUDA_ARCHITECTURES 87;110)
+  set(CMAKE_CUDA_ARCHITECTURES 87)
 endif()
 
 find_path(

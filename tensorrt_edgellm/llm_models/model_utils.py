@@ -36,8 +36,38 @@ from transformers import (AutoConfig, AutoModelForCausalLM,
                           AutoTokenizer, PreTrainedModel)
 
 from .models.eagle3_draft import Eagle3DraftModel
+from .models.gemma_model import EdgeGemma3ModelForCausalLM
+from .models.nemotron_model import EdgeNemotronModelForCausalLM
 from .models.llm_model import EdgeLLMModelForCausalLM
 
+# --- PATCH START ---
+# Patch mamba_ssm rmsnorm_fn to bypass Triton JIT error on sm_110a
+try:
+    import mamba_ssm.ops.triton.layernorm_gated
+    print("Patching mamba_ssm rmsnorm_fn...")
+    
+    def naive_rmsnorm_fn(x, weight, bias=None, z=None, eps=1e-6, group_size=None, norm_before_gate=False, is_rms_norm=True):
+        dtype = x.dtype
+        x = x.float()
+        if z is not None:
+            z = z.float()
+            x = x * torch.nn.functional.silu(z) 
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + eps)
+        if weight is not None:
+            weight = weight.float()
+            x = x * weight
+        if bias is not None:
+            bias = bias.float()
+            x = x + bias
+        return x.to(dtype)
+
+    mamba_ssm.ops.triton.layernorm_gated.rmsnorm_fn = naive_rmsnorm_fn
+except ImportError:
+    pass
+except Exception as e:
+    print(f"Failed to patch mamba_ssm: {e}")
+# --- PATCH END ---
 
 def is_nvfp4_linear(module: nn.Module) -> bool:
     """Check if the module is a quantized linear layer with NVFP4 quantization. The test is designed for identification purpose only, not designed to be comprehensive.
@@ -120,6 +150,16 @@ def _check_model_type(model_dir: str, model_identifier: str) -> bool:
 def _is_phi4mm_model(dir_path: str) -> bool:
     """Check if the model is a Phi4MM model."""
     return _check_model_type(dir_path, "phi4mm")
+
+
+def _is_gemma_model(dir_path: str) -> bool:
+    """Check if the model is a Gemma model."""
+    return _check_model_type(dir_path, "gemma")
+
+
+def _is_nemotron_model(dir_path: str) -> bool:
+    """Check if the model is a Nemotron model."""
+    return _check_model_type(dir_path, "nemotron")
 
 
 # Models that require explicit chat template because auto-extraction fails
@@ -363,9 +403,18 @@ def load_llm_model(
     set_dynamic_quant(model, dtype)
 
     # Create EdgeLLMModelForCausalLM wrapper.
-    edge_model = EdgeLLMModelForCausalLM(model, is_eagle_base,
-                                         use_prompt_tuning, reduced_vocab_size,
-                                         vocab_map)
+    if _is_gemma_model(model_dir):
+        edge_model = EdgeGemma3ModelForCausalLM(model, is_eagle_base,
+                                             use_prompt_tuning, reduced_vocab_size,
+                                             vocab_map)
+    elif _is_nemotron_model(model_dir):
+        edge_model = EdgeNemotronModelForCausalLM(model, is_eagle_base,
+                                             use_prompt_tuning, reduced_vocab_size,
+                                             vocab_map)
+    else:
+        edge_model = EdgeLLMModelForCausalLM(model, is_eagle_base,
+                                             use_prompt_tuning, reduced_vocab_size,
+                                             vocab_map)
 
     del model
     gc.collect()
@@ -395,8 +444,6 @@ def load_eagle3_draft_model(draft_model_dir: str, base_model_dir: str,
     # Convert dtype string to torch dtype
     if dtype == "fp16":
         torch_dtype = torch.float16
-    elif dtype == "bf16":
-        torch_dtype = torch.bfloat16
     else:
         raise ValueError(f"Unsupported dtype: {dtype}")
 

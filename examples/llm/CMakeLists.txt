@@ -23,3 +23,6 @@ target_include_directories(
   llm_inference PRIVATE ${COMMON_INCLUDE_DIRS}
                         ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(llm_inference)
+
+install(TARGETS llm_build llm_inference
+        RUNTIME DESTINATION bin)

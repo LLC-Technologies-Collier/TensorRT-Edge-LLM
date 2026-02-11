@@ -76,6 +76,7 @@ struct LLMGenerationRequest
     float topP;                      //!< Top-p (nucleus) sampling parameter
     int64_t topK;                    //!< Top-k sampling parameter
     int64_t maxGenerateLength;       //!< Max length of the generated tokens
+    uint64_t randomSeed{42};         //!< Random seed for sampling. Default to 42.
     std::string loraWeightsName{""}; //!< Name of the LoRA weights. Default to empty string for no LoRA weights
     bool saveSystemPromptKVCache{
         false}; //!< Whether to save system prompt KV cache of this request to be used by later requests

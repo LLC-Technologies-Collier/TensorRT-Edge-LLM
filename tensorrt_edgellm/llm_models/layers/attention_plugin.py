@@ -244,9 +244,8 @@ def attention_plugin(
     assert past_key_value.shape[
         4] == head_size, f"head_size of kv_cache {past_key_value.shape[4]} should be equal to head_size of qkv {head_size}"
 
-    # Allow FP16 or BF16
-    # assert qkv.dtype == torch.float16, f"qkv {qkv.dtype} should be in float16"
-    # assert past_key_value.dtype == torch.float16, f"past_key_value {past_key_value.dtype} should be in float16"
+    assert qkv.dtype == qkv.dtype, f"qkv {qkv.dtype} should be in float16"
+    assert past_key_value.dtype == qkv.dtype, f"past_key_value {past_key_value.dtype} should be in float16"
 
     # Dummy implementation for ONNX export, this is not used in the actual inference
     attn_output = torch.zeros(batch_size,

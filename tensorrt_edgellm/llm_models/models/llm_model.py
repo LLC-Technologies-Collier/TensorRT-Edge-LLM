@@ -72,7 +72,15 @@ class EdgeLLMModel(nn.Module):
         # Copy all the basic attributes
         self.config = hf_model.config
         self.padding_idx = self.config.pad_token_id
-        self.vocab_size = self.config.vocab_size
+        
+        # Handle vocab_size for multimodal models (e.g. Gemma 3)
+        if hasattr(self.config, "vocab_size"):
+            self.vocab_size = self.config.vocab_size
+        elif hasattr(self.config, "text_config") and hasattr(self.config.text_config, "vocab_size"):
+            self.vocab_size = self.config.text_config.vocab_size
+        else:
+            self.vocab_size = self.config.vocab_size
+            
         self.is_eagle_base = is_eagle_base
         self.use_prompt_tuning = use_prompt_tuning
 
@@ -83,8 +91,8 @@ class EdgeLLMModel(nn.Module):
 
         # Replace decoder layers with our custom ones
         self.layers = nn.ModuleList([
-            EdgeLLMDecoderLayer(hf_layer, index=i, torch_dtype=self.torch_dtype, eagle3_draft=False)
-            for i, hf_layer in enumerate(hf_model.layers)
+            EdgeLLMDecoderLayer(hf_layer, self.torch_dtype, eagle3_draft=False)
+            for hf_layer in hf_model.layers
         ])
 
         # Set max_position_embeddings on attention modules from the model's config
