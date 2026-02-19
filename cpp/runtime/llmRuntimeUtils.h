@@ -26,6 +26,7 @@
 #include <string>
 #include <variant>
 #include <vector>
+#include <functional>
 
 namespace trt_edgellm
 {
@@ -87,6 +88,8 @@ struct LLMGenerationRequest
     //!< applyChatTemplate=true
     bool enableThinking{false};
     //!< Whether to enable thinking mode for models that support it. Default is disabled
+
+    std::function<void(int32_t, int32_t)> tokenCallback; //!< Optional callback for each generated token (batch_idx, token_id)
 };
 
 /*! \brief LLM Generation Response structure

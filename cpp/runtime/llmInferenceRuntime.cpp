@@ -52,8 +52,10 @@ size_t hashSystemPromptWithLoraWeights(std::string const& systemPrompt, std::str
 namespace rt
 {
 LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
-    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
+    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream, bool enableCudaGraph)
 {
+    mMemoryMonitor.start();
+
     std::filesystem::path const enginePath = std::filesystem::path(engineDir) / "llm.engine";
     std::filesystem::path const configPath = std::filesystem::path(engineDir) / "config.json";
 
@@ -406,6 +408,10 @@ bool LLMInferenceRuntime::handleRequest(
             if (!finishedStates[i])
             {
                 outputIds[i].push_back(hostSelectedTokenIdsData[i]);
+                if (request.tokenCallback)
+                {
+                    request.tokenCallback(i, hostSelectedTokenIdsData[i]);
+                }
                 finishedStates[i] = hostSelectedTokenIdsData[i] == mTokenizer->getEosId();
                 if (finishedStates[i])
                 {
@@ -631,6 +637,28 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     LOG_DEBUG("LLMInferenceRuntime(): The KVCache is saved for the prompt: {%s}", prompt.c_str());
 
     return true;
+}
+
+std::string LLMInferenceRuntime::decode(std::vector<int32_t> const& tokenIds, bool skipSpecialTokens) const
+{
+    if (!mTokenizer)
+    {
+        return "";
+    }
+    return mTokenizer->decode(tokenIds, skipSpecialTokens);
+}
+
+std::vector<int32_t> LLMInferenceRuntime::tokenize(LLMGenerationRequest::Request const& request, bool applyChatTemplate) const
+{
+    if (!mTokenizer)
+    {
+        return {};
+    }
+
+    LLMGenerationRequest::FormattedRequest formatted;
+    mTokenizer->applyChatTemplate(request, formatted, applyChatTemplate, true, false);
+
+    return mTokenizer->encode(formatted.formattedCompleteRequest, true);
 }
 
 } // namespace rt

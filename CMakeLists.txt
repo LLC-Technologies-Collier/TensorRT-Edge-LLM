@@ -48,11 +48,14 @@ endmacro(add_cross_build_link_options)
 set_ifndef(CUDA_VERSION 12.8)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_VERSION})
 
-if(NOT DEFINED AARCH64_BUILD)
-  set(CMAKE_CUDA_ARCHITECTURES 87) # Jetson Thor / Orin
-else()
-  set(CMAKE_CUDA_ARCHITECTURES 87)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  if(NOT DEFINED AARCH64_BUILD)
+    set(CMAKE_CUDA_ARCHITECTURES 86) # Ampere (compy786)
+  else()
+    set(CMAKE_CUDA_ARCHITECTURES 110) # Jetson Thor
+  endif()
 endif()
+message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 find_path(
   CUDA_RUNTIME_API_INCLUDE_DIR cuda_runtime_api.h

@@ -22,6 +22,7 @@
 #include "profiling/timer.h"
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/memoryMonitor.h"
 #include "tokenizer/tokenizer.h"
 #include <memory>
 #include <string>
@@ -53,7 +54,7 @@ public:
      *  \param stream CUDA stream for initialization
      */
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
-        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream, bool enableCudaGraph = true);
 
     /*! \brief Destructor
      */
@@ -107,6 +108,20 @@ public:
         return mMultimodalRunner ? mMultimodalRunner->getMultimodalMetrics() : metrics::MultimodalMetrics{};
     }
 
+    /*! \brief Decode token IDs into a string
+     *  \param tokenIds Vector of token IDs to decode
+     *  \param skipSpecialTokens Whether to skip special tokens
+     *  \return Decoded string
+     */
+    std::string decode(std::vector<int32_t> const& tokenIds, bool skipSpecialTokens = true) const;
+
+    /*! \brief Tokenize a request into token IDs
+     *  \param request Single request object containing messages
+     *  \param applyChatTemplate Whether to apply chat template
+     *  \return Vector of token IDs
+     */
+    std::vector<int32_t> tokenize(LLMGenerationRequest::Request const& request, bool applyChatTemplate = true) const;
+
 private:
     /*! \brief Helper structure to hold token counting results
      */
@@ -142,6 +157,8 @@ private:
     std::string mEmptyLoraWeightsName{""}; //!< Empty LoRA weights name for default case
 
     LLMEngineRunnerConfig mEngineConfig{}; //!< Engine configuration
+
+    MemoryMonitor mMemoryMonitor; //!< Background memory monitor
 
     metrics::LLMPrefillMetrics mPrefillMetrics; //!< Stage-specific metrics to store number of tokens in prefill
     metrics::LLMGenerationMetrics

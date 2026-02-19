@@ -29,6 +29,7 @@
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "common/streamReader.h"
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -54,7 +55,8 @@ std::string formatEngineConfig(trt_edgellm::rt::LLMEngineRunnerConfig const& con
        << "  minSupportedInputLength: " << config.minSupportedInputLength
        << "  maxSupportedInputLength: " << config.maxSupportedInputLength
        << "  maxKVCacheCapacity: " << config.maxKVCacheCapacity
-       << "  maxSupportedLoraRank: " << config.maxSupportedLoraRank;
+       << "  maxSupportedLoraRank: " << config.maxSupportedLoraRank
+       << "  weightStreamingBudget: " << config.weightStreamingBudget;
     if (config.enableEagleSpecDecode)
     {
         ss << "  outputHiddenDim (For Eagle SpecDecode): " << config.outputHiddenDim;
@@ -142,14 +144,15 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     LOG_INFO("Loading engine file: %s", enginePath.string().c_str());
     mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
 
-    auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
-    if (mmapReader->getData() == nullptr)
-    {
-        LOG_ERROR("LLMEngineRunner(): Failed to use MMap to read engine from file path: %s", enginePath.string());
-        throw std::runtime_error("Failed to use MMap to read engine from file path: " + enginePath.string());
+    file_io::FileStreamReader streamReader(enginePath.string());
+    mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(streamReader));
+
+    if (mConfig.weightStreamingBudget >= 0) {
+        LOG_INFO("Setting weight streaming budget to %ld bytes", mConfig.weightStreamingBudget);
+        if (!mEngine->setWeightStreamingBudgetV2(mConfig.weightStreamingBudget)) {
+            LOG_ERROR("Failed to set weight streaming budget");
+        }
     }
-    mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
-        mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
     int64_t const execContextMemoryInBytes = mEngine->getDeviceMemorySizeV2();
     // Allocate device memory for the execution contexts. UINT8 is used to represent raw bytes.
@@ -423,6 +426,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.maxKVCacheCapacity = builderConfig["max_kv_cache_capacity"].get<int32_t>();
         mConfig.maxSupportedLoraRank = builderConfig["max_lora_rank"].get<int32_t>();
         mConfig.enableEagleSpecDecode = builderConfig["eagle_base"].get<bool>();
+        mConfig.weightStreamingBudget = builderConfig.value("weight_streaming_budget", -1L);
 
         // Collect RoPE configuration
         mConfig.ropeConfig = collectRopeConfig(configJson);

@@ -61,6 +61,7 @@ struct LLMEngineRunnerConfig
     int32_t outputHiddenDim{};      //!< Output hidden dimension for Eagle speculative decoding (hidden_size * 3)
     int32_t maxVerifyTreeSize{};    //!< Maximum verification tree size for Eagle speculative decoding
     int32_t numDeepstackFeatures{}; //!< Number of deepstack features for Qwen3-VL
+    int64_t weightStreamingBudget{-1}; //!< Weight streaming budget in bytes (-1 to use TRT automatic budget, 0 for minimum usage)
 };
 
 //! The class wraps the TensorRT engine built for auto-regressive style decoder model.
