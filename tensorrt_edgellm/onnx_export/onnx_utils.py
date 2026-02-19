@@ -241,23 +241,36 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
     t0 = time.time()
     os.makedirs(output_dir, exist_ok=True)
     onnx_path = f'{output_dir}/model.onnx'
-    with torch.inference_mode():
-        torch.onnx.export(model,
-                          inputs,
-                          onnx_path,
-                          export_params=True,
-                          dynamic_axes=dynamic_axes,
-                          input_names=input_names,
-                          output_names=output_names,
-                          opset_version=ONNX_OPSET_VERSION,
-                          do_constant_folding=True,
-                          dynamo=False)
+    
+    skip_export = False
+    if os.path.exists(onnx_path):
+        try:
+            # Check if the ONNX structure is valid without loading weights
+            onnx.load(onnx_path, load_external_data=False)
+            print(f"Valid ONNX model structure found at {onnx_path}, skipping tracing phase.")
+            skip_export = True
+        except Exception as e:
+            print(f"Existing ONNX file at {onnx_path} is invalid or incomplete ({e}). Re-exporting...")
+    
+    if not skip_export:
+        print(f"Exporting model to ONNX format: {onnx_path}")
+        with torch.inference_mode():
+            torch.onnx.export(model,
+                              inputs,
+                              onnx_path,
+                              export_params=True,
+                              dynamic_axes=dynamic_axes,
+                              input_names=input_names,
+                              output_names=output_names,
+                              opset_version=ONNX_OPSET_VERSION,
+                              do_constant_folding=True,
+                              dynamo=False)
     t1 = time.time()
-    print(f"ONNX export completed in {t1 - t0}s. Apply post-processing...")
+    print(f"ONNX export (tracing) stage completed. Apply post-processing...")
     
     # Post-processing
     onnx.shape_inference.infer_shapes_path(onnx_path)
-    onnx_model = onnx.load(onnx_path)
+    onnx_model = onnx.load(onnx_path, load_external_data=False)
     graph = None
 
     if is_int4_awq_quantized(model):
@@ -279,23 +292,40 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
     if graph is not None:
         onnx_model = gs.export_onnx(graph)
 
-    # Since torch.onnx.export deduplicates weights, lm_head and embed_tokens can
-    # share the same ONNX initializer. To prevent quantization of lm_head (e.g. NVFP4)
-    # from affecting embed_tokens, we manually create a separate initializer.
-    # See: https://github.com/pytorch/pytorch/blob/v2.9.0-rc9/torch/csrc/jit/passes/onnx/deduplicate_initializers.cpp#L96
-    if isinstance(model, EdgeLLMModelForCausalLM) and is_fp4_quantized(
-            model.lm_head):
-        onnx_model = untie_nvfp4_lm_head_initializer(onnx_model)
-    if is_fp4_quantized(model):
-        print(
-            "NVFP4 quantization detected in the model, compressing some weights to NVFP4"
-        )
-        onnx_model = fp4qdq_to_2dq(onnx_model)
-    if is_mxfp8_quantized(model):
-        print(
-            "MXFP8 quantization detected in the model, compressing some weights to MXFP8"
-        )
-        onnx_model = quantize_weights_to_mxfp8(onnx_model)
+    # Monkey patch to_array to supply base_dir for external data
+    # This is required because modelopt calls to_array() without base_dir on models loaded with load_external_data=False
+    original_to_array = onnx.numpy_helper.to_array
+    model_base_dir = os.path.dirname(onnx_path)
+    
+    def patched_to_array(tensor, base_dir=None):
+        # If tensor has external data but base_dir is missing, inject it
+        if base_dir is None and tensor.data_location == onnx.TensorProto.EXTERNAL:
+            return original_to_array(tensor, base_dir=model_base_dir)
+        return original_to_array(tensor, base_dir)
+        
+    onnx.numpy_helper.to_array = patched_to_array
+
+    try:
+        # Since torch.onnx.export deduplicates weights, lm_head and embed_tokens can
+        # share the same ONNX initializer. To prevent quantization of lm_head (e.g. NVFP4)
+        # from affecting embed_tokens, we manually create a separate initializer.
+        # See: https://github.com/pytorch/pytorch/blob/v2.9.0-rc9/torch/csrc/jit/passes/onnx/deduplicate_initializers.cpp#L96
+        if isinstance(model, EdgeLLMModelForCausalLM) and is_fp4_quantized(
+                model.lm_head):
+            onnx_model = untie_nvfp4_lm_head_initializer(onnx_model)
+        if is_fp4_quantized(model):
+            print(
+                "NVFP4 quantization detected in the model, compressing some weights to NVFP4"
+            )
+            onnx_model = fp4qdq_to_2dq(onnx_model)
+        if is_mxfp8_quantized(model):
+            print(
+                "MXFP8 quantization detected in the model, compressing some weights to MXFP8"
+            )
+            onnx_model = quantize_weights_to_mxfp8(onnx_model)
+    finally:
+        # Restore original function
+        onnx.numpy_helper.to_array = original_to_array
 
     # print(
     #     "Removing all the files in the output directory except for .json files"

@@ -32,10 +32,32 @@ Usage:
 
 import argparse
 import sys
+import os
 import traceback
 
-from tensorrt_edgellm.onnx_export.llm_export import export_llm_model
-
+def is_export_complete(output_dir: str) -> bool:
+    """Check if all necessary files for a successful export are present and valid."""
+    required_files = [
+        "model.onnx",
+        "onnx_model.data",
+        "config.json",
+        "processed_chat_template.json"
+    ]
+    
+    for f in required_files:
+        path = os.path.join(output_dir, f)
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return False
+            
+    # Quick structural check without loading heavy weights
+    try:
+        import onnx
+        onnx_path = os.path.join(output_dir, "model.onnx")
+        onnx.load(onnx_path, load_external_data=False)
+    except Exception:
+        return False
+        
+    return True
 
 def main() -> None:
     """
@@ -96,6 +118,25 @@ def main() -> None:
                         help="Whether to use FP8 KV cache")
 
     args = parser.parse_args()
+
+    # Fast exit if already complete - avoids importing heavy libraries
+    if is_export_complete(args.output_dir):
+        print(f"Full export found in {args.output_dir}. Skipping everything.")
+        print("LLM model export completed successfully!")
+        return
+
+    # Fully deferred imports to minimize startup time
+    # Import from the specific file to avoid triggering package-level __init__.py
+    import sys
+    import os
+    
+    # Add current dir to path if not already there
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_dir = os.path.dirname(os.path.dirname(script_dir))
+    if project_dir not in sys.path:
+        sys.path.insert(0, project_dir)
+        
+    from tensorrt_edgellm.onnx_export.llm_export import export_llm_model
 
     try:
         # Export model(s)

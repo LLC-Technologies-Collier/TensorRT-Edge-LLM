@@ -153,7 +153,7 @@ onnx.defs.register_schema(attention_plugin_schema)
 @symbolic_helper.parse_args("v", "v", "v", "v", "v", "i", "i", "b", "i", "b",
                             "v", "v", "v")
 def symbolic_attention_plugin(
-    g: torch.onnx._internal.jit_utils.GraphContext,
+    g,
     qkv: torch._C.Value,
     past_key_value: torch._C.Value,
     context_lengths: torch._C.Value,

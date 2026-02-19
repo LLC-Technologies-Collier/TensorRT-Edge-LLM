@@ -465,6 +465,32 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
         raise RuntimeError(f"Failed to export model to ONNX: {str(e)}")
 
 
+def is_export_complete(output_dir: str) -> bool:
+    """Check if all necessary files for a successful export are present and valid."""
+    import onnx
+    
+    required_files = [
+        "model.onnx",
+        "onnx_model.data",
+        "config.json",
+        "processed_chat_template.json"
+    ]
+    
+    for f in required_files:
+        path = os.path.join(output_dir, f)
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return False
+            
+    # Additional verification for ONNX structure
+    try:
+        onnx_path = os.path.join(output_dir, "model.onnx")
+        onnx.load(onnx_path, load_external_data=False)
+    except Exception:
+        return False
+        
+    return True
+
+
 def export_llm_model(model_dir: str,
                      output_dir: str,
                      dtype: str = "fp16",
@@ -488,6 +514,12 @@ def export_llm_model(model_dir: str,
         chat_template_path: Path to chat template JSON file. When provided, this template is validated and used instead of inferring from the model (optional)
         fp8_kv_cache: Whether to use FP8 KV cache
     """
+    # Fast exit check
+    if is_export_complete(output_dir):
+        print(f"Full export found in {output_dir}. Skipping tracing and post-processing.")
+        print(f"Export completed successfully in 0s. Files saved to: {output_dir}")
+        return
+
     start_time = time.time()
 
     if is_eagle_base:

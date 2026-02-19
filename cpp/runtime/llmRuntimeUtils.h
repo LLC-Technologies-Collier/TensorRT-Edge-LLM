@@ -26,6 +26,7 @@
 #include <string>
 #include <variant>
 #include <vector>
+#include <functional>
 
 namespace trt_edgellm
 {
@@ -90,6 +91,8 @@ struct LLMGenerationRequest
     bool enableThinking{false};
     // Always disable speculative decoding for this request even if Eagle Draft engine is loaded.
     bool disableSpecDecode{false};
+
+    std::function<void(int32_t, int32_t)> tokenCallback; //!< Optional callback for each generated token (batch_idx, token_id)
 };
 
 /*! \brief LLM Generation Response structure

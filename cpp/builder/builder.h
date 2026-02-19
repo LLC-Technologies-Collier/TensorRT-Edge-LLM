@@ -268,6 +268,10 @@ private:
 struct LLMBuilderConfig
 {
     int64_t maxInputLen{1024};        //!< Maximum input sequence length for the model
+    bool isVlm{false};                //!< Whether this is a Vision-Language Model (VLM)
+    int64_t weightStreamingBudget{-1};
+    int64_t minImageTokens{4};        //!< Minimum number of image tokens (VLM only)
+    int64_t maxImageTokens{1024};     //!< Maximum number of image tokens (VLM only)
     bool eagleDraft{false};           //!< Whether this is an Eagle draft model
     bool eagleBase{false};            //!< Whether this is an Eagle base model
     int64_t maxBatchSize{4};          //!< Maximum batch size for inference
@@ -287,6 +291,7 @@ struct LLMBuilderConfig
         json["max_batch_size"] = maxBatchSize;
         json["max_lora_rank"] = maxLoraRank;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
+        json["weight_streaming_budget"] = weightStreamingBudget;
         // Only include Eagle-specific fields when Eagle is enabled
         if (eagleBase)
         {
