@@ -122,6 +122,22 @@ public:
      */
     std::vector<int32_t> tokenize(LLMGenerationRequest::Request const& request, bool applyChatTemplate = true) const;
 
+    /*! \brief Get the underlying LLM engine runner
+     *  \return Pointer to LLMEngineRunner
+     */
+    LLMEngineRunner* getEngineRunner() const
+    {
+        return mLLMEngineRunner.get();
+    }
+
+    /*! \brief Get the tokenizer
+     *  \return Reference to Tokenizer
+     */
+    tokenizer::Tokenizer const& getTokenizer() const
+    {
+        return *mTokenizer;
+    }
+
 private:
     /*! \brief Helper structure to hold token counting results
      */
