@@ -240,7 +240,7 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
     '''
     t0 = time.time()
     os.makedirs(output_dir, exist_ok=True)
-    onnx_path = f'{output_dir}/model.onnx'
+    onnx_path = os.path.join(output_dir, 'model.onnx')
     
     skip_export = False
     if os.path.exists(onnx_path):
@@ -271,27 +271,7 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
     # Post-processing
     onnx.shape_inference.infer_shapes_path(onnx_path)
     onnx_model = onnx.load(onnx_path, load_external_data=False)
-    graph = None
-
-    if is_int4_awq_quantized(model):
-        print(
-            "INT4 AWQ quantization detected in the model, compressing some weights to INT4 and inserting int4 gemm plugin"
-        )
-        onnx_model = quantize_weights_to_int4(onnx_model)
-        # Fix the Cast nodes and hidden_states output types for INT4 models
-        onnx_model = fix_model_int4_output_dtypes(onnx_model)
-        graph = gs.import_onnx(onnx_model)
-        graph = int4_dq_gemm_to_plugin(graph)
-    if is_fp8_quantized(model):
-        print(
-            "FP8 quantization detected in the model, compressing some weights to FP8"
-        )
-        if graph is None:
-            graph = gs.import_onnx(onnx_model)
-        graph = fold_fp8_qdq_to_dq(graph)
-    if graph is not None:
-        onnx_model = gs.export_onnx(graph)
-
+    
     # Monkey patch to_array to supply base_dir for external data
     # This is required because modelopt calls to_array() without base_dir on models loaded with load_external_data=False
     original_to_array = onnx.numpy_helper.to_array
@@ -299,13 +279,39 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
     
     def patched_to_array(tensor, base_dir=None):
         # If tensor has external data but base_dir is missing, inject it
-        if base_dir is None and tensor.data_location == onnx.TensorProto.EXTERNAL:
-            return original_to_array(tensor, base_dir=model_base_dir)
+        if base_dir is None:
+            # Check if it has external data
+            for entry in tensor.external_data:
+                if entry.key == "location":
+                    return original_to_array(tensor, base_dir=model_base_dir)
         return original_to_array(tensor, base_dir)
         
     onnx.numpy_helper.to_array = patched_to_array
 
     try:
+        graph = None
+
+        if is_int4_awq_quantized(model):
+            print(
+                "INT4 AWQ quantization detected in the model, compressing some weights to INT4 and inserting int4 gemm plugin"
+            )
+            onnx_model = quantize_weights_to_int4(onnx_model)
+            # Fix the Cast nodes and hidden_states output types for INT4 models
+            onnx_model = fix_model_int4_output_dtypes(onnx_model)
+            graph = gs.import_onnx(onnx_model)
+            graph = int4_dq_gemm_to_plugin(graph)
+        
+        if is_fp8_quantized(model):
+            print(
+                "FP8 quantization detected in the model, compressing some weights to FP8"
+            )
+            if graph is None:
+                graph = gs.import_onnx(onnx_model)
+            graph = fold_fp8_qdq_to_dq(graph)
+        
+        if graph is not None:
+            onnx_model = gs.export_onnx(graph)
+
         # Since torch.onnx.export deduplicates weights, lm_head and embed_tokens can
         # share the same ONNX initializer. To prevent quantization of lm_head (e.g. NVFP4)
         # from affecting embed_tokens, we manually create a separate initializer.
@@ -313,35 +319,31 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
         if isinstance(model, EdgeLLMModelForCausalLM) and is_fp4_quantized(
                 model.lm_head):
             onnx_model = untie_nvfp4_lm_head_initializer(onnx_model)
+        
         if is_fp4_quantized(model):
             print(
                 "NVFP4 quantization detected in the model, compressing some weights to NVFP4"
             )
             onnx_model = fp4qdq_to_2dq(onnx_model)
+        
         if is_mxfp8_quantized(model):
             print(
                 "MXFP8 quantization detected in the model, compressing some weights to MXFP8"
             )
             onnx_model = quantize_weights_to_mxfp8(onnx_model)
+
     finally:
         # Restore original function
         onnx.numpy_helper.to_array = original_to_array
-
-    # print(
-    #     "Removing all the files in the output directory except for .json files"
-    # )
-    # for file in os.listdir(output_dir):
-    #     if file.endswith(".json"):
-    #         continue
-    #     os.remove(os.path.join(output_dir, file))
 
     # Save the model to the output directory
     onnx.save_model(onnx_model,
                     onnx_path,
                     save_as_external_data=True,
                     all_tensors_to_one_file=True,
-                    location="onnx_model.data",
-                    convert_attribute=True)
+                    location="model.onnx.data",
+                    size_threshold=1024,
+                    convert_attribute=False)
     t2 = time.time()
     print(
         f"ONNX post-processing completed in {t2 - t1}s. ONNX file is saved to {output_dir} in {t2 - t0}s."

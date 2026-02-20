@@ -414,7 +414,7 @@ def quantize_and_save_llm(model_dir: str,
         processor.save_pretrained(output_dir)
 
     # Save the quant config
-    quant_config = get_quant_config(dict(model.named_modules()))
+    quant_config = get_quant_config(model)
     with open(os.path.join(output_dir, "hf_quant_config.json"), "w") as f:
         json.dump(quant_config, f)
 
