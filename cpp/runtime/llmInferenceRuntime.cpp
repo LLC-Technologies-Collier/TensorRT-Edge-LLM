@@ -54,7 +54,20 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
 {
     mMemoryMonitor.start();
 
-    std::filesystem::path const enginePath = std::filesystem::path(engineDir) / "llm.engine";
+    // Dynamically find the engine file
+    std::filesystem::path enginePath;
+    for (const auto& name : {"eagle_base.engine", "eagle_draft.engine", "visual.engine", "llm.engine"}) {
+        auto p = std::filesystem::path(engineDir) / name;
+        if (std::filesystem::exists(p)) {
+            enginePath = p;
+            break;
+        }
+    }
+    
+    if (enginePath.empty()) {
+        enginePath = std::filesystem::path(engineDir) / "llm.engine";
+    }
+
     std::filesystem::path const configPath = std::filesystem::path(engineDir) / "config.json";
 
     // Load embedding table from embedding.safetensors

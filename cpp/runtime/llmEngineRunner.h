@@ -217,6 +217,9 @@ private:
     std::string mActiveLoraWeightsName{}; //!< Name of currently active LoRA weights
 
     LLMEngineRunnerConfig mConfig{}; //!< Engine configuration
+    bool mHasHiddenStatesOutput{false}; //!< Whether the engine has a hidden states output binding
+    bool mHasAttentionMaskInput{false}; //!< Whether the engine has an attention mask input binding
+    bool mHasAttentionPosIdInput{false}; //!< Whether the engine has an attention pos id input binding
 
     //! The Rope CosSinCache tensor that pre-computed prior to engine execution.
     //! The design is to produce better performance and accommodate complex context dependent rope.
@@ -244,6 +247,9 @@ private:
     //! Dummy output tensor used to reserve space for unused output tensors. TRT engines have static I/O, to keep
     //! runtime design clean, we will route unused output tensors to this dummy tensor.
     rt::Tensor mDummyOutputTensor{};
+
+    //! Dummy tensor for hidden states output if engine requires it but caller doesn't.
+    rt::Tensor mDummyHiddenStates{};
 
     //! Dummy tensor used for VLM engines when no images are provided.
     rt::Tensor mDummyVlmTensor{};

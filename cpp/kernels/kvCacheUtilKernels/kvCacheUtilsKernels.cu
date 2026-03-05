@@ -81,7 +81,7 @@ __global__ void instantiateKVCacheKernel(T* KVCacheBuffer, T* KVCacheTensor, int
     int64_t kvCacheMaxSequenceLength, int64_t batchIdx, int64_t numDecoderLayers, int64_t numKVHeads,
     int64_t sequenceLength, int64_t headDim)
 {
-    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128, "Only HEAD_DIM = 64 or 128 is supported now.");
+    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256, "Only HEAD_DIM = 64, 128, or 256 is supported now.");
     // The kernel will perform data movement between preComputedKVCache and KVCacheBuffer, both are BSHD layout.
     // The kernel have assumptions that:
     //     1. Each CTA will take over the work for one sequence [SxD] for one decoder-layer/KV-Head.
@@ -138,7 +138,7 @@ __global__ void instantiateKVCacheKernel(T* KVCacheBuffer, T* KVCacheTensor, int
     }
 
     // There could be leftovers, not all warp are relvent for this iterations.
-    // Given the current supported HEAD_DIM = 64 or 128, each thread will load/store full vector of data.
+    // Given the current supported HEAD_DIM = 64, 128, or 256, each thread will load/store full vector of data.
     if (warpSeqStartIdx < sequenceLength)
     {
         int32_t leftOverElems = (sequenceLength - warpSeqStartIdx) * HEAD_DIM;
@@ -212,9 +212,14 @@ void instantiateKVCacheFromTensor(
             dstKVCacheBuffer.dataPointer<half>(), srcKVCacheTensorPtr, kvCacheMaxBatch, kvCacheMaxSequenceLength,
             batchIdx, numDecoderLayers, numKVHeads, sequenceLength, headDim);
         break;
+    case 256:
+        instantiateKVCacheKernel<half, 256, true><<<gridDim, blockDim, 0, stream>>>(
+            dstKVCacheBuffer.dataPointer<half>(), srcKVCacheTensorPtr, kvCacheMaxBatch, kvCacheMaxSequenceLength,
+            batchIdx, numDecoderLayers, numKVHeads, sequenceLength, headDim);
+        break;
     default:
         throw std::runtime_error(
-            "instantiateKVCacheFromTensor(): Only headDim = 64 or 128 are supported by the kernel, current headDim = "
+            "instantiateKVCacheFromTensor(): Only headDim = 64, 128, or 256 are supported by the kernel, current headDim = "
             + std::to_string(headDim));
     }
 }
@@ -269,9 +274,14 @@ void saveKVCacheIntoTensor(
             dstKVCacheTensor.dataPointer<half>(), kvCacheMaxBatch, kvCacheMaxSequenceLength, batchIdx, numDecoderLayers,
             numKVHeads, sequenceLength, headDim);
         break;
+    case 256:
+        instantiateKVCacheKernel<half, 256, false><<<gridDim, blockDim, 0, stream>>>(srcKVCacheBufferPtr,
+            dstKVCacheTensor.dataPointer<half>(), kvCacheMaxBatch, kvCacheMaxSequenceLength, batchIdx, numDecoderLayers,
+            numKVHeads, sequenceLength, headDim);
+        break;
     default:
         throw std::runtime_error(
-            "saveKVCacheIntoTensor(): Only headDim = 64 or 128 are supported by the kernel, current headDim = "
+            "saveKVCacheIntoTensor(): Only headDim = 64, 128, or 256 are supported by the kernel, current headDim = "
             + std::to_string(headDim));
     }
 }

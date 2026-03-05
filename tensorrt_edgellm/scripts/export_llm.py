@@ -116,11 +116,19 @@ def main() -> None:
                         required=False,
                         action='store_true',
                         help="Whether to use FP8 KV cache")
+    parser.add_argument("--output_hidden_states",
+                        required=False,
+                        action='store_true',
+                        help="Whether to output hidden states")
+    parser.add_argument("--force",
+                        required=False,
+                        action='store_true',
+                        help="Force re-export even if artifacts exist")
 
     args = parser.parse_args()
 
     # Fast exit if already complete - avoids importing heavy libraries
-    if is_export_complete(args.output_dir):
+    if not args.force and is_export_complete(args.output_dir):
         print(f"Full export found in {args.output_dir}. Skipping everything.")
         print("LLM model export completed successfully!")
         return
@@ -147,8 +155,9 @@ def main() -> None:
                          is_eagle_base=args.is_eagle_base,
                          reduced_vocab_dir=args.reduced_vocab_dir,
                          chat_template_path=args.chat_template_path,
-                         fp8_kv_cache=args.fp8_kv_cache)
-
+                         fp8_kv_cache=args.fp8_kv_cache,
+                         output_hidden_states=args.output_hidden_states,
+                         force=args.force)
         print("LLM model export completed successfully!")
 
     except Exception as e:

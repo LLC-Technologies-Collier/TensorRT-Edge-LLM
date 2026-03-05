@@ -55,8 +55,9 @@ class EdgeGemma3ModelForCausalLM(EdgeLLMModelForCausalLM):
                  is_eagle_base: bool = False,
                  use_prompt_tuning: bool = False,
                  reduced_vocab_size: Optional[int] = None,
-                 vocab_map: Optional[torch.Tensor] = None) -> None:
-        super().__init__(hf_model, is_eagle_base, use_prompt_tuning, reduced_vocab_size, vocab_map)
+                 vocab_map: Optional[torch.Tensor] = None,
+                 output_hidden_states: bool = False) -> None:
+        super().__init__(hf_model, is_eagle_base, use_prompt_tuning, reduced_vocab_size, vocab_map, output_hidden_states=output_hidden_states)
         
         # Override the internal model with EdgeGemma3Model if we need specific forward logic
         self.model = EdgeGemma3Model(hf_model.model, is_eagle_base, use_prompt_tuning)

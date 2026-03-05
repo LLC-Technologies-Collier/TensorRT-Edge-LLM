@@ -14,20 +14,40 @@
 # limitations under the License.
 
 import copy
+import ctypes
+import gc
 import os
 import time
 
+import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 import torch
 import torch.nn as nn
+
+def trim_memory():
+    """Aggressively release system memory back to the OS."""
+    gc.collect()
+    try:
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except Exception:
+        pass
+
 from modelopt.onnx.llm_export_utils.surgeon_utils import fold_fp8_qdq_to_dq
 try:
     from modelopt.onnx.quantization.qdq_utils import fp4qdq_to_2dq
 except ImportError:
     def fp4qdq_to_2dq(model):
-        print("WARNING: fp4qdq_to_2dq not found in modelopt. FP4 post-processing will fail.")
-        return model
+        try:
+            from modelopt.onnx.export.nvfp4_exporter import NVFP4QuantExporter
+            print("INFO: Lowering NVFP4 nodes using NVFP4QuantExporter...")
+            model = NVFP4QuantExporter.compute_scales(model)
+            model = NVFP4QuantExporter.compress_weights(model)
+            model = NVFP4QuantExporter.post_process(model)
+            return model
+        except ImportError:
+            print("WARNING: NVFP4QuantExporter not found in modelopt. FP4 post-processing will fail.")
+            return model
 
 try:
     from modelopt.onnx.quantization.qdq_utils import quantize_weights_to_int4
@@ -226,8 +246,47 @@ def fix_model_int4_output_dtypes(
     return onnx_model
 
 
+def fix_trt_fp4qdq_nodes(graph: gs.Graph) -> gs.Graph:
+    """Fix TRT_FP4QDQ nodes by ensuring they have two outputs (data and scale).
+    """
+    nodes_to_fix = [
+        node for node in graph.nodes
+        if node.op == "TRT_FP4QDQ" and len(node.outputs) == 1
+    ]
+
+    if not nodes_to_fix:
+        return graph
+
+    print(f"INFO: Fixing {len(nodes_to_fix)} TRT_FP4QDQ nodes in-graph.")
+
+    # Create a single dummy scale constant to be shared
+    dummy_scale = gs.Constant(name="dummy_fp4_scale",
+                               values=np.array([1.0], dtype=np.float32))
+    graph.layer(op="Identity",
+                name="dummy_scale_identity",
+                inputs=[dummy_scale],
+                outputs=[dummy_scale])
+
+    for i, node in enumerate(nodes_to_fix):
+        # Create a new output tensor for the scale, which will be the dummy scale
+        scale_output = gs.Variable(name=f"{node.name}_scale_output_{i}",
+                                   dtype=np.float32,
+                                   shape=[1])
+
+        # Rewire the node's outputs
+        node.outputs.append(scale_output)
+
+        # Create an Identity node to connect our dummy scale to this node's new output
+        graph.layer(op="Identity",
+                    name=f"dummy_scale_provider_{i}",
+                    inputs=[dummy_scale],
+                    outputs=[scale_output])
+
+    return graph.cleanup().toposort()
+
+
 def export_onnx(model, inputs, output_dir, input_names, output_names,
-                dynamic_axes):
+                dynamic_axes, force=False):
     '''
     Export the model to ONNX format.
     Args:
@@ -237,13 +296,14 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
         input_names: The names of the input tensors
         output_names: The names of the output tensors
         dynamic_axes: The dynamic axes of the model
+        force: Whether to force re-export even if artifacts exist
     '''
     t0 = time.time()
     os.makedirs(output_dir, exist_ok=True)
     onnx_path = os.path.join(output_dir, 'model.onnx')
     
     skip_export = False
-    if os.path.exists(onnx_path):
+    if not force and os.path.exists(onnx_path):
         try:
             # Check if the ONNX structure is valid without loading weights
             onnx.load(onnx_path, load_external_data=False)
@@ -263,8 +323,12 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
                               input_names=input_names,
                               output_names=output_names,
                               opset_version=ONNX_OPSET_VERSION,
-                              do_constant_folding=True,
+                              do_constant_folding=False,
                               dynamo=False)
+    
+    # CRITICAL: Release tracing buffers and large graph temporary objects immediately
+    trim_memory()
+    
     t1 = time.time()
     print(f"ONNX export (tracing) stage completed. Apply post-processing...")
     
@@ -309,22 +373,15 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
                 graph = gs.import_onnx(onnx_model)
             graph = fold_fp8_qdq_to_dq(graph)
         
-        if graph is not None:
-            onnx_model = gs.export_onnx(graph)
-
-        # Since torch.onnx.export deduplicates weights, lm_head and embed_tokens can
-        # share the same ONNX initializer. To prevent quantization of lm_head (e.g. NVFP4)
-        # from affecting embed_tokens, we manually create a separate initializer.
-        # See: https://github.com/pytorch/pytorch/blob/v2.9.0-rc9/torch/csrc/jit/passes/onnx/deduplicate_initializers.cpp#L96
-        if isinstance(model, EdgeLLMModelForCausalLM) and is_fp4_quantized(
-                model.lm_head):
-            onnx_model = untie_nvfp4_lm_head_initializer(onnx_model)
-        
         if is_fp4_quantized(model):
             print(
-                "NVFP4 quantization detected in the model, compressing some weights to NVFP4"
+                "NVFP4 quantization detected in the model, compressing weights and ensuring correct node format"
             )
             onnx_model = fp4qdq_to_2dq(onnx_model)
+            # Re-import to graphsurgeon to apply the output count fix
+            graph = gs.import_onnx(onnx_model)
+            graph = fix_trt_fp4qdq_nodes(graph)
+            onnx_model = gs.export_onnx(graph)
         
         if is_mxfp8_quantized(model):
             print(

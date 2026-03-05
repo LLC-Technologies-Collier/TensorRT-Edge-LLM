@@ -646,7 +646,7 @@ __global__ void eagleBaseCommitKVCacheKernel(int32_t const* acceptedIndices, int
     int32_t const* kvCacheLengths, KV_T* kvCacheBuffer, int32_t const activeBatchSize, int32_t const maxDepth,
     int32_t const numLayers, int32_t const maxBatchSize, int32_t const numHeads, int32_t const maxSeqLen)
 {
-    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128, "Only HEAD_DIM = 64 or 128 are supported");
+    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256, "Only HEAD_DIM = 64, 128, or 256 are supported");
     DVec<KV_T> tempBuffer[MAX_PATH];
 
     // The kernel have assumptions that:
@@ -656,7 +656,7 @@ __global__ void eagleBaseCommitKVCacheKernel(int32_t const* acceptedIndices, int
     //        - FP8 : 8 fp8  = 8 bytes
     //     3. Each CTA contains 128 threads (4 warps).
     //         blockDim.x = number of threads used to process 1 head = HEAD_DIM / DVec<KV_T>::vec_size
-    //         blockDim.y = number of heads handled by each CTA = 128 / blockDim.x
+    //         blockDim.y = number of heads handled by each CTA = 128 / blockDim.x or 256 / blockDim.x
     //     4. The KVCache buffer has layout of [numLayers, maxBatchSize, 2, numHeads, maxSeqLen, HEAD_DIM]
 
     int32_t const tIdx = threadIdx.x;
@@ -851,9 +851,15 @@ void eagleBaseCommitKVCacheAndAssembleHiddenState(rt::Tensor const& acceptedIndi
 #endif
         }
         break;
+    case 256:
+        eagleBaseCommitKVCacheKernel<256, MAX_PATH>
+            <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndices.dataPointer<int32_t>(),
+                acceptLengths.dataPointer<int32_t>(), kvCacheLengths.dataPointer<int32_t>(),
+                kvCacheBuffer.dataPointer<half>(), batchSize, maxDepth, numLayers, maxBatchSize, numHeads, maxSeqLen);
+        break;
     default:
         throw std::runtime_error(
-            "Only HEAD_DIM = 64 or 128 are supported by eagleBaseCommitKVCacheAndAssembleHiddenState, current HEAD_DIM "
+            "Only HEAD_DIM = 64, 128, or 256 are supported by eagleBaseCommitKVCacheAndAssembleHiddenState, current HEAD_DIM "
             "= "
             + std::to_string(headDim));
     }

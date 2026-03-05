@@ -218,7 +218,8 @@ class EdgeLLMModelForCausalLM(nn.Module):
                  is_eagle_base: bool = False,
                  use_prompt_tuning: bool = False,
                  reduced_vocab_size: Optional[int] = None,
-                 vocab_map: Optional[torch.Tensor] = None) -> None:
+                 vocab_map: Optional[torch.Tensor] = None,
+                 output_hidden_states: bool = False) -> None:
         """
         Initialize the EdgeLLM model for causal LM.
         
@@ -228,6 +229,7 @@ class EdgeLLMModelForCausalLM(nn.Module):
             use_prompt_tuning: Whether to enable prompt tuning support
             reduced_vocab_size: Size of the reduced vocabulary (optional)
             vocab_map: Tensor of shape (reduced_vocab_size,) with int32 indices for vocabulary reduction (optional)
+            output_hidden_states: Whether to output hidden states
         """
         super().__init__()
 
@@ -265,6 +267,7 @@ class EdgeLLMModelForCausalLM(nn.Module):
             self.lm_head = hf_model.lm_head
 
         self.is_eagle_base = is_eagle_base
+        self.output_hidden_states = output_hidden_states
 
     @property
     def device(self):
@@ -299,11 +302,12 @@ class EdgeLLMModelForCausalLM(nn.Module):
             deepstack_visual_embeds: Deepstack visual embeddings for Qwen3VL, list of 3 tensors, each (batch_size, seq_len, hidden_size), optional
 
         Returns:
-            For standard: (logits, past_key_values)
-            For EAGLE3 base: (logits, past_key_values, hidden_states)
+            Union[Tuple[torch.Tensor, Tuple[torch.Tensor, ...]], Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor]]: Model outputs
+                - For standard models: (logits, past_key_values) or (logits, past_key_values, hidden_states)
+                - For EAGLE3 base: (logits, past_key_values, hidden_states)
         """
         # Determine output configuration based on model type
-        output_hidden_states = self.is_eagle_base
+        output_hidden_states = self.is_eagle_base or self.output_hidden_states
 
         # Forward pass through the model
         hidden_states, present_key_values, all_hidden_states = self.model(
@@ -340,6 +344,9 @@ class EdgeLLMModelForCausalLM(nn.Module):
                 [hidden_states_0, hidden_states_1, hidden_states_2],
                 dim=-1).to(self.torch_dtype)
 
+            return logits, hidden_states, tuple(present_key_values)
+
+        if self.output_hidden_states:
             return logits, hidden_states, tuple(present_key_values)
 
         # Standard model: return logits and past key values

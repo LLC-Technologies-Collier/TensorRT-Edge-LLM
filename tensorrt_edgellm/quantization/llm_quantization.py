@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional, Union
 
 import modelopt.torch.quantization as mtq
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from modelopt.torch.export.quant_utils import get_quant_config
 from modelopt.torch.quantization.utils import is_quantized
 from torch.utils.data import DataLoader
@@ -185,8 +185,17 @@ def get_llm_calib_dataloader(
             f"Recognized local dataset repo {dataset_dir} for calibration; "
             "assuming the calibration data are in the train split and text column."
         )
-        dataset = load_dataset(dataset_dir, split="train")
-        dataset = dataset["text"][:num_samples]
+        dataset = load_from_disk(dataset_dir)
+        # Ensure we use the 'train' split if it's a DatasetDict
+        if hasattr(dataset, "keys") and "train" in dataset:
+            dataset = dataset["train"]
+        
+        # Determine the data column
+        col_name = "text" if "text" in dataset.column_names else "content"
+        if col_name not in dataset.column_names:
+             raise ValueError(f"Could not find 'text' or 'content' column in {dataset_dir}. Columns: {dataset.column_names}")
+             
+        dataset = dataset[col_name][:num_samples]
     else:
         raise NotImplementedError(
             f"Unsupported dataset name or local repo directory: {dataset_dir}."

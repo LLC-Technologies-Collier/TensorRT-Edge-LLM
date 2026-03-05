@@ -63,8 +63,8 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void)
     }
     else
     {
-        LOG_INFO("EDGELLM_PLUGIN_PATH variable is not set. Default to build/libNvInfer_edgellm_plugin.so");
-        pluginPath = "build/libNvInfer_edgellm_plugin.so";
+        LOG_INFO("EDGELLM_PLUGIN_PATH variable is not set. Default to libNvInfer_edgellm_plugin.so (relying on LD_LIBRARY_PATH)");
+        pluginPath = "libNvInfer_edgellm_plugin.so";
     }
 
     auto handle = std::unique_ptr<void, DlDeleter>(dlopen(pluginPath, RTLD_LAZY));

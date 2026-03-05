@@ -630,6 +630,34 @@ bool LLMEngineRunner::validateConfigFromEngine()
         return false;
     }
 
+    // Check for optional IO bindings
+    for (int32_t i = 0; i < numIOBindings; ++i)
+    {
+        std::string const bindingName = mEngine->getIOTensorName(i);
+        if (bindingName == binding_names::kOutputHiddenStates)
+        {
+            mHasHiddenStatesOutput = true;
+            LOG_INFO("validateConfigFromEngine(): Engine has hidden_states output binding.");
+            
+            Dims const hiddenDim = mEngine->getTensorShape(binding_names::kOutputHiddenStates);
+            mConfig.outputHiddenDim = hiddenDim.d[2];
+            
+            // Allocate dummy hidden states buffer [MaxBatchSize, MaxInputLen, HiddenDim]
+            mDummyHiddenStates = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxSupportedInputLength, mConfig.outputHiddenDim},
+                rt::DeviceType::kGPU, mEngine->getTensorDataType(binding_names::kOutputHiddenStates));
+        }
+        else if (bindingName == binding_names::kAttentionMask)
+        {
+            mHasAttentionMaskInput = true;
+            LOG_INFO("validateConfigFromEngine(): Engine has attention_mask input binding.");
+        }
+        else if (bindingName == binding_names::kAttentionPosId)
+        {
+            mHasAttentionPosIdInput = true;
+            LOG_INFO("validateConfigFromEngine(): Engine has attention_pos_id input binding.");
+        }
+    }
+
     // Obtain rotary dim from the engine.
     Dims const ropeCosSinCacheDim = mEngine->getTensorShape(binding_names::kRopeCosSin);
     if (mConfig.rotaryDim != ropeCosSinCacheDim.d[2])
@@ -767,20 +795,26 @@ if ((deepstackEmbedsCount != mConfig.numDeepstackFeatures) && (deepstackEmbedsCo
             outputLogits.getShape().formatString().c_str());
         return false;
     }
-    if (mConfig.enableEagleSpecDecode)
+    if (mHasHiddenStatesOutput)
     {
-        bool const isHiddenStatesShapeValid = outputHiddenStates.has_value()
-            && outputHiddenStates.value().get().getShape().getNumDims() == 3
-            && outputHiddenStates.value().get().getShape()[0] == activeBatchSize
-            && outputHiddenStates.value().get().getShape()[1] == prefillSequenceLength
-            && outputHiddenStates.value().get().getShape()[2] == mConfig.outputHiddenDim;
-        if (!isHiddenStatesShapeValid)
-        {
+        if (outputHiddenStates.has_value()) {
+            bool const isHiddenStatesShapeValid = outputHiddenStates.value().get().getShape().getNumDims() == 3
+                && outputHiddenStates.value().get().getShape()[0] == activeBatchSize
+                && outputHiddenStates.value().get().getShape()[1] == prefillSequenceLength
+                && outputHiddenStates.value().get().getShape()[2] == mConfig.outputHiddenDim;
+            if (!isHiddenStatesShapeValid)
+            {
+                LOG_ERROR(
+                    "Invalid shape of the output hidden states tensor. The output hidden states tensor should have shape "
+                    "[%d, %d, %d]. Current hidden states shape is %s.",
+                    activeBatchSize, prefillSequenceLength, mConfig.outputHiddenDim,
+                    outputHiddenStates.value().get().getShape().formatString().c_str());
+                return false;
+            }
+        } else if (mConfig.enableEagleSpecDecode) {
             LOG_ERROR(
                 "With SpecDecode enabled, the output hidden states tensor shall be valid and has shape "
-                "[activeBatchSize, %d, %d]. Current hidden states shape is %s.",
-                prefillSequenceLength, mConfig.outputHiddenDim,
-                outputHiddenStates.value().get().getShape().formatString().c_str());
+                "[%d, %d, %d].", activeBatchSize, prefillSequenceLength, mConfig.outputHiddenDim);
             return false;
         }
     }
@@ -892,19 +926,34 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
                 &= mTRTExecutionContext->setInputShape(embedName.c_str(), embedTensor.getShape().getTRTDims());
         }
     }
-    if (mConfig.enableEagleSpecDecode)
+    if (mHasHiddenStatesOutput)
     {
+        void* hiddenStatesPtr = outputHiddenStates.has_value() 
+            ? outputHiddenStates.value().get().rawPointer() 
+            : mDummyHiddenStates.rawPointer();
+            
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kOutputHiddenStates, outputHiddenStates.value().get().rawPointer());
-        // Mask input and optional token pos-ids are not used, set to dummy data.
-        setEngineIOStatus
-            &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mDummyInputTensor.rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kAttentionMask, Coords{activeBatchSize, 1, 1}.getTRTDims());
-        setEngineIOStatus
-            &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDummyInputTensor.rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kAttentionPosId, Coords{activeBatchSize, 1}.getTRTDims());
+            binding_names::kOutputHiddenStates, hiddenStatesPtr);
+        
+        if (mConfig.enableEagleSpecDecode)
+        {
+            // Mask input and optional token pos-ids are not used, set to dummy data.
+            if (mHasAttentionMaskInput)
+            {
+                setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+                    binding_names::kAttentionMask, mDummyInputTensor.rawPointer());
+                setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+                    binding_names::kAttentionMask, Coords{activeBatchSize, 1, 1}.getTRTDims());
+            }
+            
+            if (mHasAttentionPosIdInput)
+            {
+                setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+                    binding_names::kAttentionPosId, mDummyInputTensor.rawPointer());
+                setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+                    binding_names::kAttentionPosId, Coords{activeBatchSize, 1}.getTRTDims());
+            }
+        }
     }
 
     // Engine output tensors.
@@ -1061,6 +1110,12 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
         {
             setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
                 binding_names::kOutputHiddenStates, mDummyOutputTensor.rawPointer());
+        }
+
+        if (mHasHiddenStatesOutput)
+        {
+            setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+                binding_names::kOutputHiddenStates, mDummyHiddenStates.rawPointer());
         }
 
         if (!setEngineIOStatus)
@@ -1240,15 +1295,23 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
         // Update KV cache shapes to match activeBatchSize
         setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
-        setEngineIOStatus
-            &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mEagleBasePackedMask.rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kAttentionMask, mEagleBasePackedMask.getShape().getTRTDims());
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kAttentionPosId, mEagleBasePositionIds.rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kAttentionPosId, mEagleBasePositionIds.getShape().getTRTDims());
+        if (mHasAttentionMaskInput)
+        {
+            setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+                binding_names::kAttentionMask, mEagleBasePackedMask.rawPointer());
+            setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+                binding_names::kAttentionMask, mEagleBasePackedMask.getShape().getTRTDims());
+        }
+        
+        if (mHasAttentionPosIdInput)
+        {
+            setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+                binding_names::kAttentionPosId, mEagleBasePositionIds.rawPointer());
+            setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+                binding_names::kAttentionPosId, mEagleBasePositionIds.getShape().getTRTDims());
+        }
 
+        // Bind the output tensor into the engine.
         // Bind deepstack_embeds to dummy tensors for Qwen3VL models during Eagle base tree decoding
         if (mConfig.numDeepstackFeatures > 0)
         {
@@ -1391,10 +1454,11 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
 
     // Engine output tensors.
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-    if (mConfig.enableEagleSpecDecode)
+
+    if (mHasHiddenStatesOutput)
     {
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kOutputHiddenStates, mDummyOutputTensor.rawPointer());
+            binding_names::kOutputHiddenStates, mDummyHiddenStates.rawPointer());
     }
 
     // Bind the KVCache since we haven't executed the real prefill step.

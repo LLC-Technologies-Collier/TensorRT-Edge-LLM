@@ -66,7 +66,7 @@ from ..llm_models.model_utils import (is_gptq_model,
                                       load_eagle3_draft_model, load_llm_model,
                                       load_reduced_vocab_map)
 from .config_export import export_llm_config
-from .onnx_utils import export_onnx
+from .onnx_utils import export_onnx, trim_memory
 
 
 def save_d2t_for_eagle3_draft(draft_model: nn.Module, output_dir: str) -> None:
@@ -105,7 +105,8 @@ def create_dummy_inputs(model: nn.Module,
                         is_eagle_draft: bool,
                         use_prompt_tuning: bool,
                         torch_dtype: torch.dtype = torch.float16,
-                        fp8_kv_cache: bool = False) -> Dict[str, Any]:
+                        fp8_kv_cache: bool = False,
+                        output_hidden_states: bool = False) -> Dict[str, Any]:
     """
     Create dummy inputs for ONNX export.
     
@@ -113,7 +114,9 @@ def create_dummy_inputs(model: nn.Module,
         model: The model to create inputs for
         is_eagle_base: Whether this is an EAGLE base model
         is_eagle_draft: Whether this is an EAGLE draft model
+        use_prompt_tuning: Whether the model uses prompt tuning
         fp8_kv_cache: Whether to use FP8 KV cache
+        output_hidden_states: Whether to output hidden states
         
     Returns:
         dict: Dictionary containing dummy inputs
@@ -167,13 +170,13 @@ def create_dummy_inputs(model: nn.Module,
         past_key_values.append(past_key_value)
 
     # Create last_token_ids
-    if not is_eagle_base and not is_eagle_draft:
+    if not is_eagle_base and not is_eagle_draft and not output_hidden_states:
         last_token_ids = torch.full([batch_size, 1],
                                     seq_len - 1,
                                     dtype=torch.int64,
                                     device=device)
     else:
-        # For EAGLE models, maintain batch dimension for proper GatherND support
+        # For EAGLE models or models with hidden states output, maintain 2D shape
         num_selected_tokens = 2
         last_token_ids = torch.full([batch_size, num_selected_tokens],
                                     seq_len - 1,
@@ -288,7 +291,10 @@ def replace_torch_quant_linear_with_int4_plugin(model: nn.Module) -> nn.Module:
 
 def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
                          output_dir: str, is_eagle_base: bool,
-                         is_eagle_draft: bool) -> None:
+                         is_eagle_draft: bool,
+                         use_prompt_tuning: bool,
+                         output_hidden_states: bool = False,
+                         force: bool = False) -> None:
     """
     Export the model to ONNX format.
     
@@ -298,6 +304,9 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
         output_dir: Directory to save the ONNX model
         is_eagle_base: Whether this is an EAGLE base model
         is_eagle_draft: Whether this is an EAGLE draft model
+        use_prompt_tuning: Whether the model uses prompt tuning
+        output_hidden_states: Whether to output hidden states
+        force: Whether to force re-export even if artifacts exist
     """
     print(f"Exporting model to ONNX format: {output_dir}")
 
@@ -365,8 +374,39 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
             input_names += [f'deepstack_embeds_{i}' for i in range(3)]
 
         # Create output names
-        output_names = (['logits', 'hidden_states'] if (is_eagle_base or is_eagle_draft) else ['logits']) + \
-                       [f'present_key_values_{i}' for i in range(num_layers)]
+        if is_eagle_base or is_eagle_draft or output_hidden_states:
+            output_names = ['logits', 'hidden_states'] + [
+                f'present_key_values_{i}' for i in range(num_layers)
+            ]
+        else:
+            output_names = ['logits'] + [
+                f'present_key_values_{i}' for i in range(num_layers)
+            ]
+        # Create dynamic shapes
+        past_key_values_shapes = {
+            f"past_key_values.{i}": {
+                0: "batch_size",
+                3: "past_len"
+            }
+            for i in range(num_layers)
+        }
+
+        present_key_values_shapes = {
+            f"present_key_values.{i}": {
+                0: "batch_size",
+                3: "present_kv_cache_len"
+            }
+            for i in range(num_layers)
+        }
+
+        # Define dynamic axes for last_token_ids based on model type
+        if is_eagle_base or is_eagle_draft or output_hidden_states:
+            # EAGLE models: (batch_size, num_selected_tokens)
+            last_token_ids_axes = {0: "batch_size", 1: "num_selected_tokens"}
+        else:
+            # Standard models: (batch_size, 1)
+            last_token_ids_axes = {0: "batch_size"}
+>>>>>>> a0477b4 (# TensorRT-Edge-LLM Change Description)
 
         # Create dynamic axes
         dynamic_axes = {
@@ -453,13 +493,36 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
                 },
             })
 
+<<<<<<< HEAD
+=======
+        # Add dynamic axes for outputs
+        if is_eagle_base or is_eagle_draft or output_hidden_states:
+            # EAGLE models: logits shape (batch_size, num_selected_tokens, vocab_size)
+            if is_eagle_base or is_eagle_draft:
+                dynamic_axes["logits"] = {
+                    0: "batch_size",
+                    1: "num_selected_tokens"
+                }
+            else:
+                # Standard models: logits shape (batch_size, num_tokens, vocab_size)
+                dynamic_axes["logits"] = {0: "batch_size", 1: "num_tokens"}
+
+            # hidden_states shape
+            # Eagle base: (batch_size, seq_len, 3*hidden_dim)
+            # Eagle draft: (batch_size, seq_len, hidden_dim)
+            # Standard model: (batch_size, seq_len, hidden_dim)
+            dynamic_axes["hidden_states"] = {0: "batch_size", 1: "seq_len"}
+        else:
+            # Standard models: logits shape (batch_size, num_tokens, vocab_size)
+            dynamic_axes["logits"] = {0: "batch_size", 1: "num_tokens"}
+
         # Register ONNX symbolic functions
         register_attention_plugin_onnx_symbolic_functions()
         register_gather_nd_onnx_symbolic_functions()
 
         # Export to ONNX
         export_onnx(model, inputs, output_dir, input_names, output_names,
-                    dynamic_axes)
+                    dynamic_axes, force=force)
 
     except Exception as e:
         raise RuntimeError(f"Failed to export model to ONNX: {str(e)}")
@@ -471,7 +534,7 @@ def is_export_complete(output_dir: str) -> bool:
     
     required_files = [
         "model.onnx",
-        "onnx_model.data",
+        "model.onnx.data",
         "config.json",
         "processed_chat_template.json"
     ]
@@ -498,7 +561,8 @@ def export_llm_model(model_dir: str,
                      is_eagle_base: bool = False,
                      reduced_vocab_dir: Optional[str] = None,
                      chat_template_path: Optional[str] = None,
-                     fp8_kv_cache: bool = False) -> None:
+                     output_hidden_states: bool = False,
+                     force: bool = False) -> None:
     """
     Export a language model to ONNX format with custom attention plugin.
     
@@ -508,14 +572,16 @@ def export_llm_model(model_dir: str,
     Args:
         model_dir: Directory containing the HuggingFace model
         output_dir: Directory to save the exported ONNX model
+        dtype: Data type to use for the model (fp16 or bf16).
         device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
         is_eagle_base: Whether the model is an EAGLE3 base model (vs standard LLM)
         reduced_vocab_dir: Directory containing vocab_map.safetensors for vocabulary reduction (optional)
         chat_template_path: Path to chat template JSON file. When provided, this template is validated and used instead of inferring from the model (optional)
-        fp8_kv_cache: Whether to use FP8 KV cache
+        output_hidden_states: Whether to output hidden states
+        force: Whether to force re-export even if artifacts exist
     """
     # Fast exit check
-    if is_export_complete(output_dir):
+    if not force and is_export_complete(output_dir):
         print(f"Full export found in {output_dir}. Skipping tracing and post-processing.")
         print(f"Export completed successfully in 0s. Files saved to: {output_dir}")
         return
@@ -541,11 +607,12 @@ def export_llm_model(model_dir: str,
     # Load model
     model, tokenizer, processor = load_llm_model(
         model_dir,
-        dtype='fp16',
+        dtype=dtype,
         device=device,
         is_eagle_base=is_eagle_base,
         reduced_vocab_size=reduced_vocab_size,
-        vocab_map=vocab_map)
+        vocab_map=vocab_map,
+        output_hidden_states=output_hidden_states)
 
     model = replace_torch_quant_linear_with_int4_plugin(model)
 
@@ -555,18 +622,29 @@ def export_llm_model(model_dir: str,
                                        is_eagle_draft=False,
                                        use_prompt_tuning=use_prompt_tuning,
                                        torch_dtype=model.torch_dtype,
-                                       fp8_kv_cache=fp8_kv_cache)
+                                       fp8_kv_cache=fp8_kv_cache,
+                                       output_hidden_states=output_hidden_states)
 
     # Export to ONNX
     export_model_to_onnx(model,
                          dummy_inputs,
                          output_dir,
                          is_eagle_base=is_eagle_base,
-                         is_eagle_draft=False)
+                         is_eagle_draft=False,
+                         use_prompt_tuning=use_prompt_tuning,
+                         output_hidden_states=output_hidden_states,
+                         force=force)
+
+    # MEMORY OPTIMIZATION: Release the massive model and tracing buffers from RAM 
+    # before proceeding to config/tokenizer saving.
+    model_config_snapshot = model.config # Keep config for saving
+    del model
+    del dummy_inputs
+    trim_memory()
 
     # Save model configuration
-    model_type = 'eagle3_base' if is_eagle_base else 'llm'
-    model_config = export_llm_config(model.config, model_type)
+    model_type = 'eagle3_base' if (is_eagle_base or output_hidden_states) else 'llm'
+    model_config = export_llm_config(model_config_snapshot, model_type)
 
     # Add reduced_vocab_size to config if vocabulary reduction is used
     if reduced_vocab_size is not None:

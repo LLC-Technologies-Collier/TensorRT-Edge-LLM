@@ -313,6 +313,9 @@ def load_hf_model(
     Raises:
         ValueError: If dtype is not supported or model loading fails
     """
+    import torch
+    torch.cuda.init()  # Explicitly initialize CUDA context
+
     # Convert dtype string to torch dtype
     if dtype == "fp16":
         torch_dtype = torch.float16
@@ -325,6 +328,7 @@ def load_hf_model(
     tokenizer = AutoTokenizer.from_pretrained(model_dir,
                                               trust_remote_code=True)
 
+    uses_device_map = False
     # Due to a known loading issue with Phi4MM on recent transformers, special handling is required.
     # See: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/discussions/75.
     if _is_phi4mm_model(model_dir):
@@ -336,19 +340,31 @@ def load_hf_model(
             model_dir,
             torch_dtype=torch_dtype,
             trust_remote_code=True,
-            attn_implementation="eager").to(device)
+            attn_implementation="eager").cpu()
 
     elif _is_qwen3_omni_model(model_dir):
         from transformers import Qwen3OmniForConditionalGeneration
         model = Qwen3OmniForConditionalGeneration.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
-            trust_remote_code=True).to(device)
+            trust_remote_code=True).cpu()
     else:
-        # Try loading as AutoModelForCausalLM first
+        # Aggressive memory management: cap RAM usage and enable disk offload
+        # Increased to 64GiB to support larger models like 14B/32B on Thor (128GB total)
+        max_memory = {device.type if device.type != "cpu" else "cpu": "64GiB"}
+        offload_dir = os.path.join(model_dir, "offload_temp")
+        os.makedirs(offload_dir, exist_ok=True)
+
         try:
             model = AutoModelForCausalLM.from_pretrained(
-                model_dir, torch_dtype=torch_dtype,
-                trust_remote_code=True).to(device)
+                model_dir,
+                torch_dtype=torch_dtype,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+                device_map={"": device.type}, 
+                max_memory=max_memory,
+                offload_folder=offload_dir,
+                attn_implementation="eager")
+            uses_device_map = True
         except Exception:
             # If that fails, try AutoModelForImageTextToText
             try:
@@ -356,12 +372,18 @@ def load_hf_model(
                 # In VLMs, the model has both model.language_model and model.vision_model.
                 model = AutoModelForImageTextToText.from_pretrained(
                     model_dir, torch_dtype=torch_dtype,
-                    trust_remote_code=True).to(device)
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True).to(device)
             except Exception as e:
                 raise ValueError(
                     f"Could not load model from {model_dir}. Error: {e}")
-    if not is_gptq_model(model):
-        model.to(torch_dtype)
+
+    if not is_gptq_model(model) and not uses_device_map:
+        # Only call .to() if we didn't use device_map (which handles placement)
+        model.to(torch_dtype).to(device)
+    elif uses_device_map:
+        # Ensure model is on the correct device even if device_map was used
+        model.to(device)
 
     # Set tokenizer padding token if needed
     if tokenizer.pad_token != "<unk>":
@@ -394,7 +416,8 @@ def load_llm_model(
     device: str,
     is_eagle_base: bool,
     reduced_vocab_size: Optional[int] = None,
-    vocab_map: Optional[torch.Tensor] = None
+    vocab_map: Optional[torch.Tensor] = None,
+    output_hidden_states: bool = False
 ) -> tuple[nn.Module, bool, AutoTokenizer, Optional[AutoProcessor]]:
     """
     Load a language model (standard or EAGLE base).
@@ -406,6 +429,7 @@ def load_llm_model(
         is_eagle_base: Whether this is an EAGLE3 base model
         reduced_vocab_size: Size of the reduced vocabulary (optional)
         vocab_map: Tensor of shape (reduced_vocab_size,) with int32 indices for vocabulary reduction (optional)
+        output_hidden_states: Whether to output hidden states
         
     Returns:
         tuple: (model, use_prompt_tuning, tokenizer, processor)
@@ -425,19 +449,19 @@ def load_llm_model(
     if _is_gemma_model(model_dir):
         edge_model = EdgeGemma3ModelForCausalLM(model, is_eagle_base,
                                              use_prompt_tuning, reduced_vocab_size,
-                                             vocab_map)
+                                             vocab_map, output_hidden_states=output_hidden_states)
     elif _is_nemotron_model(model_dir):
         edge_model = EdgeNemotronModelForCausalLM(model, is_eagle_base,
                                              use_prompt_tuning, reduced_vocab_size,
-                                             vocab_map)
+                                             vocab_map, output_hidden_states=output_hidden_states)
     elif _is_qwen3_omni_model(model_dir):
         edge_model = EdgeLLMModelForCausalLM(model.thinker, is_eagle_base,
                                              use_prompt_tuning, reduced_vocab_size,
-                                             vocab_map)
+                                             vocab_map, output_hidden_states=output_hidden_states)
     else:
         edge_model = EdgeLLMModelForCausalLM(model, is_eagle_base,
                                              use_prompt_tuning, reduced_vocab_size,
-                                             vocab_map)
+                                             vocab_map, output_hidden_states=output_hidden_states)
 
     del model
     gc.collect()

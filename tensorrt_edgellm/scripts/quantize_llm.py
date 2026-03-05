@@ -26,10 +26,21 @@ Usage:
     # Quantize with different quantization for LM head
     python quantize_llm.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8 --lm_head_quantization fp8
 """
-
 import argparse
 import sys
 import traceback
+import torch
+import os
+
+print("--- PYTHON ENV DEBUG ---")
+print(f"sys.executable: {sys.executable}")
+print("sys.path:")
+for p in sys.path:
+    print(f"  - {p}")
+print(f"torch location: {torch.__file__}")
+print(f"torch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+print("--- END PYTHON ENV DEBUG ---")
 
 from tensorrt_edgellm.quantization.llm_quantization import \
     quantize_and_save_llm
