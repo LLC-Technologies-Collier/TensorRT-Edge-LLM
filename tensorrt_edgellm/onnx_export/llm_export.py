@@ -406,7 +406,6 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
         else:
             # Standard models: (batch_size, 1)
             last_token_ids_axes = {0: "batch_size"}
->>>>>>> a0477b4 (# TensorRT-Edge-LLM Change Description)
 
         # Create dynamic axes
         dynamic_axes = {
@@ -435,12 +434,7 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
             "context_lengths": {
                 0: "batch_size"
             },
-            "last_token_ids": {
-                0: "batch_size",
-                1: "num_selected_tokens"
-            } if (is_eagle_base or is_eagle_draft) else {
-                0: "batch_size"
-            },
+            "last_token_ids": last_token_ids_axes,
             "kvcache_start_index": {
                 0: "kv_cache_start_batch_size"
             },
@@ -493,8 +487,6 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
                 },
             })
 
-<<<<<<< HEAD
-=======
         # Add dynamic axes for outputs
         if is_eagle_base or is_eagle_draft or output_hidden_states:
             # EAGLE models: logits shape (batch_size, num_selected_tokens, vocab_size)
@@ -605,7 +597,7 @@ def export_llm_model(model_dir: str,
             reduced_vocab_dir, device)
 
     # Load model
-    model, tokenizer, processor = load_llm_model(
+    model, use_prompt_tuning, tokenizer, processor = load_llm_model(
         model_dir,
         dtype=dtype,
         device=device,
@@ -622,7 +614,7 @@ def export_llm_model(model_dir: str,
                                        is_eagle_draft=False,
                                        use_prompt_tuning=use_prompt_tuning,
                                        torch_dtype=model.torch_dtype,
-                                       fp8_kv_cache=fp8_kv_cache,
+                                       fp8_kv_cache=False,
                                        output_hidden_states=output_hidden_states)
 
     # Export to ONNX
@@ -634,6 +626,10 @@ def export_llm_model(model_dir: str,
                          use_prompt_tuning=use_prompt_tuning,
                          output_hidden_states=output_hidden_states,
                          force=force)
+
+    # Save embedding.safetensors for all models (EAGLE base and regular models)
+    # Draft models don't need embeddings as they use the base model's embeddings
+    save_embedding_table(model, output_dir)
 
     # MEMORY OPTIMIZATION: Release the massive model and tracing buffers from RAM 
     # before proceeding to config/tokenizer saving.
@@ -655,10 +651,6 @@ def export_llm_model(model_dir: str,
     with open(config_path, 'w') as f:
         json.dump(model_config, f, indent=2)
     print(f"Model configuration saved to {config_path}")
-
-    # Save embedding.safetensors for all models (EAGLE base and regular models)
-    # Draft models don't need embeddings as they use the base model's embeddings
-    save_embedding_table(model, output_dir)
 
     # Save tokenizer files
     tokenizer.save_pretrained(output_dir)

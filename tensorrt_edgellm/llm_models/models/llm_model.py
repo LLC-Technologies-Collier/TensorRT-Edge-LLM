@@ -30,8 +30,7 @@ import torch
 from torch import nn
 
 from ..layers.gather_nd import custom_gather_nd
-from ..layers.layers import (EdgeLLMDecoderLayer, PromptTuningEmbedding,
-                             Qwen3VLDeepStackProcess)
+from ..layers.layers import EdgeLLMDecoderLayer, PromptTuningEmbedding
 from ..layers.reduced_lm_head import reduce_lm_head
 
 
@@ -181,13 +180,7 @@ class EdgeLLMModel(nn.Module):
             # Apply deepstack processing for Qwen3VL and Qwen3OmniThinker
             if deepstack_visual_embeds is not None and idx in range(
                     len(deepstack_visual_embeds)):
-                assert self.config.model_type == "qwen3_vl_text", "Qwen3VLTextModel is required for deepstack processing"
-                hidden_states = Qwen3VLDeepStackProcess(
-                    self.embed_tokens.num_embeddings)(
-                        input_ids,
-                        hidden_states,
-                        deepstack_visual_embeds[idx],
-                    )
+                raise NotImplementedError("Deepstack processing requires Qwen3VLDeepStackProcess which is disabled.")
 
         # Apply final normalization
         hidden_states = self.norm(hidden_states)

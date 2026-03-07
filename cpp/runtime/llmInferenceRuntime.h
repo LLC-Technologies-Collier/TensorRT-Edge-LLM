@@ -139,6 +139,14 @@ public:
         return *mTokenizer;
     }
 
+    /*! \brief Get the embedding table tensor
+     *  \return Const reference to embedding table tensor
+     */
+    rt::Tensor const& getEmbeddingTable() const
+    {
+        return mEmbeddingTable;
+    }
+
 private:
     /*! \brief Helper structure to hold token counting results
      */

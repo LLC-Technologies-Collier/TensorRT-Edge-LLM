@@ -28,6 +28,7 @@
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
+#include <list>
 
 using Json = nlohmann::json;
 
@@ -553,6 +554,8 @@ private:
     int32_t mTargetModelOutputHiddenDim{0}; //!< Target output hidden dimension
     int32_t mNumDeepstackFeatures{0};       //!< Number of deepstack features (for Qwen3VL)
     Json mModelConfig;                      //!< Parsed model configuration
+
+    std::list<std::string> mProfileNames;   //!< Storage for profile names to prevent dangling pointers
 };
 
 //! Builder class for visual encoder TensorRT engines.

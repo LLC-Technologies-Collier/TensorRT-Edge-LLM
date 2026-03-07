@@ -1114,7 +1114,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
 
         if (mHasHiddenStatesOutput)
         {
-            setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
                 binding_names::kOutputHiddenStates, mDummyHiddenStates.rawPointer());
         }
 

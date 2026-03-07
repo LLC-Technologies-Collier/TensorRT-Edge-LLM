@@ -155,7 +155,6 @@ def main() -> None:
                          is_eagle_base=args.is_eagle_base,
                          reduced_vocab_dir=args.reduced_vocab_dir,
                          chat_template_path=args.chat_template_path,
-                         fp8_kv_cache=args.fp8_kv_cache,
                          output_hidden_states=args.output_hidden_states,
                          force=args.force)
         print("LLM model export completed successfully!")

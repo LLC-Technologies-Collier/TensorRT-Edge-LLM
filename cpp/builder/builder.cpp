@@ -101,12 +101,18 @@ bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, char const*
 {
     if (!checkOptimizationProfileDims(minDims, optDims, maxDims))
     {
-        LOG_INFO("setOptimizationProfile: %s is not valid", inputName);
+        LOG_INFO("setOptimizationProfile: %s is not valid (MIN/OPT/MAX dimensions mismatch)", inputName);
         return false;
     }
-    return profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMIN, minDims)
-        && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kOPT, optDims)
-        && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMAX, maxDims);
+    bool min_set = profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMIN, minDims);
+    bool opt_set = profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kOPT, optDims);
+    bool max_set = profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMAX, maxDims);
+    
+    if (!min_set || !opt_set || !max_set) {
+        LOG_INFO("setOptimizationProfile failed to set dimensions for %s (MIN: %d, OPT: %d, MAX: %d)", inputName, min_set, opt_set, max_set);
+        return false;
+    }
+    return true;
 }
 //! Print detailed information about the TensorRT network.
 //! Shows input and output tensor names and shapes for debugging purposes.
@@ -653,6 +659,9 @@ bool LLMBuilder::setupEagleProfiles(
             createDims({mBuilderConfig.maxBatchSize, maxTokens}));
     }
 
+    // KV cache profiles MUST be added for Eagle models too
+    result &= setupKVCacheProfiles(contextProfile, generationProfile);
+
     return result;
 }
 
@@ -805,12 +814,23 @@ bool LLMBuilder::setupKVCacheProfiles(
     nvinfer1::Dims maxKVCacheShape
         = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
 
+    LOG_INFO("setupKVCacheProfiles called with mNbKVCacheInputs=%d", mNbKVCacheInputs);
+
     for (int i = 0; i < mNbKVCacheInputs; ++i)
     {
-        result &= setOptimizationProfile(contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
+        std::string pastName = binding_names::formatKVCacheName(i, true);
+        mProfileNames.push_back(pastName);
+        
+        bool c_res = setOptimizationProfile(contextProfile, mProfileNames.back().c_str(),
             minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-        result &= setOptimizationProfile(generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
+        bool g_res = setOptimizationProfile(generationProfile, mProfileNames.back().c_str(),
             minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            
+        if (!c_res || !g_res) {
+            LOG_ERROR("Failed to set profile for %s (context:%d, gen:%d)", mProfileNames.back().c_str(), c_res, g_res);
+        }
+        
+        result &= (c_res && g_res);
     }
 
     return result;

@@ -45,6 +45,7 @@ struct LLMEngineRunnerConfig
     RopeConfig ropeConfig{};             //!< Type of rotary positional encoding
     bool useContextDependentRope{false}; //!< Use context-dependent RoPE
     bool enableEagleSpecDecode{false};   //!< Enable Eagle speculative decoding
+    bool isVlm{false};                   //!< Whether this is a Vision Language Model
     int32_t numDecoderLayers{};          //!< Number of decoder layers
     int32_t numKVHeads{};                //!< Number of key-value heads
     int32_t headDim{};                   //!< Dimension of each attention head
