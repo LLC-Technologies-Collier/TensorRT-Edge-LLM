@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common/tensor.h"
+#include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
 
 #include <cstdint>
@@ -67,6 +68,9 @@ struct LLMGenerationRequest
     {
         std::vector<Message> messages; //!< Structured messages (required - use chat template format)
         std::vector<rt::imageUtils::ImageData> imageBuffers; //!< Optional image data for multimodal inputs
+        std::vector<rt::audioUtils::AudioData> audioBuffers; //!< Optional audio data for multimodal inputs (Qwen3-Omni)
+
+        mutable FormattedRequest formatted; //!< Formatted request (populated by tokenizer or user-provided)
     };
     //! \endcond
     std::vector<Request> requests; //!< Vector of requests for a batch
@@ -107,6 +111,7 @@ enum class RopeType
     kDynamic,  //!< Dynamic RoPE type used by InternVL-3
     kLongRope, //!< Long RoPE type used by Phi-4
     kMRope,    //!< MRope type used by Qwen2-VL
+    kNoRope,   //!< No positional encoding (e.g., Nemotron-Nano)
 };
 
 /*! \brief Long-Rope specific parameters */
@@ -138,6 +143,7 @@ struct RopeConfig
  *
  *  \param config [JSON] The model config file supplied with the model
  *  \return The parsed rope configuration
+ *  \throws nlohmann::json::type_error if JSON value types don't match expected types
  */
 RopeConfig collectRopeConfig(nlohmann::json const& config);
 
@@ -145,24 +151,33 @@ RopeConfig collectRopeConfig(nlohmann::json const& config);
  *
  *  \param cosSinCache [GPU] The tensor to store the rope cos/sin cache
  *  \param config [RopeConfig] The basic rope configuration
- *  \param modelConfig [JSON] Model config json that can supply additional information for the rope initialization
  *  \param stream [CUDA stream] The stream to execute the initialization
  *  \return True if the initialization is successful, false otherwise
  */
-bool initializeRopeCosSinCache(
-    rt::Tensor& cosSinCache, RopeConfig const& config, nlohmann::json const& modelConfig, cudaStream_t stream);
+bool initializeRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& config, cudaStream_t stream) noexcept;
+
+/*! \brief Initialize an identity cos/sin cache for models without positional encoding (NoPE)
+ *
+ *  Fills the first half of each position's rotaryDim with 1.0 (cos) and the
+ *  second half with 0.0 (sin), making the RoPE kernel a pass-through.
+ *
+ *  \param cosSinCache [GPU] The tensor to fill, shape [1, maxLength, rotaryDim]
+ *  \param stream [CUDA stream] The stream to execute the copy
+ *  \return True on success
+ */
+bool initializeNopeCosSinCache(rt::Tensor& cosSinCache, cudaStream_t stream) noexcept;
 
 /*! \brief Initialize the rope cos/sin cache tensor for long rope type
  *
  *  \param shortCosSinCache [GPU] The tensor to store the short rope cos/sin cache
  *  \param longCosSinCache [GPU] The tensor to store the long rope cos/sin cache
  *  \param config [RopeConfig] The rope configuration
- *  \param modelConfig [JSON] Model config json that can supply additional information for the rope initialization
  *  \param stream [CUDA stream] The stream to execute the initialization
  *  \return True if the initialization is successful, false otherwise
+ *  \throws std::runtime_error if CUDA operations fail
  */
-bool initializeLongRopeCosSinCache(rt::Tensor& shortCosSinCache, rt::Tensor& longCosSinCache, RopeConfig const& config,
-    nlohmann::json const& modelConfig, cudaStream_t stream);
+bool initializeLongRopeCosSinCache(
+    rt::Tensor& shortCosSinCache, rt::Tensor& longCosSinCache, RopeConfig const& config, cudaStream_t stream);
 
 /*!
  * @brief Format rope configuration into string
@@ -178,6 +193,7 @@ std::string formatRopeConfig(RopeConfig const& config);
  * @tparam T Element type
  * @param batchMapping      [oldActiveBatch] CPU vector (const input), mapping[i] = newBatchIdx or -1 (evict)
  * @param vec               Vector to compact (output, modified in-place)
+ * @throws std::invalid_argument if sizes of input vectors don't match
  */
 template <typename T>
 void compactVector(std::vector<int32_t> const& batchMapping, std::vector<T>& vec);

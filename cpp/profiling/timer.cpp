@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,12 +27,12 @@ namespace trt_edgellm
 // Global profiling control flag implementation
 static bool gProfilingEnabled = false;
 
-bool getProfilingEnabled()
+bool getProfilingEnabled() noexcept
 {
     return gProfilingEnabled;
 }
 
-void setProfilingEnabled(bool enabled)
+void setProfilingEnabled(bool enabled) noexcept
 {
     gProfilingEnabled = enabled;
 }
@@ -40,7 +40,7 @@ void setProfilingEnabled(bool enabled)
 namespace timer
 {
 
-void Timer::reset()
+void Timer::reset() noexcept
 {
     mTimingData.clear();
     mTimers.clear();

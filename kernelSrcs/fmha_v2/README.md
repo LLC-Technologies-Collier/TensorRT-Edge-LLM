@@ -7,8 +7,8 @@ This document outlines the process for generating the pre-compiled FMHA_V2 CUDA 
 ```bash
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
-git checkout 636c622bb8685b9db7422b3fa064a173cf1ff2a8
-git apply gen_fmha_cubin.patch
+git checkout 0ffa77af51b272ba27424564ed253096d6f0f11a
+git apply /path/to/gen_fmha_cubin.patch
 cd cpp/kernels/fmha_v2
 ```
 
@@ -19,7 +19,7 @@ These architectures can be compiled with a **CUDA 12.8** Toolkit.
 **Steps:**
 ```bash
 # 1) Generate the arch–specific .cu sources & headers
-export GENERATE_EDGE_LLM=1 GENERATE_CUBIN=1 ENABLE_SM100=1
+export GENERATE_EDGE_LLM=1 GENERATE_CUBIN=1 ENABLE_SM10X=1
 python3 setup.py
 
 # 2) Build the cubins (old BERT parameter layout)
@@ -64,4 +64,8 @@ make bin/fmha.exe -j$(nproc)
 
 bin/fmha.exe -v 1 -runs 5 -warm-up-runs 2  -s 1024 -d 128  -b 1 -causal-mask -grouped-query-attention 2 -h 14 -fix-s
 bin/fmha.exe -v 1 -runs 5 -warm-up-runs 2  -s 128 -d 64  -b 1 -causal-mask -grouped-query-attention 2 -h 14 -fix-s -force-non-tiled
+bin/fmha.exe -v 1 -runs 5 -warm-up-runs 2  -s 1024 -d 128  -b 1 -causal-mask -grouped-query-attention 2 -h 14 -fix-s -separate-q-k-v
+bin/fmha.exe -v 1 -runs 5 -warm-up-runs 2  -s 128 -d 64  -b 1 -causal-mask -grouped-query-attention 2 -h 14 -fix-s -force-non-tiled -separate-q-k-v
+bin/fmha.exe -v 1 -runs 5 -warm-up-runs 2  -s 1024 -d 128  -b 1 -causal-mask -grouped-query-attention 2 -h 14 -fix-s -contiguous-q-kv
+bin/fmha.exe -v 1 -runs 5 -warm-up-runs 2  -s 128 -d 64  -b 1 -causal-mask -grouped-query-attention 2 -h 14 -fix-s -force-non-tiled -contiguous-q-kv
 ```

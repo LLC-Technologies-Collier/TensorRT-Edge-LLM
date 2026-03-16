@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,17 +49,18 @@ class MultimodalRunner
 {
 public:
     //! @brief Default constructor
-    MultimodalRunner() = default;
+    MultimodalRunner() noexcept = default;
 
     /*!
      * @brief Construct multimodal runner
      * @param engineDir Directory containing engine files
      * @param stream CUDA stream for operations
+     * @throws std::runtime_error If engine loading or initialization fails
      */
     MultimodalRunner(std::string const& engineDir, cudaStream_t stream);
 
     //! @brief Virtual destructor
-    virtual ~MultimodalRunner() = default;
+    virtual ~MultimodalRunner() noexcept = default;
 
     /*!
      * @brief Create appropriate multimodal runner instance
@@ -71,6 +72,7 @@ public:
      * @param llmMaxPositionEmbeddings Maximum position embeddings from LLM engine
      * @param stream CUDA stream for operations
      * @return Unique pointer to created runner
+     * @throws std::runtime_error If model type is unknown or runner creation fails
      */
     static std::unique_ptr<MultimodalRunner> create(std::string const& multimodalEngineDir, int32_t llmMaxBatchSize,
         int64_t llmMaxPositionEmbeddings, cudaStream_t stream);
@@ -80,25 +82,28 @@ public:
      * @param request Generation request with prompts and images
      * @param batchedInputIds Output batched input token IDs
      * @param tokenizer Tokenizer instance
-     * @param ropeRotaryCosSinDevice RoPE cache tensor
+     * @param ropeRotaryCosSinDevice RoPE cache tensor (only used by image / language models)
      * @param stream CUDA stream
      * @return True on success, false on failure
      */
     virtual bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+        tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
         = 0;
 
     /*!
      * @brief Used for KVCache saving where we need to conduct the tokenization of the system prompt and generate
      * ND-Rope parameters for the system prompt.
+     * @details This function may be a no-op for some multimodal runners and only performs nontrivial work for some
+     *          derived subclasses.
      * @param systemPrompt System prompt text
      * @param tokenizer Tokenizer instance
      * @param ropeRotaryCosSinDevice RoPE cache tensor
      * @param stream CUDA stream
      * @return True on success, false on failure
      */
-    virtual bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
-        rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream);
+    virtual bool preprocessSystemPrompt([[maybe_unused]] std::string const& systemPrompt,
+        [[maybe_unused]] tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice,
+        [[maybe_unused]] cudaStream_t stream);
 
     /*!
      * @brief Run multimodal inference
@@ -128,14 +133,14 @@ public:
 
     //! @brief Get model type
     //! @return Model type enum
-    virtual multimodal::ModelType getModelType() const
+    virtual multimodal::ModelType getModelType() const noexcept
     {
         return mModelType;
     }
 
     //! @brief Get multimodal processing metrics
     //! @return Multimodal metrics
-    metrics::MultimodalMetrics const& getMultimodalMetrics() const
+    metrics::MultimodalMetrics const& getMultimodalMetrics() const noexcept
     {
         return mMultimodalMetrics;
     }

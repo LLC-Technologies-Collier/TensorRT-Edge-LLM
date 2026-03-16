@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,7 +49,7 @@ struct SourceLocation
      * @param func Function name
      * @param l Line number
      */
-    SourceLocation(char const* f, char const* func, int32_t l)
+    SourceLocation(char const* f, char const* func, int32_t l) noexcept
         : file(f)
         , function(func)
         , lineNumber(l)
@@ -69,8 +69,8 @@ struct SourceLocation
 class EdgeLLMLogger : public nvinfer1::ILogger
 {
 public:
-    EdgeLLMLogger() = default;
-    ~EdgeLLMLogger() = default;
+    EdgeLLMLogger() noexcept = default;
+    ~EdgeLLMLogger() noexcept = default;
 
     /*!
      * @brief nvinfer1::ILogger interface implementation for TensorRT integration
@@ -79,9 +79,16 @@ public:
      */
     void log(nvinfer1::ILogger::Severity severity, char const* msg) noexcept override
     {
-        // Create source location for external library messages
-        SourceLocation extLoc("TensorRT", "TensorRT_Internal", 0);
-        logWithLocation(severity, msg, extLoc);
+        try
+        {
+            // Create source location for external library messages
+            SourceLocation extLoc("TensorRT", "TensorRT_Internal", 0);
+            logWithLocation(severity, msg, extLoc);
+        }
+        catch (...)
+        {
+            // Silently ignore exceptions to maintain noexcept guarantee
+        }
     }
 
     /*!
@@ -147,7 +154,7 @@ public:
      * @brief Set minimum logging level
      * @param level Minimum severity level to log
      */
-    void setLevel(nvinfer1::ILogger::Severity level)
+    void setLevel(nvinfer1::ILogger::Severity level) noexcept
     {
         mMinLevel = level;
     }
@@ -156,7 +163,7 @@ public:
      * @brief Get current logging level
      * @return Current minimum severity level
      */
-    nvinfer1::ILogger::Severity getLevel() const
+    nvinfer1::ILogger::Severity getLevel() const noexcept
     {
         return mMinLevel;
     }
@@ -165,7 +172,7 @@ public:
      * @brief Configure whether to show timestamps in log output
      * @param show true to show timestamps, false to hide
      */
-    void setShowTimestamp(bool show)
+    void setShowTimestamp(bool show) noexcept
     {
         mShowTimestamp = show;
     }
@@ -174,7 +181,7 @@ public:
      * @brief Configure whether to show location info in log output
      * @param show true to show location, false to hide
      */
-    void setShowLocation(bool show)
+    void setShowLocation(bool show) noexcept
     {
         mShowLocation = show;
     }
@@ -183,7 +190,7 @@ public:
      * @brief Configure whether to show function names in log output
      * @param show true to show function names, false to hide
      */
-    void setShowFunction(bool show)
+    void setShowFunction(bool show) noexcept
     {
         mShowFunction = show;
     }
@@ -194,7 +201,7 @@ private:
     bool mShowLocation = true;
     bool mShowFunction = true;
 
-    bool shouldLog(nvinfer1::ILogger::Severity level) const
+    bool shouldLog(nvinfer1::ILogger::Severity level) const noexcept
     {
         return level <= mMinLevel; // Note: lower values are more severe in TensorRT
     }
@@ -244,7 +251,7 @@ private:
         return oss.str();
     }
 
-    char const* getLevelString(nvinfer1::ILogger::Severity level) const
+    char const* getLevelString(nvinfer1::ILogger::Severity level) const noexcept
     {
         switch (level)
         {
@@ -283,9 +290,16 @@ public:
     /*!
      * @brief Destructor that logs function exit
      */
-    ~ScopedFunctionTracer()
+    ~ScopedFunctionTracer() noexcept
     {
-        mLogger.debug("<- Exiting " + mFuncName, mLoc);
+        try
+        {
+            mLogger.debug("<- Exiting " + mFuncName, mLoc);
+        }
+        catch (...)
+        {
+            // Silently ignore exceptions to maintain noexcept guarantee
+        }
     }
 
 private:

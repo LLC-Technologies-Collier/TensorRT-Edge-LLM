@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -87,7 +87,7 @@ struct textPartition
      * @brief Constructor for special token partition
      * @param _token Token ID for the special token
      */
-    textPartition(Rank _token)
+    textPartition(Rank _token) noexcept
         : type(TEXT_PART_SPECIAL_TOKEN)
         , token(_token)
         , rawText(_dummy)
@@ -131,8 +131,8 @@ struct textPartition
 class Tokenizer
 {
 public:
-    Tokenizer();
-    ~Tokenizer() = default;
+    Tokenizer() noexcept;
+    ~Tokenizer() noexcept = default;
 
     // TODO: Add constructor with preTokenizer and tokenEncoder
     // Tokenizer(std::string const& patStr, BPETokenToRanks& mergeableRanks, BPETokenToRanks& specialTokens,
@@ -144,6 +144,7 @@ public:
      * @param addBos Whether to add beginning-of-sequence token
      * @param addEos Whether to add end-of-sequence token
      * @return Vector of token IDs
+     * @throws std::runtime_error if tokenization encounters an error
      */
     std::vector<Rank> encode(std::string const& text, bool addBos = false, bool addEos = false) const;
 
@@ -307,19 +308,19 @@ protected:
      * @return true if text is partitioned successfully without exceptions;
      *         false if partitioning fails due to processing errors
      */
-    bool partitionSpecialTokens(std::string const& text, std::forward_list<textPartition>& partitions) const;
+    bool partitionSpecialTokens(std::string const& text, std::forward_list<textPartition>& partitions) const noexcept;
 
     /**
      * @brief Add BOS token if configured
      * @param tokens Token vector to modify
      */
-    void appendBos(std::vector<Rank>& tokens) const noexcept;
+    void appendBos(std::vector<Rank>& tokens) const;
 
     /**
      * @brief Add EOS token if configured
      * @param tokens Token vector to modify
      */
-    void appendEos(std::vector<Rank>& tokens) const noexcept;
+    void appendEos(std::vector<Rank>& tokens) const;
 
     // Core components
     std::unique_ptr<PreTokenizer> mPreTokenizer; //!< Pretokenizer for splitting input text

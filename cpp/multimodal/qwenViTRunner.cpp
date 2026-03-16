@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,10 +18,12 @@
 #include "qwenViTRunner.h"
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
+#include "common/mathUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
 #include "profiling/timer.h"
 #include <cmath>
+#include <cstddef>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <numeric>
@@ -80,13 +82,15 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     std::string modelTypeStr = jsonConfig["model_type"].get<std::string>();
     mModelType = multimodal::stringToModelType(modelTypeStr);
     if (mModelType != multimodal::ModelType::QWEN2_5_VL && mModelType != multimodal::ModelType::QWEN2_VL
-        && mModelType != multimodal::ModelType::QWEN3_VL)
+        && mModelType != multimodal::ModelType::QWEN3_VL
+        && mModelType != multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
         LOG_ERROR("QwenViTRunner::validateAndFillConfig(): Invalid model type: %s", modelTypeStr.c_str());
         return false;
     }
 
     mConfig.visionStartTokenId = jsonConfig["vision_start_token_id"].get<int32_t>();
+    mConfig.visionEndTokenId = jsonConfig.value("vision_end_token_id", 0);
     mConfig.imageTokenId = jsonConfig["image_token_id"].get<int32_t>();
     mConfig.videoTokenId = jsonConfig["video_token_id"].get<int32_t>();
 
@@ -101,7 +105,8 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     {
         mConfig.windowSize = jsonConfig["vision_config"]["window_size"].get<int64_t>();
     }
-    else if (mModelType == multimodal::ModelType::QWEN3_VL)
+    else if (mModelType == multimodal::ModelType::QWEN3_VL
+        || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
         auto visionConfig = jsonConfig["vision_config"];
         auto numPositionEmbeddings = visionConfig["num_position_embeddings"].get<int64_t>();
@@ -172,13 +177,22 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
         {mConfig.maxHW, mConfig.inputDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "QwenViTRunner::mVitInput");
     setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
 
-    mAttentionMask = rt::Tensor({1, mConfig.maxHW, mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
-        "QwenViTRunner::mAttentionMask");
-    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kAttentionMask, mAttentionMask.rawPointer());
-
     mRotaryPosEmb = rt::Tensor({mConfig.maxHW, mConfig.vitPosEmbDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
         "QwenViTRunner::mRotaryPosEmb");
     setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kRotaryPosEmb, mRotaryPosEmb.rawPointer());
+
+    // The size of the tensor is maxNumImages + 1 because the first element is 0.
+    mCuSeqlens = rt::Tensor(
+        {mConfig.maxNumImages + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "QwenViTRunner::mCuSeqlens");
+    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kCuSeqlens, mCuSeqlens.rawPointer());
+    // Pre-allocate host tensor for cumulative sequence lengths.
+    mCuSeqlensHost = rt::Tensor(
+        {mConfig.maxNumImages + 1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "QwenViTRunner::mCuSeqlensHost");
+
+    mMaxSeqLenCarrier = rt::Tensor(
+        {mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "QwenViTRunner::mMaxSeqLenCarrier");
+    setTensorAddressStatus
+        &= mContext->setTensorAddress(binding_names::kMaxSeqLenCarrier, mMaxSeqLenCarrier.rawPointer());
 
     // In Qwen-VL, VIT input mHW is always numImageTokens * spatial_merge_size ** 2.
     auto const maxImageTokens = mConfig.maxHW / (mConfig.mergeSize * mConfig.mergeSize);
@@ -188,10 +202,13 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
 
     if (mModelType == multimodal::ModelType::QWEN2_5_VL)
     {
-        mWindowAttentionMask = rt::Tensor({1, mConfig.maxHW, mConfig.maxHW}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kHALF, "QwenViTRunner::mWindowAttentionMask");
+        // Use maxImageTokens as a safe upper bound for cumulative window sequence lengths.
+        mCuWindowSeqlens = rt::Tensor(
+            {maxImageTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "QwenViTRunner::mCuWindowSeqlens");
         setTensorAddressStatus
-            &= mContext->setTensorAddress(binding_names::kWindowAttentionMask, mWindowAttentionMask.rawPointer());
+            &= mContext->setTensorAddress(binding_names::kCuWindowSeqlens, mCuWindowSeqlens.rawPointer());
+        mCuWindowSeqlensHost = rt::Tensor(
+            {maxImageTokens}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "QwenViTRunner::mCuWindowSeqlensHost");
 
         mWindowIndexHost = rt::Tensor(
             {maxImageTokens}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64, "QwenViTRunner::mWindowIndexHost");
@@ -206,14 +223,9 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
             "QwenViTRunner::mReverseWindowIndexDevice");
         setTensorAddressStatus
             &= mContext->setTensorAddress(binding_names::kReverseWindowIndex, mReverseWindowIndexDevice.rawPointer());
-
-        // Use maxImageTokens as a safe upper bound for cumulative window sequence lengths.
-        mCuWindowSeqlensHost = rt::Tensor(
-            {maxImageTokens}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64, "QwenViTRunner::mCuWindowSeqlensHost");
-        mCuWindowSeqlensDevice = rt::Tensor({maxImageTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64,
-            "QwenViTRunner::mCuWindowSeqlensDevice");
     }
-    else if (mModelType == multimodal::ModelType::QWEN3_VL)
+    else if (mModelType == multimodal::ModelType::QWEN3_VL
+        || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
         mFastPosEmbIdx = rt::Tensor(
             {4, mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64, "QwenViTRunner::mFastPosEmbIdx");
@@ -243,13 +255,14 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
     }
 
     // Copy image mean and std to device to be used in normalizeImage
-    auto channels = mConfig.imageMean.size();
+    auto nbBytes = mConfig.imageMean.size() * sizeof(float);
+    auto channels = math::cast<int64_t>(mConfig.imageMean.size());
     mImageMean = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "QwenViTRunner::mImageMean");
     mImageStd = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "QwenViTRunner::mImageStd");
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageMean.rawPointer(), mConfig.imageMean.data(), channels * sizeof(float), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageStd.rawPointer(), mConfig.imageStd.data(), channels * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(mImageMean.rawPointer(), mConfig.imageMean.data(), nbBytes, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(mImageStd.rawPointer(), mConfig.imageStd.data(), nbBytes, cudaMemcpyHostToDevice, stream));
 
     // Pre-allocate temporary image buffers for preprocessing
     int64_t const maxImagePixels = mVitInput.getShape().volume();
@@ -268,19 +281,12 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
     mMropePositionIdsDevice = rt::Tensor({mLLMMaxBatchSize, 3, mLLMMaxSequenceLength}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kINT64, "QwenViTRunner::mMropePositionIdsDevice");
 
-    // Pre-allocate tensors for cumulative sequence lengths.
-    // The size of the tensor is maxNumImages + 1 because the first element is 0.
-    mCuSeqlensDevice = rt::Tensor({mConfig.maxNumImages + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64,
-        "QwenViTRunner::mCuSeqlensDevice");
-    mCuSeqlensHost = rt::Tensor(
-        {mConfig.maxNumImages + 1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64, "QwenViTRunner::mCuSeqlensHost");
-
     return true;
 }
 
 void QwenViTRunner::formatPatch(rt::imageUtils::ImageData const& image,
-    std::vector<std::vector<int64_t>>& imageGridTHWs, std::vector<int64_t>& imageTokenLengths, int64_t* cuSeqlensData,
-    int64_t& cuSeqlensSize, cudaStream_t stream)
+    std::vector<std::vector<int64_t>>& imageGridTHWs, std::vector<int64_t>& imageTokenLengths, int32_t* cuSeqlensData,
+    int64_t& cuSeqlensSize, int64_t& maxSeqLen, cudaStream_t stream)
 {
     int64_t height = image.height;
     int64_t width = image.width;
@@ -305,17 +311,19 @@ void QwenViTRunner::formatPatch(rt::imageUtils::ImageData const& image,
             + " or maxNumImages = " + std::to_string(mConfig.maxNumImages) + " of VIT engine.");
     }
     imageTokenLengths.emplace_back(curSeqLength / mConfig.mergeSize / mConfig.mergeSize);
+    maxSeqLen = std::max(maxSeqLen, curSeqLength);
 
     // Reshape pre-allocated temporary buffers to current image dimensions
-    mImageDevice.reshape({mConfig.temporalPatchSize, height, width, channels});
-    mNormalizedImageDevice.reshape({mConfig.temporalPatchSize, height, width, channels});
+    check::check(mImageDevice.reshape({mConfig.temporalPatchSize, height, width, channels}), "Tensor reshape failed");
+    check::check(
+        mNormalizedImageDevice.reshape({mConfig.temporalPatchSize, height, width, channels}), "Tensor reshape failed");
 
     // Copy image to device. Repeat for T = temporalPatchSize
     auto imageSize = height * width * channels;
     for (int64_t i = 0; i < mConfig.temporalPatchSize; ++i)
     {
-        CUDA_CHECK(cudaMemcpyAsync(mImageDevice.rawPointer() + i * imageSize * sizeof(unsigned char), imageData,
-            imageSize * sizeof(unsigned char), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(mImageDevice.rawPointer()) + i * imageSize, imageData,
+            imageSize, cudaMemcpyHostToDevice, stream));
     }
 
     // Normalize image
@@ -326,7 +334,7 @@ void QwenViTRunner::formatPatch(rt::imageUtils::ImageData const& image,
         mConfig.temporalPatchSize, mConfig.patchSize, mConfig.mergeSize, stream);
 
     // Update sequence length
-    cuSeqlensData[cuSeqlensSize++] = prevCuSeqlen + curSeqLength;
+    cuSeqlensData[cuSeqlensSize++] = static_cast<int32_t>(prevCuSeqlen + curSeqLength);
 }
 
 std::tuple<int64_t, int64_t> QwenViTRunner::getResizedImageSize(
@@ -377,9 +385,10 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
     std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
 {
     // Use pre-allocated pinned host tensor for cumulative sequence lengths
-    int64_t* cuSeqlensData = mCuSeqlensHost.dataPointer<int64_t>();
+    int32_t* cuSeqlensData = mCuSeqlensHost.dataPointer<int32_t>();
     cuSeqlensData[0] = 0;
     int64_t cuSeqlensSize = 1;
+    int64_t maxSeqLen = 0;
 
     for (auto const& req : request.requests)
     {
@@ -390,11 +399,12 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
             {
                 auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width);
                 rt::imageUtils::resizeImage(image, mResizedImageHost, resizedWidth, resizedHeight);
-                formatPatch(mResizedImageHost, imageGridTHWs, imageTokenLengths, cuSeqlensData, cuSeqlensSize, stream);
+                formatPatch(mResizedImageHost, imageGridTHWs, imageTokenLengths, cuSeqlensData, cuSeqlensSize,
+                    maxSeqLen, stream);
             }
             else
             {
-                formatPatch(image, imageGridTHWs, imageTokenLengths, cuSeqlensData, cuSeqlensSize, stream);
+                formatPatch(image, imageGridTHWs, imageTokenLengths, cuSeqlensData, cuSeqlensSize, maxSeqLen, stream);
             }
             ++numImage;
         }
@@ -404,7 +414,7 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
     int64_t totalSeqLength = cuSeqlensData[cuSeqlensSize - 1];
     if (totalSeqLength == 0)
     {
-        mVitInput.reshape({totalSeqLength, mConfig.inputDim});
+        check::check(mVitInput.reshape({totalSeqLength, mConfig.inputDim}), "Tensor reshape failed");
         return;
     }
 
@@ -416,28 +426,27 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
 
     // Reshape tensors
     int64_t totalImageTokens = totalSeqLength / (mConfig.mergeSize * mConfig.mergeSize);
-    mVitInput.reshape({totalSeqLength, mConfig.inputDim});
-    mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize});
+    check::check(mVitInput.reshape({totalSeqLength, mConfig.inputDim}), "Tensor reshape failed");
+    check::check(mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
+    check::check(mMaxSeqLenCarrier.reshape({maxSeqLen}), "Tensor reshape failed");
     // Record performance data
     int64_t imageCount = std::accumulate(numImages.begin(), numImages.end(), int64_t(0));
     mMultimodalMetrics.recordRun(imageCount, totalImageTokens);
 
     /*
-     * Cache optimization for ViT attention mask，rotary position embeddings, and other image grid dependent
+     * Cache optimization for cu_seqlens, rotary position embeddings, and other image grid dependent
      * input tensors. Reuse the data from last round of computation if the image grid sizes are identical.
      * This reduces inference latency by skipping invariant tensor initialization.
      */
     if (imageGridTHWs != mLastImageGridTHWs)
     {
-        mAttentionMask.reshape({1, totalSeqLength, totalSeqLength});
-        // Compute attention mask
-        CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensDevice.rawPointer(), mCuSeqlensHost.rawPointer(),
-            cuSeqlensSize * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-        kernel::initAttentionMaskQwenViT(mCuSeqlensDevice, mAttentionMask, stream);
+        check::check(mCuSeqlens.reshape({cuSeqlensSize}), "Tensor reshape failed");
+        CUDA_CHECK(cudaMemcpyAsync(mCuSeqlens.rawPointer(), mCuSeqlensHost.rawPointer(),
+            cuSeqlensSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
-        mRotaryPosEmb.reshape({totalSeqLength, mConfig.vitPosEmbDim});
+        check::check(mRotaryPosEmb.reshape({totalSeqLength, mConfig.vitPosEmbDim}), "Tensor reshape failed");
         // Compute rotary position embeddings
-        for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
+        for (size_t i = 0; i < imageGridTHWs.size(); ++i)
         {
             kernel::initRotaryPosEmbQwenViT(
                 mRotaryPosEmb, imageGridTHWs[i], mConfig.mergeSize, cuSeqlensData[i], 10000.0f, 1.0f, stream);
@@ -446,20 +455,20 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
         // Compute additional inputs
         if (mModelType == multimodal::ModelType::QWEN2_5_VL)
         {
-            mWindowAttentionMask.reshape({1, totalSeqLength, totalSeqLength});
-            mWindowIndexHost.reshape({totalImageTokens});
-            mWindowIndexDevice.reshape({totalImageTokens});
-            mReverseWindowIndexHost.reshape({totalImageTokens});
-            mReverseWindowIndexDevice.reshape({totalImageTokens});
+            check::check(mWindowIndexHost.reshape({totalImageTokens}), "Tensor reshape failed");
+            check::check(mWindowIndexDevice.reshape({totalImageTokens}), "Tensor reshape failed");
+            check::check(mReverseWindowIndexHost.reshape({totalImageTokens}), "Tensor reshape failed");
+            check::check(mReverseWindowIndexDevice.reshape({totalImageTokens}), "Tensor reshape failed");
 
             getWindowIndex(imageGridTHWs, totalSeqLength, stream);
         }
-        else if (mModelType == multimodal::ModelType::QWEN3_VL)
+        else if (mModelType == multimodal::ModelType::QWEN3_VL
+            || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
         {
-            mFastPosEmbIdx.reshape({4, totalSeqLength});
-            mFastPosEmbWeight.reshape({4, totalSeqLength});
+            check::check(mFastPosEmbIdx.reshape({4, totalSeqLength}), "Tensor reshape failed");
+            check::check(mFastPosEmbWeight.reshape({4, totalSeqLength}), "Tensor reshape failed");
 
-            for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
+            for (size_t i = 0; i < imageGridTHWs.size(); ++i)
             {
                 kernel::initFastPosEmbedQwenViT(mFastPosEmbIdx, mFastPosEmbWeight, imageGridTHWs[i], mConfig.mergeSize,
                     mConfig.numGridPerSide, cuSeqlensData[i], stream);
@@ -467,15 +476,16 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
 
             for (int64_t i = 0; i < mConfig.numDeepstackFeatures; ++i)
             {
-                mDeepstackFeatures[i].reshape({totalImageTokens, mConfig.outHiddenSize});
+                check::check(
+                    mDeepstackFeatures[i].reshape({totalImageTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
             }
         }
         mLastImageGridTHWs = imageGridTHWs;
     }
 }
 
-void QwenViTRunner::getMRopePositionIds(
-    std::vector<std::vector<int32_t>> const& batchInputIds, std::vector<std::vector<int64_t>> const& imageGridTHWs)
+void QwenViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds,
+    std::vector<std::vector<int64_t>> const& imageGridTHWs) noexcept
 {
     // According to transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLModel.get_rope_index
     // mropePositionIds: (bs, 3, maxPositionEmbeddings), 3 is for T, H, W
@@ -562,15 +572,16 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
     }
 
     // Initialize mropePositionIds and copy to device
-    mMropePositionIdsHost.reshape({activeBatchSize, 3, maxPositionEmbeddings});
-    mMropePositionIdsDevice.reshape({activeBatchSize, 3, maxPositionEmbeddings});
+    check::check(mMropePositionIdsHost.reshape({activeBatchSize, 3, maxPositionEmbeddings}), "Tensor reshape failed");
+    check::check(mMropePositionIdsDevice.reshape({activeBatchSize, 3, maxPositionEmbeddings}), "Tensor reshape failed");
     getMRopePositionIds(batchInputIds, imageGridTHWs);
     CUDA_CHECK(cudaMemcpyAsync(mMropePositionIdsDevice.rawPointer(), mMropePositionIdsHost.rawPointer(),
         activeBatchSize * 3 * maxPositionEmbeddings * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
 
     // Initialize mrope cosSinCacheDevice
-    ropeRotaryCosSinDevice.reshape({activeBatchSize, maxPositionEmbeddings, rotaryDim});
-    bool interleaved = mModelType == multimodal::ModelType::QWEN3_VL;
+    check::check(
+        ropeRotaryCosSinDevice.reshape({activeBatchSize, maxPositionEmbeddings, rotaryDim}), "Tensor reshape failed");
+    bool interleaved = (mModelType == multimodal::ModelType::QWEN3_VL);
     kernel::initializeMRopeCosSin(ropeRotaryCosSinDevice.dataPointer<float>(),
         mMropePositionIdsDevice.dataPointer<int64_t>(), mConfig.mropeTheta, rotaryDim, maxPositionEmbeddings,
         activeBatchSize, interleaved, stream);
@@ -587,7 +598,7 @@ void QwenViTRunner::getWindowIndex(
     int64_t windowIndexValue = 0;
 
     // Use pre-allocated pinned host tensor for cumulative window sequence lengths
-    int64_t* cuWindowSeqlensData = mCuWindowSeqlensHost.dataPointer<int64_t>();
+    int32_t* cuWindowSeqlensData = mCuWindowSeqlensHost.dataPointer<int32_t>();
     cuWindowSeqlensData[0] = 0;
     int64_t cuWindowSeqlensSize = 1;
 
@@ -618,9 +629,9 @@ void QwenViTRunner::getWindowIndex(
                     }
                 }
 
-                int64_t prevCuWindowSeqlen = cuWindowSeqlensData[cuWindowSeqlensSize - 1];
+                int32_t prevCuWindowSeqlen = cuWindowSeqlensData[cuWindowSeqlensSize - 1];
                 cuWindowSeqlensData[cuWindowSeqlensSize++]
-                    = prevCuWindowSeqlen + cnt * mConfig.mergeSize * mConfig.mergeSize;
+                    = static_cast<int32_t>(prevCuWindowSeqlen + cnt * mConfig.mergeSize * mConfig.mergeSize);
             }
         }
 
@@ -634,6 +645,12 @@ void QwenViTRunner::getWindowIndex(
             + std::to_string(windowIndexPos) + ", curHW: " + std::to_string(curHW));
     }
 
+    // Copy cu_window_seqlens
+    check::check(mCuWindowSeqlens.reshape({cuWindowSeqlensSize}), "Tensor reshape failed");
+    CUDA_CHECK(cudaMemcpyAsync(mCuWindowSeqlens.rawPointer(), mCuWindowSeqlensHost.rawPointer(),
+        cuWindowSeqlensSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    // Copy window index and reverse window index
     int64_t* reverseWindowIndexPtr = mReverseWindowIndexHost.dataPointer<int64_t>();
     std::iota(reverseWindowIndexPtr, reverseWindowIndexPtr + windowIndexSize, 0);
     std::sort(reverseWindowIndexPtr, reverseWindowIndexPtr + windowIndexSize,
@@ -643,11 +660,6 @@ void QwenViTRunner::getWindowIndex(
         windowIndexSize * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(mReverseWindowIndexDevice.rawPointer(), mReverseWindowIndexHost.rawPointer(),
         windowIndexSize * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-
-    // Init window attention mask
-    CUDA_CHECK(cudaMemcpyAsync(mCuWindowSeqlensDevice.rawPointer(), mCuWindowSeqlensHost.rawPointer(),
-        cuWindowSeqlensSize * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-    kernel::initAttentionMaskQwenViT(mCuWindowSeqlensDevice, mWindowAttentionMask, stream);
 }
 
 void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
@@ -663,14 +675,27 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     }
 
     int64_t imageIndex = 0;
-    // Image token id will start from vocabSize and increment for each image token position
-    int32_t imageTokenId = mConfig.vocabSize;
+    // For Qwen2.5-VL/Qwen3-VL: use incrementing IDs (>= vocabSize) for embeddingLookupWithImageInsertion
+    // For Qwen3-Omni: keep original imageTokenId and wrap with vision_start/vision_end to match PyTorch,
+    // since embeddingLookupMultimodal uses multimodalIndices for indexing
+    bool const isQwen3Omni = (mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER);
+    int32_t nextImageTokenId = mConfig.vocabSize;
 
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
-        // Use the formatted complete request
-        std::vector<int32_t> ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
-        check::check(!ids.empty(), "QwenViTRunner::textPreprocess() Failed to encode text");
+        std::vector<int32_t> ids;
+
+        // Check if already tokenized (incremental mode)
+        if (i < batchInputIds.size() && !batchInputIds[i].empty())
+        {
+            // Already tokenized by another runner, use existing tokens
+            ids = batchInputIds[i];
+        }
+        else
+        {
+            // First runner to process, tokenize the request
+            ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
+        }
 
         // insert image tokens
         std::vector<int32_t> newIds;
@@ -679,10 +704,26 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             if (ids[j] == mConfig.imageTokenId || ids[j] == mConfig.videoTokenId)
             {
                 int64_t numImageTokens = imageTokenLengths.at(imageIndex);
-                for (int64_t k = 0; k < numImageTokens; ++k)
+
+                if (isQwen3Omni)
                 {
-                    newIds.push_back(imageTokenId);
-                    ++imageTokenId;
+                    // Qwen3-Omni: <|vision_start|> + N×<|image_pad|> + <|vision_end|>
+                    // TRT chat template only has <|image_pad|>, no start/end markers
+                    newIds.push_back(mConfig.visionStartTokenId);
+                    for (int64_t k = 0; k < numImageTokens; ++k)
+                    {
+                        newIds.push_back(mConfig.imageTokenId);
+                    }
+                    newIds.push_back(mConfig.visionEndTokenId);
+                }
+                else
+                {
+                    // Qwen2.5-VL/Qwen3-VL: use incrementing IDs
+                    for (int64_t k = 0; k < numImageTokens; ++k)
+                    {
+                        newIds.push_back(nextImageTokenId);
+                        ++nextImageTokenId;
+                    }
                 }
                 ++imageIndex;
             }
@@ -691,7 +732,16 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
                 newIds.push_back(ids[j]);
             }
         }
-        batchInputIds.emplace_back(std::move(newIds));
+
+        // Update batchInputIds
+        if (i < batchInputIds.size())
+        {
+            batchInputIds[i] = std::move(newIds);
+        }
+        else
+        {
+            batchInputIds.emplace_back(std::move(newIds));
+        }
     }
 }
 
@@ -750,7 +800,7 @@ bool QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, toke
     return true;
 }
 
-bool QwenViTRunner::infer(cudaStream_t stream)
+bool QwenViTRunner::infer(cudaStream_t stream) noexcept
 {
     // Skip VIT inference if there are no images to process
     // Check if the first dimension (sequence length) is 0, indicating no images
@@ -761,24 +811,26 @@ bool QwenViTRunner::infer(cudaStream_t stream)
 
     // Profile ViT inference with automatic cleanup
     {
-        TIME_STAGE(metrics::StageNames::kMULTIMODAL_PROCESSING, stream);
+        TIME_STAGE(metrics::StageNames::kVISION_ENCODER, stream);
 
         bool setEngineIOStatus{true};
         setEngineIOStatus &= mContext->setInputShape(binding_names::kVisualInput, mVitInput.getShape().getTRTDims());
         setEngineIOStatus
-            &= mContext->setInputShape(binding_names::kAttentionMask, mAttentionMask.getShape().getTRTDims());
-        setEngineIOStatus
             &= mContext->setInputShape(binding_names::kRotaryPosEmb, mRotaryPosEmb.getShape().getTRTDims());
+        setEngineIOStatus &= mContext->setInputShape(binding_names::kCuSeqlens, mCuSeqlens.getShape().getTRTDims());
+        setEngineIOStatus
+            &= mContext->setInputShape(binding_names::kMaxSeqLenCarrier, mMaxSeqLenCarrier.getShape().getTRTDims());
         if (mModelType == multimodal::ModelType::QWEN2_5_VL)
         {
-            setEngineIOStatus &= mContext->setInputShape(
-                binding_names::kWindowAttentionMask, mWindowAttentionMask.getShape().getTRTDims());
+            setEngineIOStatus
+                &= mContext->setInputShape(binding_names::kCuWindowSeqlens, mCuWindowSeqlens.getShape().getTRTDims());
             setEngineIOStatus
                 &= mContext->setInputShape(binding_names::kWindowIndex, mWindowIndexDevice.getShape().getTRTDims());
             setEngineIOStatus &= mContext->setInputShape(
                 binding_names::kReverseWindowIndex, mReverseWindowIndexDevice.getShape().getTRTDims());
         }
-        else if (mModelType == multimodal::ModelType::QWEN3_VL)
+        else if (mModelType == multimodal::ModelType::QWEN3_VL
+            || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
         {
             setEngineIOStatus
                 &= mContext->setInputShape(binding_names::kFastPosEmbIdx, mFastPosEmbIdx.getShape().getTRTDims());
@@ -805,7 +857,7 @@ bool QwenViTRunner::infer(cudaStream_t stream)
 
 rt::OptionalInputTensors QwenViTRunner::getDeepstackFeatures()
 {
-    if (mModelType != multimodal::ModelType::QWEN3_VL)
+    if (mModelType != multimodal::ModelType::QWEN3_VL && mModelType != multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
         return {};
     }

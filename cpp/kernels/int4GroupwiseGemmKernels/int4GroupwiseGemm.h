@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,6 +40,7 @@ namespace kernel
  * @param k Input dimension
  * @param group_size Quantization group size
  * @param stream CUDA stream
+ * @throws std::runtime_error if group or batch size are unsupported
  */
 void gemv_forward_cuda_new(half const* in_feats, int8_t const* kernel, half const* scaling_factors, half* out_feats,
     int m, int n, int k, int group_size, cudaStream_t stream);
@@ -61,6 +62,6 @@ void gemv_forward_cuda_new(half const* in_feats, int8_t const* kernel, half cons
  * @param stream CUDA stream
  */
 void gemm_forward_cuda_new(half const* in_feats, int8_t const* kernel, half const* scaling_factors, half* out_feats,
-    int m, int n, int k, int group_size, cudaStream_t stream);
+    int m, int n, int k, int group_size, cudaStream_t stream) noexcept;
 } // namespace kernel
 } // namespace trt_edgellm

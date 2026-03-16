@@ -1,0 +1,375 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "multimodal/audioUtils.h"
+
+#include "common/cudaUtils.h"
+#include "common/logger.h"
+#include <algorithm>
+#include <cmath>
+#include <cuda_fp16.h>
+#include <vector>
+
+namespace trt_edgellm
+{
+namespace rt
+{
+namespace audioUtils
+{
+
+int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow)
+{
+    // Floor division that always rounds toward negative infinity, matching Python's "//" operator.
+    auto floorDiv = [](int64_t a, int64_t b) -> int64_t {
+        int64_t q = a / b;
+        // Adjust if the remainder is nonzero and the signs of a and b differ
+        if ((a % b != 0) && ((a ^ b) < 0))
+        {
+            --q;
+        }
+        return q;
+    };
+
+    // Chunk size = nWindow * 2, matching the chunk size used in computeChunkInfo.
+    int64_t const chunkSize = nWindow * 2;
+
+    // Three 2x downsampling Conv2D layers (stride=2 each)
+    // Layer 1: input -> (input - 1) // 2 + 1
+    int64_t len1 = floorDiv(inputLength % chunkSize - 1, 2) + 1;
+    // Layer 2: len1 -> (len1 - 1) // 2 + 1
+    int64_t len2 = floorDiv(len1 - 1, 2) + 1;
+    // Layer 3: len2 -> (len2 - 1) // 2 + 1
+    int64_t len3 = floorDiv(len2 - 1, 2) + 1;
+    return len3 + floorDiv(inputLength, chunkSize) * 13;
+}
+
+ChunkInfo computeChunkInfo(int64_t featureLength, int32_t nWindow)
+{
+    ChunkInfo info;
+    // BUGFIX: Original Qwen3-Omni uses n_window * 2 for chunking (see modeling_qwen3_omni.py line 1145)
+    // chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
+    // chunk_lengths = torch.tensor([self.n_window * 2] * chunk_num.sum(), ...)
+    int64_t chunkSize = nWindow * 2; // Must be n_window * 2, not n_window
+    info.numChunks = (featureLength + chunkSize - 1) / chunkSize;
+    info.chunkLengths.resize(info.numChunks, chunkSize);
+    info.chunkOffsets.resize(info.numChunks);
+
+    for (int64_t i = 0; i < info.numChunks; ++i)
+    {
+        info.chunkOffsets[i] = i * chunkSize;
+    }
+
+    int64_t remainder = featureLength % chunkSize;
+    if (remainder != 0)
+    {
+        info.chunkLengths[info.numChunks - 1] = remainder;
+    }
+
+    info.maxChunkLength = *std::max_element(info.chunkLengths.begin(), info.chunkLengths.end());
+    return info;
+}
+
+bool chunkAndPadFeatures(
+    rt::Tensor const& melSpectrogram, ChunkInfo const& chunkInfo, rt::Tensor& paddedFeature, cudaStream_t stream)
+{
+    auto const& inputShape = melSpectrogram.getShape();
+    if (inputShape.getNumDims() != 3 || inputShape[0] != 1)
+    {
+        LOG_ERROR("Invalid input shape, expected [1, mel_bins, time_steps]");
+        return false;
+    }
+
+    // Input: [1, mel_bins, time_steps]
+    int64_t melBins = inputShape[1];
+    int64_t timeSteps = inputShape[2];
+
+    // Output: [num_chunks, mel_bins, max_chunk_length]
+    int64_t outputSize = chunkInfo.numChunks * melBins * chunkInfo.maxChunkLength;
+
+    if (paddedFeature.getShape().volume() < outputSize)
+    {
+        // Allocate as FP16 (Half precision)
+        paddedFeature = rt::Tensor(
+            {chunkInfo.numChunks, melBins, chunkInfo.maxChunkLength}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    }
+    else
+    {
+        check::check(paddedFeature.reshape({chunkInfo.numChunks, melBins, chunkInfo.maxChunkLength}),
+            "Failed to reshape paddedFeature");
+    }
+
+    // Zero out padding
+    CUDA_CHECK(
+        cudaMemsetAsync(paddedFeature.rawPointer(), 0, paddedFeature.getShape().volume() * sizeof(__half), stream));
+
+    __half const* srcPtr = melSpectrogram.dataPointer<__half>();
+
+    // Copy chunks (both input and output are FP16)
+    for (int64_t chunkIdx = 0; chunkIdx < chunkInfo.numChunks; ++chunkIdx)
+    {
+        int64_t chunkOffset = chunkInfo.chunkOffsets[chunkIdx];
+        int64_t chunkLength = chunkInfo.chunkLengths[chunkIdx];
+
+        if (chunkOffset + chunkLength > timeSteps)
+        {
+            chunkLength = timeSteps - chunkOffset;
+        }
+
+        // Copy chunk data (FP16 device-to-device)
+        __half* dstPtr = paddedFeature.dataPointer<__half>();
+        for (int64_t melIdx = 0; melIdx < melBins; ++melIdx)
+        {
+            size_t srcOffset = melIdx * timeSteps + chunkOffset;
+            size_t dstOffset = chunkIdx * melBins * chunkInfo.maxChunkLength + melIdx * chunkInfo.maxChunkLength;
+
+            CUDA_CHECK(cudaMemcpyAsync(dstPtr + dstOffset, srcPtr + srcOffset, chunkLength * sizeof(__half),
+                cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    return true;
+}
+
+bool createPaddedMask(ChunkInfo const& chunkInfo, [[maybe_unused]] int32_t nWindow, rt::Tensor& paddedMask,
+    std::vector<int64_t>& afterCNNLens, cudaStream_t stream)
+{
+    // Compute aftercnn_lens for each chunk
+    afterCNNLens.clear();
+    afterCNNLens.reserve(chunkInfo.numChunks);
+
+    int64_t maxLenAfterCNN = 0;
+    for (int64_t i = 0; i < chunkInfo.numChunks; ++i)
+    {
+        int64_t lenAfterCNN = computeFeatExtractOutputLength(chunkInfo.chunkLengths[i], nWindow);
+        afterCNNLens.push_back(lenAfterCNN);
+        maxLenAfterCNN = std::max(maxLenAfterCNN, lenAfterCNN);
+    }
+
+    // Output: [num_chunks, max_len_after_cnn]
+    int64_t outputSize = chunkInfo.numChunks * maxLenAfterCNN;
+    if (paddedMask.getShape().volume() < outputSize)
+    {
+        // Reallocate if needed
+        paddedMask
+            = rt::Tensor({chunkInfo.numChunks, maxLenAfterCNN}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+    }
+    else
+    {
+        check::check(paddedMask.reshape({chunkInfo.numChunks, maxLenAfterCNN}), "Failed to reshape paddedMask");
+    }
+
+    std::vector<int64_t> maskHost(chunkInfo.numChunks * maxLenAfterCNN, 0);
+
+    // For each chunk, mark valid positions after CNN
+    for (int64_t chunkIdx = 0; chunkIdx < chunkInfo.numChunks; ++chunkIdx)
+    {
+        int64_t validLength = afterCNNLens[chunkIdx];
+
+        for (int64_t i = 0; i < validLength; ++i)
+        {
+            maskHost[chunkIdx * maxLenAfterCNN + i] = 1;
+        }
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        paddedMask.rawPointer(), maskHost.data(), maskHost.size() * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+
+    return true;
+}
+
+bool preprocessAudioForEncoder(rt::Tensor const& melSpectrogram, int32_t nWindow, rt::Tensor& paddedFeature,
+    rt::Tensor& paddedMaskAfterCNN, std::vector<int64_t>& afterCNNLens, cudaStream_t stream)
+{
+    auto const& inputShape = melSpectrogram.getShape();
+    if (inputShape.getNumDims() != 3)
+    {
+        LOG_ERROR("Invalid input shape, expected [1, mel_bins, time_steps]");
+        return false;
+    }
+
+    // Input shape: [1, mel_bins, time_steps]
+    int64_t timeSteps = inputShape[2];
+
+    ChunkInfo chunkInfo = computeChunkInfo(timeSteps, nWindow);
+
+    if (!chunkAndPadFeatures(melSpectrogram, chunkInfo, paddedFeature, stream))
+    {
+        LOG_ERROR("Failed to chunk and pad features");
+        return false;
+    }
+
+    if (!createPaddedMask(chunkInfo, nWindow, paddedMaskAfterCNN, afterCNNLens, stream))
+    {
+        LOG_ERROR("Failed to create padded mask");
+        return false;
+    }
+
+    return true;
+}
+
+bool convertMaskToIndices(rt::Tensor const& paddedMask, rt::Tensor& paddedMaskIndices, cudaStream_t stream)
+{
+    // Validate input shape
+    auto const& maskShape = paddedMask.getShape();
+    if (maskShape.getNumDims() != 2)
+    {
+        LOG_ERROR("Expected 2D mask, got %d dimensions", maskShape.getNumDims());
+        return false;
+    }
+
+    int64_t numChunks = maskShape[0];
+    int64_t maxLen = maskShape[1];
+    int64_t totalElements = numChunks * maxLen;
+
+    // Step 1: Copy mask from device to host
+    std::vector<int64_t> maskHost(totalElements);
+    CUDA_CHECK(cudaMemcpyAsync(
+        maskHost.data(), paddedMask.rawPointer(), totalElements * sizeof(int64_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Step 2: Find all nonzero positions (equivalent to torch.nonzero)
+    std::vector<int64_t> indicesFlat;
+    indicesFlat.reserve(totalElements * 2); // Pre-allocate maximum possible size
+
+    for (int64_t chunkIdx = 0; chunkIdx < numChunks; ++chunkIdx)
+    {
+        for (int64_t posIdx = 0; posIdx < maxLen; ++posIdx)
+        {
+            int64_t linearIdx = chunkIdx * maxLen + posIdx;
+            if (maskHost[linearIdx] != 0)
+            {
+                indicesFlat.push_back(chunkIdx); // First dimension index
+                indicesFlat.push_back(posIdx);   // Second dimension index
+            }
+        }
+    }
+
+    // Step 3: Create output tensor [num_valid, 2]
+    int64_t numValid = indicesFlat.size() / 2;
+
+    if (numValid == 0)
+    {
+        LOG_WARNING("No valid elements in mask! Creating empty indices tensor");
+        check::check(paddedMaskIndices.reshape({0, 2}), "Failed to reshape paddedMaskIndices");
+        return true;
+    }
+
+    // Allocate or reshape output tensor
+    if (paddedMaskIndices.getShape().volume() < numValid * 2)
+    {
+        paddedMaskIndices = rt::Tensor({numValid, 2}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+    }
+    else
+    {
+        check::check(paddedMaskIndices.reshape({numValid, 2}), "Failed to reshape paddedMaskIndices");
+    }
+
+    // Step 4: Copy indices from host to device
+    CUDA_CHECK(cudaMemcpyAsync(paddedMaskIndices.rawPointer(), indicesFlat.data(), indicesFlat.size() * sizeof(int64_t),
+        cudaMemcpyHostToDevice, stream));
+
+    return true;
+}
+
+bool createChunkwiseAttentionMask(std::vector<int64_t> const& afterCNNLens, int32_t nWindow, int32_t nWindowInfer,
+    rt::Tensor& attentionMask, cudaStream_t stream)
+{
+    // Matches modeling_qwen3_omni.py _prepare_attention_mask + cu_seqlens logic:
+    //   window_aftercnn = padded_mask_after_cnn.shape[-1] * (n_window_infer // (n_window * 2))
+    //   cu_seqlens built from aftercnn_lens split by window_aftercnn
+    //   Block-diagonal mask: tokens within the same window attend to each other.
+    int64_t const chunkSize = static_cast<int64_t>(nWindow) * 2;
+    int64_t maxLenAfterCNN = 0;
+    for (auto len : afterCNNLens)
+    {
+        maxLenAfterCNN = std::max(maxLenAfterCNN, len);
+    }
+    int64_t const windowAfterCNN = maxLenAfterCNN * (nWindowInfer / chunkSize);
+
+    // Global after-CNN length = sum of per-chunk after-CNN lengths
+    int64_t globalAfterCNNLen = 0;
+    for (auto len : afterCNNLens)
+    {
+        globalAfterCNNLen += len;
+    }
+
+    // Build window lengths from global aftercnn_lens
+    std::vector<int64_t> windowLens;
+    int64_t numFull = globalAfterCNNLen / windowAfterCNN;
+    for (int64_t i = 0; i < numFull; ++i)
+    {
+        windowLens.push_back(windowAfterCNN);
+    }
+    int64_t remainder = globalAfterCNNLen % windowAfterCNN;
+    if (remainder != 0)
+    {
+        windowLens.push_back(remainder);
+    }
+
+    int64_t totalLen = 0;
+    for (auto len : windowLens)
+    {
+        totalLen += len;
+    }
+
+    if (totalLen == 0)
+    {
+        LOG_ERROR("Total attention length is 0");
+        return false;
+    }
+
+    // Allocate or reshape mask tensor [total_len, total_len]
+    if (attentionMask.getShape().volume() < totalLen * totalLen)
+    {
+        attentionMask = rt::Tensor({totalLen, totalLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    }
+    else
+    {
+        check::check(attentionMask.reshape({totalLen, totalLen}), "Failed to reshape attentionMask");
+    }
+
+    constexpr float NEG_INF = -65504.0f;
+    std::vector<__half> maskHost(totalLen * totalLen);
+    for (int64_t i = 0; i < totalLen * totalLen; ++i)
+    {
+        maskHost[i] = __float2half(NEG_INF);
+    }
+
+    // Set block-diagonal regions to 0 (allow attention within each window)
+    int64_t offset = 0;
+    for (size_t winIdx = 0; winIdx < windowLens.size(); ++winIdx)
+    {
+        int64_t winLen = windowLens[winIdx];
+        for (int64_t i = 0; i < winLen; ++i)
+        {
+            for (int64_t j = 0; j < winLen; ++j)
+            {
+                maskHost[(offset + i) * totalLen + (offset + j)] = __float2half(0.0f);
+            }
+        }
+        offset += winLen;
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        attentionMask.rawPointer(), maskHost.data(), maskHost.size() * sizeof(__half), cudaMemcpyHostToDevice, stream));
+
+    return true;
+}
+
+} // namespace audioUtils
+} // namespace rt
+} // namespace trt_edgellm

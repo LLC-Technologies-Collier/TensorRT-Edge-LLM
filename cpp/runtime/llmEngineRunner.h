@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -45,6 +45,7 @@ struct LLMEngineRunnerConfig
     RopeConfig ropeConfig{};             //!< Type of rotary positional encoding
     bool useContextDependentRope{false}; //!< Use context-dependent RoPE
     bool enableEagleSpecDecode{false};   //!< Enable Eagle speculative decoding
+    bool useTrtNativeOps{false};         //!< Use TensorRT native operations instead of custom plugin
     int32_t numDecoderLayers{};          //!< Number of decoder layers
     int32_t numKVHeads{};                //!< Number of key-value heads
     int32_t headDim{};                   //!< Dimension of each attention head
@@ -59,7 +60,18 @@ struct LLMEngineRunnerConfig
     int32_t maxSupportedLoraRank{};  //!< Maximum supported LoRA rank
     int32_t outputHiddenDim{};       //!< Output hidden dimension for Eagle speculative decoding (hidden_size * 3)
     int32_t maxVerifyTreeSize{};     //!< Maximum verification tree size for Eagle speculative decoding
-    int32_t numDeepstackFeatures{0}; //!< Number of deepstack features for Qwen3-VL
+    int32_t numDeepstackFeatures{0}; //!< Number of deepstack features for Qwen3-VL and Qwen3-Omni
+    int32_t audioTokenId{0};         //!< Special token ID for audio in Qwen3-Omni
+    int32_t imageTokenId{0};         //!< Special token ID for image in Qwen3-Omni
+
+    // Hybrid Mamba+Attention model configuration
+    int32_t numMambaLayers{0};     //!< Number of Mamba (SSM) layers (0 for pure attention models)
+    int32_t numAttentionLayers{0}; //!< Number of attention layers (equals numDecoderLayers for pure attention)
+    int32_t mambaNumHeads{0};      //!< Number of Mamba heads
+    int32_t mambaHeadDim{0};       //!< Dimension of each Mamba head
+    int32_t ssmStateSize{0};       //!< SSM state dimension (dstate)
+    int32_t convDim{0};            //!< Conv1d dimension (intermediate_size + 2 * n_groups * ssm_state_size)
+    int32_t convKernel{0};         //!< Conv1d kernel width
 };
 
 //! The class wraps the TensorRT engine built for auto-regressive style decoder model.
@@ -80,25 +92,42 @@ public:
      * @param configPath Path to model configuration file
      * @param loraWeightsMap Map of LoRA weight names to file paths
      * @param stream CUDA stream for operations
+     * @throws std::runtime_error If engine loading, configuration parsing, or initialization fails, or a CUDA operation
+     * fails
      */
     LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
     //! @brief Destructor
-    ~LLMEngineRunner();
+    ~LLMEngineRunner() noexcept;
 
     //! API entry to get the Rope CosSinCache tensor.
     //! The API is useful when the rope cos/sin cache depends on the context which cannot be initialized
     //! in advance when creating the LLMEngineRunner instance.
-    rt::Tensor& getRopeCosSinCacheTensor();
+    rt::Tensor& getRopeCosSinCacheTensor() noexcept;
 
-    //! @brief Get reference to the linear KV cache
+    //! @brief Get reference to the linear KV cache (also owns Mamba SSM/conv state buffers for hybrid models)
     //! @return Reference to LinearKVCache
-    rt::LinearKVCache& getLinearKVCache();
+    rt::LinearKVCache& getLinearKVCache() noexcept;
 
     //! @brief Get engine configuration
     //! @return Engine configuration structure
-    LLMEngineRunnerConfig getEngineConfig() const;
+    LLMEngineRunnerConfig getEngineConfig() const noexcept;
+
+    //! @brief Set an extra input tensor for the engine
+    //!
+    //! This is a temporary API for binding additional input tensors that are not part of
+    //! the standard LLM input set.
+    //! @note This is not a good design but we put it here temporarily to support TTS inference.
+    //! @note The API will be replaced soon with a better design. Please don't follow this schema.
+    //!
+    //! Example use case: CodePredictor's lm_head_weight input for dynamic lm_head selection.
+    //!
+    //! @param name The name of the LMHead input weights in the ONNX/TRT model
+    //! @param tensor The tensor to bind (must be on GPU, shape must match engine expectation)
+    //! @return True if the binding was successful
+    //! @note Must be called before executePrefillStep/executeVanillaDecodingStep
+    bool setLMHeadWeights(std::string const& name, rt::Tensor const& tensor);
 
     //! API entry to execute one prefill engine action for a batched request. The API will clear existing KVCache for
     //! last
@@ -112,6 +141,7 @@ public:
     //!     stream: The CUDA stream to execute the prefill step.
     //! Returns:
     //!     True if the prefill step is successful, false otherwise.
+    //! @throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
     bool executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Tensor const& contextLengths,
         rt::OptionalInputTensors deepstackEmbeds, rt::Tensor& outputLogits, rt::OptionalOutputTensor outputHiddenStates,
         cudaStream_t stream);
@@ -126,7 +156,9 @@ public:
     //!     outputLogits [GPU]: The output logits for the batch of requests.
     //! Returns:
     //!     True if the decoding step is successful, false otherwise.
-    bool executeVanillaDecodingStep(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, cudaStream_t stream);
+    //! @throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
+    bool executeVanillaDecodingStep(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits,
+        rt::OptionalOutputTensor outputHiddenStates, cudaStream_t stream);
 
     //! API entry to execute eagle base tree decoding step. The API will takes a draft tree of input embeddings.
     //!     baseTreeDecodingMask denote the relationship between the draft tree nodes.
@@ -139,6 +171,7 @@ public:
     //! Outputs:
     //!     outputLogits [GPU, Float16]: The output logits with shape [batchSize*Tree-Size, base-Vocab-Size].
     //!     outputHiddenStates [GPU]: The output hidden states with shape [batchSize*Tree-Size, base-hidden-dim].
+    //! @throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
     bool executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTreeDecodingInputsEmbeds,
         rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
         cudaStream_t stream);
@@ -152,16 +185,17 @@ public:
     //!     stream: The CUDA stream to execute the decoding step.
     //! Returns:
     //!     True if the CUDA graph capture is successful, false otherwise.
+    //! @throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
     bool captureVanillaDecodingCudaGraph(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits,
-        std::string const& loraWeightsName, cudaStream_t stream);
+        std::string const& loraWeightsName, cudaStream_t stream,
+        rt::OptionalOutputTensor outputHiddenStates = std::nullopt);
 
     //! API entry to switch the LoRA weights of the LLM engine.
     //! Inputs:
     //!     loraWeightsName: The name of the LoRA weights.
-    //!     stream: The CUDA stream to execute the switch step.
     //! Returns:
     //!     True if the LoRA weights switch is successful, false otherwise.
-    bool switchLoraWeights(std::string const& loraWeightsName, cudaStream_t stream);
+    bool switchLoraWeights(std::string const& loraWeightsName);
 
     //! API entry to get the active LoRA weights name.
     //! Returns:
@@ -187,15 +221,16 @@ public:
     //!     decoding step.
     //! Returns:
     //!     True if the CUDA graph capture is successful, false otherwise.
+    //! @throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
     bool captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& baseTreeDecodingInputsEmbeds,
         rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
-        cudaStream_t stream);
+        std::string const& loraWeightsName, cudaStream_t stream);
 
     //! Key to uniquely identify a captured CUDA graph for the decoding step
     using DecodingGraphKey = std::tuple<int64_t, uintptr_t, uintptr_t, std::string>;
 
     //! Key to uniquely identify a captured CUDA graph for the base model verification step
-    using BaseGraphKey = std::tuple<int64_t, uintptr_t, uintptr_t, uintptr_t>;
+    using BaseGraphKey = std::tuple<int64_t, uintptr_t, uintptr_t, uintptr_t, std::string>;
 
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                      //!< TensorRT runtime
@@ -234,6 +269,7 @@ private:
     rt::Tensor mSequenceContextLengths{};
 
     //! The LinearKVCache tensor that carried for the LLM model execution.
+    //! Also owns Mamba SSM and conv state buffers for hybrid models.
     rt::LinearKVCache mKVCache{};
 
     //! Dummy input tensor used to reserve space for unused input tensors. We always keep this tensor as zero tensor
@@ -255,7 +291,7 @@ private:
      * @param configJson JSON configuration object
      * @return True on success, false on failure
      */
-    bool initializeConfigFromJson(Json const& configJson);
+    bool initializeConfigFromJson(Json const& configJson) noexcept;
 
     /*!
      * @brief Validate configuration against engine
@@ -273,24 +309,38 @@ private:
     //! @brief Validate inputs for prefill step
     bool prefillStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& contextLengths,
         rt::Tensor const& outputLogits, rt::OptionalOutputTensor outputHiddenStates,
-        rt::OptionalInputTensors deepstackEmbeds);
+        rt::OptionalInputTensors deepstackEmbeds) noexcept;
 
     //! @brief Validate inputs for vanilla decoding step
-    bool vanillaDecodingStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits);
+    bool vanillaDecodingStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits) noexcept;
+
+    //! @brief Prepare inputs for vanilla decoding step (shared between execute and capture)
+    bool vanillaDecodingStepPrepareInputs(int32_t activeBatchSize, cudaStream_t stream);
+
+    //! @brief Bind tensors for vanilla decoding step (shared between execute and capture)
+    bool vanillaDecodingStepBindTensors(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits,
+        rt::OptionalOutputTensor outputHiddenStates, int32_t activeBatchSize);
 
     //! @brief Validate inputs for Eagle base tree decoding step
     bool eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputsEmbeds,
-        rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates);
+        rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& outputLogits,
+        rt::Tensor const& outputHiddenStates) noexcept;
+
+    //! @brief Prepare and bind tensors for Eagle base tree decoding step (shared between execute and capture)
+    bool eagleBaseTreeDecodingStepBindTensors(rt::Tensor const& baseTreeDecodingInputsEmbeds, rt::Tensor& outputLogits,
+        rt::Tensor& outputHiddenStates, int32_t activeBatchSize);
+
+    bool eagleBaseTreeDecodingStepPrepareInputs(rt::Tensor const& baseTreeDecodingInputsEmbeds,
+        rt::Tensor const& baseTreeDecodingMask, int32_t activeBatchSize, cudaStream_t stream);
 
     //! The Function is used to add a LoRA weights to the LLM engine.
     bool addLoraWeights(std::string const& loraWeightsName, std::string const& loraWeightsPath, cudaStream_t stream);
 
     /*!
      * @brief Reset LoRA weights to dummy tensors with rank 0
-     * @param stream CUDA stream for operations
      * @return True on success, false on failure
      */
-    bool resetLoraWeights(cudaStream_t stream);
+    bool resetLoraWeights();
 
     /*!
      * @brief Get maximum dimension required for LoRA weights across all LoRA bindings
@@ -306,7 +356,52 @@ private:
 
     //! @brief Check if LoRA weights are supported
     //! @return True if supported, false otherwise
-    bool isLoraWeightsSupported() const;
+    bool isLoraWeightsSupported() const noexcept;
+
+    //! @brief Get the KV cache type
+    //! @return The KV cache type
+    nvinfer1::DataType getKVCacheType() const;
+
+    //! @brief Get the SSM state dtype from the engine binding (layer 0)
+    nvinfer1::DataType getSSMStateType() const;
+
+    //! @brief Get the conv state dtype from the engine binding (layer 0)
+    nvinfer1::DataType getConvStateType() const;
+
+    //! @brief Validate the KV cache type consistency
+    //! @return True if the KV cache type is consistent, false otherwise
+    //! @throws std::runtime_error if KV cache has mismatching data type
+    bool validateKVCacheType() const;
+
+private:
+    /*!
+     * @brief Bind KV cache to engine for prefill and generation of new requests (plugin path)
+     * @param activeBatchSize Number of active sequences
+     * @return True on success, false on failure
+     */
+    bool bindPluginKVCacheToEngine(int32_t activeBatchSize);
+
+    /*!
+     * @brief Bind separate K and V caches to engine for new requests (TRT native path)
+     * @param activeBatchSize Number of active sequences
+     * @return True on success, false on failure
+     */
+    bool bindTRTNativeKVCacheToEngine(int32_t activeBatchSize);
+
+    /*!
+     * @brief Bind SSM state buffers for Mamba layers to the engine
+     * @param activeBatchSize Number of active sequences
+     * @return True on success, false on failure
+     */
+    bool bindSSMStateToEngine(int32_t activeBatchSize);
+
+    /*!
+     * @brief Bind conv state tensors to the TensorRT execution context
+     *
+     * @param activeBatchSize Current batch size to bind
+     * @return True on success, false on failure
+     */
+    bool bindConvStateToEngine(int32_t activeBatchSize);
 };
 
 } // namespace rt

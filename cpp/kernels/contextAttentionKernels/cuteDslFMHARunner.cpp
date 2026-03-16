@@ -1,0 +1,366 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifdef CUTE_DSL_FMHA_ENABLED
+
+#include "cuteDslFMHARunner.h"
+
+#include "common/logger.h"
+
+#include <climits>
+#include <cmath>
+
+namespace trt_edgellm
+{
+
+// =====================================================================
+// Static member initialization
+// =====================================================================
+
+// LLM
+fmha_d64_Kernel_Module_t CuteDslFMHARunner::sLLM_d64 = {};
+fmha_d128_Kernel_Module_t CuteDslFMHARunner::sLLM_d128 = {};
+fmha_d64_sw_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw = {};
+fmha_d128_sw_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_sw = {};
+bool CuteDslFMHARunner::sLLMLoaded = false;
+std::mutex CuteDslFMHARunner::sLLMMutex;
+
+// ViT
+vit_fmha_d64_Kernel_Module_t CuteDslFMHARunner::sViT_d64 = {};
+vit_fmha_d72_Kernel_Module_t CuteDslFMHARunner::sViT_d72 = {};
+vit_fmha_d80_Kernel_Module_t CuteDslFMHARunner::sViT_d80 = {};
+vit_fmha_d128_Kernel_Module_t CuteDslFMHARunner::sViT_d128 = {};
+bool CuteDslFMHARunner::sViTLoaded = false;
+std::mutex CuteDslFMHARunner::sViTMutex;
+
+// =====================================================================
+// Kernel module loading
+// =====================================================================
+
+bool CuteDslFMHARunner::loadLLMKernelModule()
+{
+    std::lock_guard<std::mutex> lock(sLLMMutex);
+    if (sLLMLoaded)
+    {
+        return true;
+    }
+    try
+    {
+        fmha_d64_Kernel_Module_Load(&sLLM_d64);
+        fmha_d128_Kernel_Module_Load(&sLLM_d128);
+        fmha_d64_sw_Kernel_Module_Load(&sLLM_d64_sw);
+        fmha_d128_sw_Kernel_Module_Load(&sLLM_d128_sw);
+        sLLMLoaded = true;
+        LOG_DEBUG("CuTe DSL LLM FMHA kernel modules loaded");
+        return true;
+    }
+    catch (...)
+    {
+        LOG_ERROR("Failed to load CuTe DSL LLM FMHA kernel modules");
+        return false;
+    }
+}
+
+void CuteDslFMHARunner::unloadLLMKernelModule()
+{
+    std::lock_guard<std::mutex> lock(sLLMMutex);
+    if (sLLMLoaded)
+    {
+        fmha_d64_Kernel_Module_Unload(&sLLM_d64);
+        fmha_d128_Kernel_Module_Unload(&sLLM_d128);
+        fmha_d64_sw_Kernel_Module_Unload(&sLLM_d64_sw);
+        fmha_d128_sw_Kernel_Module_Unload(&sLLM_d128_sw);
+        sLLMLoaded = false;
+    }
+}
+
+bool CuteDslFMHARunner::loadViTKernelModule()
+{
+    std::lock_guard<std::mutex> lock(sViTMutex);
+    if (sViTLoaded)
+    {
+        return true;
+    }
+    try
+    {
+        vit_fmha_d64_Kernel_Module_Load(&sViT_d64);
+        vit_fmha_d72_Kernel_Module_Load(&sViT_d72);
+        vit_fmha_d80_Kernel_Module_Load(&sViT_d80);
+        vit_fmha_d128_Kernel_Module_Load(&sViT_d128);
+        sViTLoaded = true;
+        LOG_DEBUG("CuTe DSL ViT FMHA kernel modules loaded");
+        return true;
+    }
+    catch (...)
+    {
+        LOG_ERROR("Failed to load CuTe DSL ViT FMHA kernel modules");
+        return false;
+    }
+}
+
+void CuteDslFMHARunner::unloadViTKernelModule()
+{
+    std::lock_guard<std::mutex> lock(sViTMutex);
+    if (sViTLoaded)
+    {
+        vit_fmha_d64_Kernel_Module_Unload(&sViT_d64);
+        vit_fmha_d72_Kernel_Module_Unload(&sViT_d72);
+        vit_fmha_d80_Kernel_Module_Unload(&sViT_d80);
+        vit_fmha_d128_Kernel_Module_Unload(&sViT_d128);
+        sViTLoaded = false;
+    }
+}
+
+bool CuteDslFMHARunner::canImplement(int32_t headSize, int32_t smVersion)
+{
+    return (smVersion >= 100) && (headSize == 64 || headSize == 128);
+}
+
+bool CuteDslFMHARunner::canImplementViT(int32_t headSize, int32_t smVersion)
+{
+    return (smVersion >= 100) && (headSize == 64 || headSize == 72 || headSize == 80 || headSize == 128);
+}
+
+// =====================================================================
+// Constructors
+// =====================================================================
+
+CuteDslFMHARunner::CuteDslFMHARunner(
+    int32_t numQHeads, int32_t numKVHeads, int32_t headDim, int32_t batchSize, int32_t seqLenQ, int32_t kvCacheCapacity)
+    : mBatchSize(batchSize)
+    , mSeqLenQ(seqLenQ)
+    , mKVCacheCapacity(kvCacheCapacity)
+    , mNumHeadsQ(numQHeads)
+    , mNumHeadsK(numKVHeads)
+    , mHeadDim(headDim)
+{
+}
+
+// =====================================================================
+// LLM run: batched Q + combined KV cache
+// =====================================================================
+
+void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens,
+    cudaStream_t stream, int32_t slidingWindowSize)
+{
+    if (!sLLMLoaded)
+    {
+        LOG_ERROR("CuTe DSL LLM FMHA kernel module not loaded.");
+        return;
+    }
+
+    float const softmaxScale = 1.0f / std::sqrt(static_cast<float>(mHeadDim));
+    float const scaleSoftmaxLog2 = softmaxScale * static_cast<float>(M_LOG2E);
+    float const scaleOutput = 1.0f;
+
+    int32_t const batchSize = mBatchSize;
+    int32_t const seqLenQ = mSeqLenQ;
+    int32_t const numQHeads = mNumHeadsQ;
+    int32_t const numKVHeads = mNumHeadsK;
+    int32_t const headDim = mHeadDim;
+    int32_t const capacity = mKVCacheCapacity;
+
+    bool const useSlidingWindow = (slidingWindowSize < INT_MAX);
+
+    // clang-format off
+#define CALL_LLM_FMHA(PREFIX, MODULE, WSL)                                                                             \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        PREFIX##_Tensor_q_tensor_t qTensor{};                                                                          \
+        qTensor.data = const_cast<void*>(qPtr);                                                                        \
+        qTensor.dynamic_shapes[0] = batchSize;                                                                         \
+        qTensor.dynamic_shapes[1] = seqLenQ;                                                                           \
+        qTensor.dynamic_shapes[2] = numQHeads;                                                                         \
+        qTensor.dynamic_shapes[3] = headDim;                                                                           \
+        qTensor.dynamic_strides[0] = static_cast<int64_t>(seqLenQ) * numQHeads * headDim;                             \
+        qTensor.dynamic_strides[1] = static_cast<int64_t>(numQHeads) * headDim;                                       \
+        qTensor.dynamic_strides[2] = static_cast<int64_t>(headDim);                                                    \
+                                                                                                                       \
+        PREFIX##_Tensor_kv_cache_t kvTensor{};                                                                          \
+        kvTensor.data = const_cast<void*>(kvPtr);                                                                       \
+        kvTensor.dynamic_shapes[0] = batchSize;                                                                         \
+        kvTensor.dynamic_shapes[1] = 2;                                                                                 \
+        kvTensor.dynamic_shapes[2] = numKVHeads;                                                                        \
+        kvTensor.dynamic_shapes[3] = capacity;                                                                          \
+        kvTensor.dynamic_shapes[4] = headDim;                                                                           \
+        kvTensor.dynamic_strides[0] = static_cast<int64_t>(2) * numKVHeads * capacity * headDim;                       \
+        kvTensor.dynamic_strides[1] = static_cast<int64_t>(numKVHeads) * capacity * headDim;                           \
+        kvTensor.dynamic_strides[2] = static_cast<int64_t>(capacity) * headDim;                                        \
+        kvTensor.dynamic_strides[3] = static_cast<int64_t>(headDim);                                                    \
+                                                                                                                       \
+        PREFIX##_Tensor_o_tensor_t oTensor{};                                                                           \
+        oTensor.data = oPtr;                                                                                            \
+        oTensor.dynamic_shapes[0] = batchSize;                                                                          \
+        oTensor.dynamic_shapes[1] = seqLenQ;                                                                            \
+        oTensor.dynamic_shapes[2] = numQHeads;                                                                          \
+        oTensor.dynamic_shapes[3] = headDim;                                                                            \
+        oTensor.dynamic_strides[0] = static_cast<int64_t>(seqLenQ) * numQHeads * headDim;                              \
+        oTensor.dynamic_strides[1] = static_cast<int64_t>(numQHeads) * headDim;                                        \
+        oTensor.dynamic_strides[2] = static_cast<int64_t>(headDim);                                                     \
+                                                                                                                       \
+        PREFIX##_Tensor_cum_seqlen_k_t cumSeqlenK{};                                                                     \
+        cumSeqlenK.data = const_cast<void*>(static_cast<void const*>(cuKVSeqLens));                                     \
+        cumSeqlenK.dynamic_shapes[0] = batchSize + 1;                                                                   \
+                                                                                                                       \
+        ret = cute_dsl_##PREFIX##_wrapper(                                                                              \
+            &(MODULE), &qTensor, &kvTensor, &oTensor, &cumSeqlenK, (WSL),                                              \
+            scaleSoftmaxLog2, softmaxScale, scaleOutput, stream);                                                       \
+    } while (0)
+    // clang-format on
+
+    int32_t ret = -1;
+    int32_t constexpr kNoLimit = 1 << 30;
+    int32_t const windowSizeLeft = useSlidingWindow ? slidingWindowSize : kNoLimit;
+
+    if (headDim == 64)
+    {
+        if (useSlidingWindow)
+        {
+            CALL_LLM_FMHA(fmha_d64_sw, sLLM_d64_sw, windowSizeLeft);
+        }
+        else
+        {
+            CALL_LLM_FMHA(fmha_d64, sLLM_d64, windowSizeLeft);
+        }
+    }
+    else if (headDim == 128)
+    {
+        if (useSlidingWindow)
+        {
+            CALL_LLM_FMHA(fmha_d128_sw, sLLM_d128_sw, windowSizeLeft);
+        }
+        else
+        {
+            CALL_LLM_FMHA(fmha_d128, sLLM_d128, windowSizeLeft);
+        }
+    }
+    else
+    {
+        LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim);
+        return;
+    }
+
+#undef CALL_LLM_FMHA
+
+    if (ret != 0)
+    {
+        LOG_ERROR("CuTe DSL LLM FMHA kernel (d=%d, sw=%s) failed with error code: %d", headDim,
+            useSlidingWindow ? "true" : "false", ret);
+    }
+}
+
+// =====================================================================
+// ViT run: packed varlen separate Q/K/V
+// =====================================================================
+
+void CuteDslFMHARunner::run(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr, int32_t const* cuSeqLens,
+    int32_t totalSeqLen, int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream)
+{
+    if (!sViTLoaded)
+    {
+        LOG_ERROR("CuTe DSL ViT FMHA kernel module not loaded.");
+        return;
+    }
+
+    float const softmaxScale = 1.0f / std::sqrt(static_cast<float>(mHeadDim));
+    float const scaleSoftmaxLog2 = softmaxScale * static_cast<float>(M_LOG2E);
+    float const scaleOutput = 1.0f;
+
+    int32_t const numHeads = mNumHeadsQ;
+    int32_t const headDim = mHeadDim;
+
+    // clang-format off
+#define CALL_VIT_FMHA(PREFIX, MODULE)                                                                                  \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        PREFIX##_Tensor_q_tensor_t qTensor{};                                                                          \
+        qTensor.data = const_cast<void*>(qPtr);                                                                        \
+        qTensor.dynamic_shapes[0] = totalSeqLen;                                                                       \
+        qTensor.dynamic_shapes[1] = numHeads;                                                                          \
+        qTensor.dynamic_shapes[2] = headDim;                                                                           \
+        qTensor.dynamic_strides[0] = static_cast<int64_t>(numHeads) * headDim;                                        \
+        qTensor.dynamic_strides[1] = static_cast<int64_t>(headDim);                                                    \
+                                                                                                                       \
+        PREFIX##_Tensor_k_tensor_t kTensor{};                                                                           \
+        kTensor.data = const_cast<void*>(kPtr);                                                                         \
+        kTensor.dynamic_shapes[0] = totalSeqLen;                                                                        \
+        kTensor.dynamic_shapes[1] = numHeads;                                                                           \
+        kTensor.dynamic_shapes[2] = headDim;                                                                            \
+        kTensor.dynamic_strides[0] = static_cast<int64_t>(numHeads) * headDim;                                         \
+        kTensor.dynamic_strides[1] = static_cast<int64_t>(headDim);                                                     \
+                                                                                                                       \
+        PREFIX##_Tensor_v_tensor_t vTensor{};                                                                           \
+        vTensor.data = const_cast<void*>(vPtr);                                                                         \
+        vTensor.dynamic_shapes[0] = totalSeqLen;                                                                        \
+        vTensor.dynamic_shapes[1] = numHeads;                                                                           \
+        vTensor.dynamic_shapes[2] = headDim;                                                                            \
+        vTensor.dynamic_strides[0] = static_cast<int64_t>(numHeads) * headDim;                                         \
+        vTensor.dynamic_strides[1] = static_cast<int64_t>(headDim);                                                     \
+                                                                                                                       \
+        PREFIX##_Tensor_o_tensor_t oTensor{};                                                                           \
+        oTensor.data = oPtr;                                                                                            \
+        oTensor.dynamic_shapes[0] = totalSeqLen;                                                                        \
+        oTensor.dynamic_shapes[1] = numHeads;                                                                           \
+        oTensor.dynamic_shapes[2] = headDim;                                                                            \
+        oTensor.dynamic_strides[0] = static_cast<int64_t>(numHeads) * headDim;                                         \
+        oTensor.dynamic_strides[1] = static_cast<int64_t>(headDim);                                                     \
+                                                                                                                       \
+        PREFIX##_Tensor_cu_seqlens_t cuSeqlensTensor{};                                                                 \
+        cuSeqlensTensor.data = const_cast<void*>(static_cast<void const*>(cuSeqLens));                                  \
+        cuSeqlensTensor.dynamic_shapes[0] = batchSize + 1;                                                              \
+                                                                                                                       \
+        ret = cute_dsl_##PREFIX##_wrapper(                                                                              \
+            &(MODULE), &qTensor, &kTensor, &vTensor, &oTensor, &cuSeqlensTensor, maxSeqLen,                            \
+            scaleSoftmaxLog2, softmaxScale, scaleOutput, stream);                                                       \
+    } while (0)
+    // clang-format on
+
+    int32_t ret = -1;
+
+    if (headDim == 64)
+    {
+        CALL_VIT_FMHA(vit_fmha_d64, sViT_d64);
+    }
+    else if (headDim == 72)
+    {
+        CALL_VIT_FMHA(vit_fmha_d72, sViT_d72);
+    }
+    else if (headDim == 80)
+    {
+        CALL_VIT_FMHA(vit_fmha_d80, sViT_d80);
+    }
+    else if (headDim == 128)
+    {
+        CALL_VIT_FMHA(vit_fmha_d128, sViT_d128);
+    }
+    else
+    {
+        LOG_ERROR("CuTe DSL ViT FMHA: unsupported head_dim=%d", headDim);
+        return;
+    }
+
+#undef CALL_VIT_FMHA
+
+    if (ret != 0)
+    {
+        LOG_ERROR("CuTe DSL ViT FMHA kernel (d=%d) failed with error code: %d", headDim, ret);
+    }
+}
+
+} // namespace trt_edgellm
+
+#endif // CUTE_DSL_FMHA_ENABLED

@@ -17,7 +17,7 @@ cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
 project(
   tensorrt_edgellm_sdk
-  VERSION 0.5.0
+  VERSION 0.6.0
   LANGUAGES CXX CUDA)
 
 # Specify the C++ standard and flags
@@ -26,9 +26,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_CUDA_STANDARD 17)
 
 set(CMAKE_CXX_FLAGS
-    "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations -Wall -Werror=return-type")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-declarations")
+    "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations -Wall -Werror -Wno-error=unused-parameter"
+)
+set(CMAKE_CUDA_FLAGS
+    "${CMAKE_CUDA_FLAGS} -Wno-deprecated-declarations -Xcompiler=-Werror,-Wno-error=unused-parameter"
+)
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
+
+# Code coverage with gcov (for SonarQube analysis)
+option(ENABLE_COVERAGE "Enable gcov code coverage instrumentation" OFF)
+include(${CMAKE_SOURCE_DIR}/cmake/CodeCoverage.cmake)
 
 macro(set_ifndef var val)
   if(NOT DEFINED ${var})
@@ -45,12 +52,18 @@ macro(add_cross_build_link_options target)
 endmacro(add_cross_build_link_options)
 
 # CUDA flags and dependencies.
-set_ifndef(CUDA_VERSION 12.8)
-set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_VERSION})
+if(DEFINED CUDA_VERSION)
+  message(
+    FATAL_ERROR
+      "CUDA_VERSION can cause ambiguity with CUDA Macros. Please use -DCUDA_CTK_VERSION to specify the CUDA Toolkit version."
+  )
+endif()
+set_ifndef(CUDA_CTK_VERSION 12.8)
+set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 
 if(NOT DEFINED AARCH64_BUILD)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
-  if(CUDA_VERSION VERSION_GREATER_EQUAL 12.8)
+  if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
     list(APPEND CMAKE_CUDA_ARCHITECTURES 100 120)
   endif()
 endif()
@@ -134,9 +147,12 @@ find_library(
   HINTS ${TRT_PACKAGE_DIR}
   PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
 
+# TRT and CUDA headers are treated as system includes so that the compiler
+# suppresses warnings originating from them (e.g. -Wunused-parameter in
+# NvInferRuntime.h virtual stubs).
+include_directories(SYSTEM ${CUDA_INCLUDE_DIR} ${TRT_INCLUDE_DIR})
+
 set(COMMON_INCLUDE_DIRS
-    ${CUDA_INCLUDE_DIR}
-    ${TRT_INCLUDE_DIR}
     ${NVTX_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}/cpp
     ${CMAKE_SOURCE_DIR}/examples/multimodal

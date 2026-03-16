@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +34,7 @@ namespace trt_edgellm
 namespace file_io
 {
 
-MmapReader::MmapReader()
+MmapReader::MmapReader() noexcept
     : mData(nullptr)
     , mBytes(0)
 {
@@ -50,12 +50,12 @@ MmapReader::MmapReader(std::filesystem::path const& fp)
     }
 }
 
-MmapReader::~MmapReader()
+MmapReader::~MmapReader() noexcept
 {
     release();
 }
 
-void MmapReader::release()
+void MmapReader::release() noexcept
 {
     if (mData != nullptr && mBytes > 0)
     {

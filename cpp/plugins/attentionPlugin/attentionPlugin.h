@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@
 
 #include <NvInferRuntime.h>
 #include <cstddef>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -41,8 +42,9 @@ public:
     //! \param[in] headSize Head dimension size
     //! \param[in] supportsSpecDecode Whether to support speculative decoding (Tree attention)
     //! \param[in] enableFp8KVCache Whether to enable FP8 KV cache
+    //! \param[in] slidingWindowSize Sliding window size (-1 = no sliding window)
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-        int32_t supportsSpecDecode, int32_t enableFp8KVCache);
+        int32_t supportsSpecDecode, int32_t enableFp8KVCache, int32_t slidingWindowSize = -1);
 
     //! \brief Constructor for deserialization
     //! \param[in] name Plugin instance name
@@ -176,6 +178,16 @@ protected:
     int32_t mSMVersion; //!< CUDA SM version
 
     int32_t mEnableFp8KVCache{}; //!< Whether FP8 KV cache is enabled
+
+    //! Sliding window size for attention (-1 = no sliding window, >0 = window size)
+    int32_t mSlidingWindowSize = -1;
+
+#ifdef CUTE_DSL_FMHA_ENABLED
+    //! Use CuTe DSL FMHA. Enabled by default on SM100+; set DISABLE_CUTE_DSL_FMHA=1 to fall back to FMHA_v2.
+    bool mUseCuteDslFMHA{!std::getenv("DISABLE_CUTE_DSL_FMHA")};
+#else
+    bool mUseCuteDslFMHA{false};
+#endif
 };
 
 //! \brief Factory class for creating AttentionPlugin instances

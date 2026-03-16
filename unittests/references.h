@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -134,7 +134,18 @@ void initRotaryPosEmbQwenViTReference(std::vector<float>& rotaryPosEmb,
     int64_t const mergeSize, float const rotaryBaseFrequency, float const scale);
 
 // GEMM weight packing and weight scale reference function for int4-WOQ kernel
-void awqPackReference(int16_t const* kernel_KxN, int N_in, int K_in, int16_t* out_Ndiv4xK);
+void awqPackReference(int16_t const* kernel_KxN, int32_t N_in, int32_t K_in, int16_t* out_Ndiv4xK);
 
-void scaledWeightsReference(
-    int16_t const* kernel_KxN, half const* scales_KdivGxN, int K, int N, int group_size, std::vector<half>& out_KxN);
+void scaledWeightsReference(int16_t const* kernel_KxN, half const* scales_KdivGxN, int32_t K, int32_t N,
+    int32_t group_size, std::vector<half>& out_KxN);
+
+// MoE TopK Softmax reference functions
+void referenceMoeSoftmax(std::vector<float> const& input, std::vector<float> const* correctionBias,
+    std::vector<float>& output, int32_t numTokens, int32_t numExperts, float moeSoftcapping = 0.0f);
+
+void referenceMoeTopK(std::vector<float> const& softmaxOutput, std::vector<float>& topkWeights,
+    std::vector<int32_t>& topkIndices, int32_t numTokens, int32_t numExperts, int32_t topk, bool renormalize);
+
+void referenceMoeTopkSoftmax(std::vector<float> const& gatingOutput, std::vector<float> const* correctionBias,
+    std::vector<float>& topkWeights, std::vector<int32_t>& topkIndices, int32_t numTokens, int32_t numExperts,
+    int32_t topk, bool renormalize, float moeSoftcapping = 0.0f);

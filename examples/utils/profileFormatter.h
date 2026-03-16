@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,8 +52,14 @@ void outputEagleGenerationProfile(
 //! Output multimodal processing summary to ostream
 void outputMultimodalProfile(std::ostream& output, trt_edgellm::metrics::MultimodalMetrics const& multimodalMetrics);
 
+//! Output Talker audio generation metrics summary to ostream
+void outputTalkerProfile(std::ostream& output, trt_edgellm::metrics::MultimodalMetrics const& talkerMetrics);
+
 //! Output memory usage summary to ostream
 void outputMemoryProfile(std::ostream& output, MemoryMonitor const& memoryMonitor);
+
+//! Output layer profiles summary to ostream
+void outputLayerProfiles(std::ostream& output, bool detailed = false);
 
 //! Add JSON for prefill stage to existing json object
 void addJsonPrefillSummary(nlohmann::json& summary, trt_edgellm::metrics::LLMPrefillMetrics const& prefillMetrics);
@@ -69,6 +75,9 @@ void addJsonEagleGenerationSummary(
 //! Add JSON for multimodal processing to existing json object
 void addJsonMultimodalSummary(
     nlohmann::json& summary, trt_edgellm::metrics::MultimodalMetrics const& multimodalMetrics);
+
+//! Add JSON for Talker audio generation to existing json object
+void addJsonTalkerSummary(nlohmann::json& summary, trt_edgellm::metrics::MultimodalMetrics const& talkerMetrics);
 
 //! Add JSON for all timing stages to existing json object
 void addJsonTimingStages(nlohmann::json& summary);

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -110,7 +110,7 @@ public:
 
     //! @brief Construct from TensorRT Dims
     //! @param dims TensorRT dimensions
-    Coords(nvinfer1::Dims const& dims)
+    Coords(nvinfer1::Dims const& dims) noexcept
         : mNumDims(dims.nbDims)
     {
         std::copy(dims.d, dims.d + mNumDims, mDims.begin());
@@ -132,7 +132,7 @@ public:
      * @tparam IT Iterator type
      * @param begin Beginning of range
      * @param end End of range
-     * @throw std::runtime_error if number of dimensions exceeds kMAX_DIMS
+     * @throws std::runtime_error if number of dimensions exceeds kMAX_DIMS
      */
     template <typename IT>
     Coords(IT begin, IT end)
@@ -147,6 +147,7 @@ public:
 
     //! @brief Construct from initializer list
     //! @param init Initializer list of dimensions
+    //! @throws std::runtime_error if number of dimensions exceeds kMAX_DIMS
     Coords(std::initializer_list<int64_t> init)
         : Coords(init.begin(), init.end())
     {
@@ -154,6 +155,7 @@ public:
 
     //! @brief Construct from vector
     //! @param vec Vector of dimensions
+    //! @throws std::runtime_error if number of dimensions exceeds kMAX_DIMS
     Coords(std::vector<int64_t> const& vec)
         : Coords(vec.begin(), vec.end())
     {
@@ -170,7 +172,7 @@ public:
      * @brief Array subscript operator (mutable)
      * @param idx Index to access
      * @return Reference to dimension at index
-     * @throw std::out_of_range if index is out of bounds
+     * @throws std::out_of_range if index is out of bounds
      */
     int64_t& operator[](int32_t idx)
     {
@@ -185,7 +187,7 @@ public:
      * @brief Array subscript operator (const)
      * @param idx Index to access
      * @return Dimension value at index
-     * @throw std::out_of_range if index is out of bounds
+     * @throws std::out_of_range if index is out of bounds
      */
     int64_t operator[](int32_t idx) const
     {
@@ -198,14 +200,15 @@ public:
 
     //! @brief Calculate total volume (product of all dimensions)
     //! @return Volume of the coordinates
-    int64_t volume() const;
+    int64_t volume() const noexcept;
 
     //! @brief Convert to TensorRT Dims
     //! @return TensorRT dimensions
-    nvinfer1::Dims getTRTDims() const;
+    nvinfer1::Dims getTRTDims() const noexcept;
 
     //! @brief Format coordinates as string
     //! @return String representation of coordinates
+    //! @throws std::runtime_error If coordinates are invalid or cannot be formatted
     std::string formatString() const;
 
 private:
@@ -221,7 +224,7 @@ class Tensor
 {
 public:
     //! @brief Default constructor
-    Tensor() = default;
+    Tensor() noexcept = default;
 
     /*!
      * @brief Disable copy constructor to enforce explicit memory ownership transfer
@@ -247,7 +250,7 @@ public:
     Tensor& operator=(Tensor&& other) noexcept;
 
     //! @brief Destructor
-    ~Tensor();
+    ~Tensor() noexcept;
 
     /*!
      * @brief Constructor that allocates memory on the specified device
@@ -259,6 +262,7 @@ public:
      * @param deviceType The device type to allocate memory on
      * @param dataType The data type of the tensor (sub-types like kInt4 or kE2M1 are not supported)
      * @param name Optional name for the tensor
+     * @throws std::runtime_error If volume is zero, data type is unsupported, or CUDA allocation fails
      */
     Tensor(Coords const& extent, DeviceType deviceType, nvinfer1::DataType dataType, std::string const& name = "");
 
@@ -275,7 +279,7 @@ public:
      * @param name Optional name for the tensor
      */
     Tensor(void* data, Coords const& extent, DeviceType deviceType, nvinfer1::DataType dataType,
-        std::string const& name = "") noexcept;
+        std::string const& name = "");
 
     //! @brief Get the shape of the tensor
     //! @return Coordinates representing the tensor shape
@@ -319,6 +323,7 @@ public:
     //! @brief Get stride of the tensor at given dimension
     //! @param idx Dimension index
     //! @return Stride value
+    //! @throws std::out_of_range If idx is out of bounds
     [[nodiscard]] int64_t getStride(int32_t idx) const;
 
     //! @brief Get raw data pointer (const)
@@ -398,32 +403,41 @@ namespace utils
 //! @brief Get size in bytes of a TensorRT data type
 //! @param dataType TensorRT data type (nvinfer1::DataType)
 //! @return Size in bytes
+//! @throws std::runtime_error If data type is unsupported (e.g., sub-byte types)
 size_t getTypeSize(nvinfer1::DataType dataType);
 
 //! @brief Compute strides for given shape
 //! @param shape Tensor shape
 //! @return Array of strides
+//! @throws std::out_of_range If shape index access is out of bounds
 std::array<int64_t, kMAX_DIMS> computeStrides(Coords const& shape);
 
 //! @brief Format tensor as string for debugging
 //! @param tensor Tensor to format
 //! @return String representation of tensor
+//! @throws std::runtime_error If data type is unsupported or CUDA memory copy fails
 std::string formatString(Tensor const& tensor);
 
 //! @brief Convert bytes to kilobytes
 //! @param bytes Size in bytes
 //! @return Size in kilobytes
-double toKB(size_t bytes);
+double toKB(size_t bytes) noexcept;
 
 //! @brief Convert bytes to megabytes
 //! @param bytes Size in bytes
 //! @return Size in megabytes
-double toMB(size_t bytes);
+double toMB(size_t bytes) noexcept;
 
 //! @brief Convert bytes to gigabytes
 //! @param bytes Size in bytes
 //! @return Size in gigabytes
-double toGB(size_t bytes);
+double toGB(size_t bytes) noexcept;
+
+//! @brief Get maximum value from an INT32 tensor on CPU
+//! @param tensor CPU tensor containing INT32 data
+//! @return Maximum value in the tensor (0 if tensor is empty)
+//! @throws std::runtime_error If tensor is not on CPU or data type is not INT32
+int32_t getMaxInt32Value(Tensor const& tensor);
 } // namespace utils
 
 //! @brief Optional input tensor type wrapper

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +33,10 @@ namespace plugins
 {
 //! Device memory alignment requirement (128 bytes)
 constexpr int32_t kDEVICE_ALIGNMENT{128};
+
+//! @brief Workaround for CUDA12/13 Thor SM re-numbering.
+//! @param smVersion CUDA SM version that may be normalized in-place.
+void applyThorSMRenumberWAR(int32_t& smVersion);
 
 /*!
  * @brief Convert C++ type to TensorRT PluginFieldType

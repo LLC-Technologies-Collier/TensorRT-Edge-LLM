@@ -20,18 +20,72 @@ set(CMAKE_CUDA_FLAGS_RELEASE
 )
 
 set(CMAKE_CUDA_FLAGS_DEBUG "")
+
+# ------------------------------------------------------------------------------
+# FMHA Cubin Conditional Compilation Exclude SM architectures that are not in
+# CMAKE_CUDA_ARCHITECTURES to reduce binary size. Only cubins for the target
+# architectures will be compiled.
+# ------------------------------------------------------------------------------
+set(FMHA_ALL_SM_VERSIONS
+    80
+    86
+    87
+    89
+    100
+    101
+    120
+    121)
+set(FMHA_EXCLUDE_DEFINITIONS "")
+
+# Build a list of required FMHA SM versions based on target architectures. Some
+# SM versions reuse cubins from other SM versions at runtime.
+set(REQUIRED_FMHA_SM_VERSIONS ${CMAKE_CUDA_ARCHITECTURES})
+
+# SM 110 uses SM 101 FMHA cubins at runtime
+if(110 IN_LIST CMAKE_CUDA_ARCHITECTURES AND NOT 101 IN_LIST
+                                            CMAKE_CUDA_ARCHITECTURES)
+  list(APPEND REQUIRED_FMHA_SM_VERSIONS 101)
+endif()
+
+# Exclude SM versions that are not required
+foreach(SM_VER ${FMHA_ALL_SM_VERSIONS})
+  if(NOT SM_VER IN_LIST REQUIRED_FMHA_SM_VERSIONS)
+    list(APPEND FMHA_EXCLUDE_DEFINITIONS "EXCLUDE_SM_${SM_VER}")
+  endif()
+endforeach()
+
+if(FMHA_EXCLUDE_DEFINITIONS)
+  message(
+    STATUS
+      "FMHA Kernels: Excluding SM architectures: ${FMHA_EXCLUDE_DEFINITIONS}")
+else()
+  message(STATUS "FMHA Kernels: Compiling cubins for all SM architectures")
+endif()
+
 # Generate Core C++ static library for LLM-SDK
 file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
 file(GLOB_RECURSE KERNELS_CU_SRCS "kernels/*.cu")
+# Exclude MoE Marlin ops/sm80 - compiled only via include from moeMarlin.cu
+list(FILTER KERNELS_CU_SRCS EXCLUDE REGEX
+     "marlin_moe_wna16/(ops|sm80_kernel_float16_u4_float16)\\.cu$")
 file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
 file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
 file(GLOB_RECURSE RUNTIME_CPP_SRCS "runtime/*.cpp")
 file(GLOB_RECURSE PROFILER_CPP_SRCS "profiling/*.cpp")
 
+# Enable relocatable device code for MoE Marlin kernels
+file(GLOB_RECURSE MOE_MARLIN_CU_SRCS "kernels/moe/moe_marlin/*.cu")
+set_source_files_properties(${MOE_MARLIN_CU_SRCS} PROPERTIES COMPILE_FLAGS
+                                                             "-rdc=true")
+
 add_library(edgellmKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS}
                                   ${COMMON_CPP_SRCS})
 target_include_directories(edgellmKernels PRIVATE ${COMMON_INCLUDE_DIRS})
+# Apply FMHA SM exclusion definitions
+target_compile_definitions(edgellmKernels PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
+# Enable separable compilation for MoE Marlin kernel templates
+set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 add_library(
   edgellmCore STATIC
@@ -45,6 +99,10 @@ add_library(
   ${PROFILER_CPP_SRCS})
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
 target_link_libraries(edgellmCore PRIVATE dl)
+# Apply FMHA SM exclusion definitions
+target_compile_definitions(edgellmCore PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
+# Enable separable compilation for MoE Marlin kernel templates
+set_target_properties(edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 # Generate tokenizer C++ static library
 file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
@@ -66,6 +124,16 @@ set_target_properties(NvInfer_edgellm_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
                                                         ${CMAKE_BINARY_DIR})
 target_include_directories(NvInfer_edgellm_plugin
                            PRIVATE ${COMMON_INCLUDE_DIRS})
+# Apply FMHA SM exclusion definitions
+target_compile_definitions(NvInfer_edgellm_plugin
+                           PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 target_link_libraries(NvInfer_edgellm_plugin commonLibraryExt edgellmKernels
-                      ${CUDA_DRIVER_LIB})
+                      ${CUDA_DRIVER_LIB} ${CUDART_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)
+
+# CuTe DSL FMHA (Blackwell SM100+): build-time kernel compilation
+if(ENABLE_CUTE_DSL_FMHA)
+  include(${CMAKE_SOURCE_DIR}/cmake/CuteDslFMHA.cmake)
+  cute_dsl_fmha_setup(TARGETS edgellmKernels edgellmCore PLUGIN_TARGET
+                      NvInfer_edgellm_plugin)
+endif()

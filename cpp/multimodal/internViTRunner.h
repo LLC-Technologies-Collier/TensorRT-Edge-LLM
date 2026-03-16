@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,24 +59,28 @@ public:
     //! \brief Constructor for InternViTRunner
     //! \param[in] engineDir Directory containing the TensorRT engine files
     //! \param[in] stream CUDA stream for execution
+    //! \throws std::runtime_error if engineDir does not contain valid engine files
+    //! \throws std::runtime_error if buffer allocation fails
+    //! \throws std::runtime_error if a CUDA error occurs
     InternViTRunner(std::string const& engineDir, cudaStream_t stream);
 
-    ~InternViTRunner() = default;
+    ~InternViTRunner() noexcept = default;
 
     //! \brief Preprocess multimodal input including images and text
     //! \param[in] request LLM generation request containing images and text
     //! \param[in,out] batchedInputIds Batched input token IDs after preprocessing
     //! \param[in] tokenizer Tokenizer for text processing
-    //! \param[in,out] ropeRotaryCosSinDevice RoPE rotary position encoding cache
+    //! \param[in,out] ropeRotaryCosSinDevice RoPE rotary position encoding cache (unused by this model)
     //! \param[in] stream CUDA stream for execution
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+        tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice,
+        cudaStream_t stream) noexcept override;
 
     //! \brief Run inference on the vision encoder
     //! \param[in] stream CUDA stream for execution
     //! \return True if inference succeeded, false otherwise
-    bool infer(cudaStream_t stream) override;
+    bool infer(cudaStream_t stream) noexcept override;
 
     //! \brief Validate and load configuration from JSON file
     //! \param[in] engineDir Path to engine directory
@@ -85,6 +89,7 @@ public:
 
     //! \brief Allocate buffers for inference
     //! \return True if allocation succeeded, false otherwise
+    //! \throws std::runtime_error if a CUDA error occurs
     bool allocateBuffer(cudaStream_t stream) override;
 
 private:
@@ -105,6 +110,7 @@ private:
     //! \param[out] totalNumBlocks Total number of image blocks
     //! \param[in] isThumbnail Whether the image is a thumbnail
     //! \param[in] stream CUDA stream for execution
+    //! \throws std::runtime_error if image size is unexpected, or number of blocks is excessive
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
         int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream);
 
@@ -114,6 +120,7 @@ private:
     //! \param[out] numImages Number of images per request
     //! \param[in] doResize Whether to resize images
     //! \param[in] stream CUDA stream for execution
+    //! \throws std::runtime_error if image size is unexpected, or number of blocks is excessive
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
         std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
 

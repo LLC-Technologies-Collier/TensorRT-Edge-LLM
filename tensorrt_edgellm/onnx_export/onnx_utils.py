@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -209,8 +209,13 @@ def fix_model_int4_output_dtypes(
     return onnx_model
 
 
-def export_onnx(model, inputs, output_dir, input_names, output_names,
-                dynamic_axes):
+def export_onnx(model,
+                inputs,
+                output_dir,
+                input_names,
+                output_names,
+                dynamic_axes,
+                custom_opsets=None):
     '''
     Export the model to ONNX format.
     Args:
@@ -220,6 +225,7 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
         input_names: The names of the input tensors
         output_names: The names of the output tensors
         dynamic_axes: The dynamic axes of the model
+        custom_opsets: Optional dict mapping custom domain names to opset versions
     '''
     t0 = time.time()
     os.makedirs(output_dir, exist_ok=True)
@@ -234,6 +240,7 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
                           output_names=output_names,
                           opset_version=ONNX_OPSET_VERSION,
                           do_constant_folding=True,
+                          custom_opsets=custom_opsets,
                           dynamo=False)
     t1 = time.time()
     print(f"ONNX export completed in {t1 - t0}s. Apply post-processing...")
@@ -298,3 +305,63 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
     print(
         f"ONNX post-processing completed in {t2 - t1}s. ONNX file is saved to {output_dir} in {t2 - t0}s."
     )
+
+
+def export_onnx_dynamo(model,
+                       inputs,
+                       output_dir,
+                       input_names=None,
+                       output_names=None,
+                       input_dynamic_shapes=None,
+                       output_dynamic_shapes=None,
+                       opset_version=None):
+    '''
+    Export the model to ONNX format using dynamo.
+    Args:
+        model: The model to export
+        inputs: The inputs to the model
+        output_dir: The directory to save the ONNX model
+        input_names: The names of the input tensors
+        output_names: The names of the output tensors
+        input_dynamic_shapes: The dynamic shapes of the input tensors
+        output_dynamic_shapes: The dynamic shapes of the output tensors, tuple of dicts mapping dim index to name
+        opset_version: ONNX opset version to use (default: ONNX_OPSET_VERSION from common.py)
+    '''
+    if opset_version is None:
+        opset_version = ONNX_OPSET_VERSION
+
+    t0 = time.time()
+    os.makedirs(output_dir, exist_ok=True)
+    onnx_path = f'{output_dir}/model.onnx'
+    with torch.inference_mode():
+        exported_model = torch.onnx.export(model,
+                                           inputs,
+                                           onnx_path,
+                                           dynamic_shapes=input_dynamic_shapes,
+                                           input_names=input_names,
+                                           output_names=output_names,
+                                           opset_version=opset_version,
+                                           dynamo=True)
+
+    # Modify output dimensions according to output_dynamic_shapes as the dynamo exporter
+    # does not expose this option.
+    if output_dynamic_shapes is not None:
+        outputs = exported_model.model.graph.outputs
+        for output_idx, dynamic_shape_dict in enumerate(output_dynamic_shapes):
+            if output_idx >= len(outputs):
+                raise ValueError(f"Output {output_idx} not found in the model")
+            output = outputs[output_idx]
+            for dim_idx, dim_name in dynamic_shape_dict.items():
+                if dim_idx < len(output.shape):
+                    # Set the dimension to a symbolic name
+                    output.shape[dim_idx] = dim_name
+                else:
+                    raise ValueError(
+                        f"Dimension {dim_idx} not found in output {output_idx}"
+                    )
+
+    # Save the modified model
+    exported_model.save(onnx_path)
+
+    t1 = time.time()
+    print(f"ONNX export completed in {t1 - t0}s. Apply post-processing...")

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,25 +36,38 @@ LinearKVCache::LinearKVCache(CacheConfig const& config, cudaStream_t stream)
     check::check(
         mConfig.kvCacheTypeTRT == nvinfer1::DataType::kHALF || mConfig.kvCacheTypeTRT == nvinfer1::DataType::kFP8,
         "Unsupported KV cache dtype.");
-    mDeviceKVCache = rt::Tensor({mConfig.numDecoderLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads,
+    mDeviceKVCache = rt::Tensor({mConfig.numAttentionLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads,
                                     mConfig.maxSequenceLength, mConfig.headDim},
         DeviceType::kGPU, mConfig.kvCacheTypeTRT, "LinearKVCache::mDeviceKVCache");
-    int64_t const kvCacheVolume = mConfig.numDecoderLayers * mConfig.maxBatchSize * 2 * mConfig.numKVHeads
+    int64_t const kvCacheVolume = mConfig.numAttentionLayers * mConfig.maxBatchSize * 2 * mConfig.numKVHeads
         * mConfig.maxSequenceLength * mConfig.headDim;
     size_t const kvCacheElemSize = rt::utils::getTypeSize(mConfig.kvCacheTypeTRT);
     char const* kvCacheTypeStr = (mConfig.kvCacheTypeTRT == nvinfer1::DataType::kHALF) ? "kHALF" : "kFP8";
     LOG_DEBUG(
         "KVCache(dtype=%s) of shape [%ld, %ld, %ld, %ld, %ld, %ld] allocated on GPU with size: %ld bytes (%.2f MB)",
-        kvCacheTypeStr, mConfig.numDecoderLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads,
+        kvCacheTypeStr, mConfig.numAttentionLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads,
         mConfig.maxSequenceLength, mConfig.headDim, kvCacheVolume * static_cast<int64_t>(kvCacheElemSize),
         static_cast<float>(kvCacheVolume * static_cast<int64_t>(kvCacheElemSize)) / (1024.0 * 1024.0));
     mDeviceKVCacheLengths = rt::Tensor(
         {mConfig.maxBatchSize}, DeviceType::kGPU, DataType::kINT32, "LinearKVCache::mDeviceKVCacheLengths");
     CUDA_CHECK(
         cudaMemsetAsync(mDeviceKVCacheLengths.rawPointer(), 0, mDeviceKVCacheLengths.getMemoryCapacity(), stream));
+
+    if (mConfig.numMambaLayers > 0)
+    {
+        mDeviceSSMStates = rt::Tensor({mConfig.numMambaLayers, mConfig.maxBatchSize, mConfig.mambaNumHeads,
+                                          mConfig.mambaHeadDim, mConfig.ssmStateSize},
+            DeviceType::kGPU, mConfig.ssmStateType, "LinearKVCache::mDeviceSSMStates");
+        CUDA_CHECK(cudaMemsetAsync(mDeviceSSMStates.rawPointer(), 0, mDeviceSSMStates.getMemoryCapacity(), stream));
+
+        mDeviceConvStates
+            = rt::Tensor({mConfig.numMambaLayers, mConfig.maxBatchSize, mConfig.convDim, mConfig.convKernel},
+                DeviceType::kGPU, mConfig.convStateType, "LinearKVCache::mDeviceConvStates");
+        CUDA_CHECK(cudaMemsetAsync(mDeviceConvStates.rawPointer(), 0, mDeviceConvStates.getMemoryCapacity(), stream));
+    }
 }
 
-LinearKVCache::~LinearKVCache() {}
+LinearKVCache::~LinearKVCache() noexcept {}
 
 LinearKVCache::LinearKVCache(LinearKVCache&& other) noexcept
 {
@@ -63,6 +76,8 @@ LinearKVCache::LinearKVCache(LinearKVCache&& other) noexcept
     mKVCacheAllEmpty = other.mKVCacheAllEmpty;
     mDeviceKVCache = std::move(other.mDeviceKVCache);
     mDeviceKVCacheLengths = std::move(other.mDeviceKVCacheLengths);
+    mDeviceSSMStates = std::move(other.mDeviceSSMStates);
+    mDeviceConvStates = std::move(other.mDeviceConvStates);
 
     other.mConfig = CacheConfig{};
     other.mActiveBatchSize = 0;
@@ -73,12 +88,13 @@ LinearKVCache& LinearKVCache::operator=(LinearKVCache&& other) noexcept
 {
     if (this != &other)
     {
-        // Release current KVCache memory.
         mConfig = other.mConfig;
         mKVCacheAllEmpty = other.mKVCacheAllEmpty;
         mActiveBatchSize = other.mActiveBatchSize;
         mDeviceKVCache = std::move(other.mDeviceKVCache);
         mDeviceKVCacheLengths = std::move(other.mDeviceKVCacheLengths);
+        mDeviceSSMStates = std::move(other.mDeviceSSMStates);
+        mDeviceConvStates = std::move(other.mDeviceConvStates);
 
         other.mConfig = CacheConfig{};
         other.mActiveBatchSize = 0;
@@ -87,7 +103,7 @@ LinearKVCache& LinearKVCache::operator=(LinearKVCache&& other) noexcept
     return *this;
 }
 
-rt::Tensor LinearKVCache::getKVCacheForDecoderLayer(int32_t decoderLayerIdx)
+rt::Tensor LinearKVCache::getCombinedKVCacheForDecoderLayer(int32_t decoderLayerIdx) noexcept
 {
     int64_t const kvCacheOffset
         = decoderLayerIdx * mConfig.maxBatchSize * 2 * mConfig.numKVHeads * mConfig.maxSequenceLength * mConfig.headDim;
@@ -100,12 +116,121 @@ rt::Tensor LinearKVCache::getKVCacheForDecoderLayer(int32_t decoderLayerIdx)
         mConfig.kvCacheTypeTRT);
 }
 
-rt::Tensor LinearKVCache::getKVCacheBuffer()
+std::pair<rt::Tensor, rt::Tensor> LinearKVCache::getSeparateKVCacheForDecoderLayer(int32_t decoderLayerIdx) noexcept
+{
+    // Get the combined KV cache for this layer from base class
+    rt::Tensor kvCache = LinearKVCache::getCombinedKVCacheForDecoderLayer(decoderLayerIdx);
+
+    // The KV cache has shape: [maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
+    // K cache is at index 0 of dimension 2, so we just need to point to the beginning
+    // and reshape to remove the "2" dimension
+
+    CacheConfig config = getConfig();
+    void* kvCachePtr = static_cast<void*>(kvCache.rawPointer());
+
+    void* kCachePtr = static_cast<void*>(kvCachePtr);
+    rt::Tensor kCache
+        = rt::Tensor(kCachePtr, {config.maxBatchSize, config.numKVHeads, config.maxSequenceLength, config.headDim},
+            DeviceType::kGPU, mConfig.kvCacheTypeTRT);
+
+    // Calculate offset to V cache: skip the entire K cache portion
+    // Offset = maxBatchSize * 1 (K portion) * numKVHeads * maxSequenceLength * headDim
+    int64_t vCacheOffset = config.maxBatchSize * config.numKVHeads * config.maxSequenceLength * config.headDim
+        * static_cast<int64_t>(rt::utils::getTypeSize(mConfig.kvCacheTypeTRT));
+    void* vCachePtr = static_cast<void*>(static_cast<char*>(kvCachePtr) + vCacheOffset);
+
+    rt::Tensor vCache
+        = rt::Tensor(vCachePtr, {config.maxBatchSize, config.numKVHeads, config.maxSequenceLength, config.headDim},
+            DeviceType::kGPU, mConfig.kvCacheTypeTRT);
+    return {std::move(kCache), std::move(vCache)};
+}
+
+rt::Tensor LinearKVCache::getKVCacheBuffer() noexcept
 {
     return rt::Tensor(mDeviceKVCache.rawPointer(),
-        {mConfig.numDecoderLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength,
+        {mConfig.numAttentionLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength,
             mConfig.headDim},
         DeviceType::kGPU, mConfig.kvCacheTypeTRT);
+}
+
+void LinearKVCache::clearMambaStates(cudaStream_t stream)
+{
+    if (mConfig.numMambaLayers == 0)
+    {
+        return;
+    }
+    CUDA_CHECK(cudaMemsetAsync(mDeviceSSMStates.rawPointer(), 0, mDeviceSSMStates.getMemoryCapacity(), stream));
+    CUDA_CHECK(cudaMemsetAsync(mDeviceConvStates.rawPointer(), 0, mDeviceConvStates.getMemoryCapacity(), stream));
+}
+
+rt::Tensor LinearKVCache::getSSMStateForLayer(int32_t mambaLayerIdx) noexcept
+{
+    size_t const elemSize = rt::utils::getTypeSize(mConfig.ssmStateType);
+    int64_t const perLayerElems
+        = mConfig.maxBatchSize * mConfig.mambaNumHeads * mConfig.mambaHeadDim * mConfig.ssmStateSize;
+    void* ptr = static_cast<char*>(mDeviceSSMStates.rawPointer()) + mambaLayerIdx * perLayerElems * elemSize;
+    return rt::Tensor(ptr, {mConfig.maxBatchSize, mConfig.mambaNumHeads, mConfig.mambaHeadDim, mConfig.ssmStateSize},
+        DeviceType::kGPU, mConfig.ssmStateType);
+}
+
+rt::Tensor LinearKVCache::getConvStateForLayer(int32_t mambaLayerIdx) noexcept
+{
+    size_t const elemSize = rt::utils::getTypeSize(mConfig.convStateType);
+    int64_t const perLayerElems = mConfig.maxBatchSize * mConfig.convDim * mConfig.convKernel;
+    void* ptr = static_cast<char*>(mDeviceConvStates.rawPointer()) + mambaLayerIdx * perLayerElems * elemSize;
+    return rt::Tensor(
+        ptr, {mConfig.maxBatchSize, mConfig.convDim, mConfig.convKernel}, DeviceType::kGPU, mConfig.convStateType);
+}
+
+std::vector<rt::Tensor> LinearKVCache::captureSSMStates(int32_t batchIdx, cudaStream_t stream)
+{
+    std::vector<rt::Tensor> result;
+    if (mConfig.numMambaLayers == 0)
+    {
+        return result;
+    }
+    size_t const elemSize = rt::utils::getTypeSize(mConfig.ssmStateType);
+    int64_t const perLayerElems
+        = mConfig.maxBatchSize * mConfig.mambaNumHeads * mConfig.mambaHeadDim * mConfig.ssmStateSize;
+    int64_t const perBatchElems = mConfig.mambaNumHeads * mConfig.mambaHeadDim * mConfig.ssmStateSize;
+    size_t const perBatchBytes = static_cast<size_t>(perBatchElems) * elemSize;
+
+    result.reserve(mConfig.numMambaLayers);
+    for (int32_t layer = 0; layer < mConfig.numMambaLayers; ++layer)
+    {
+        void const* src = static_cast<char const*>(mDeviceSSMStates.rawPointer())
+            + static_cast<size_t>(layer * perLayerElems + batchIdx * perBatchElems) * elemSize;
+        rt::Tensor saved({1, mConfig.mambaNumHeads, mConfig.mambaHeadDim, mConfig.ssmStateSize}, DeviceType::kGPU,
+            mConfig.ssmStateType, "LinearKVCache::capturedSSMState_" + std::to_string(layer));
+        CUDA_CHECK(cudaMemcpyAsync(saved.rawPointer(), src, perBatchBytes, cudaMemcpyDeviceToDevice, stream));
+        result.push_back(std::move(saved));
+    }
+    return result;
+}
+
+std::vector<rt::Tensor> LinearKVCache::captureConvStates(int32_t batchIdx, cudaStream_t stream)
+{
+    std::vector<rt::Tensor> result;
+    if (mConfig.numMambaLayers == 0)
+    {
+        return result;
+    }
+    size_t const elemSize = rt::utils::getTypeSize(mConfig.convStateType);
+    int64_t const perLayerElems = mConfig.maxBatchSize * mConfig.convDim * mConfig.convKernel;
+    int64_t const perBatchElems = mConfig.convDim * mConfig.convKernel;
+    size_t const perBatchBytes = static_cast<size_t>(perBatchElems) * elemSize;
+
+    result.reserve(mConfig.numMambaLayers);
+    for (int32_t layer = 0; layer < mConfig.numMambaLayers; ++layer)
+    {
+        void const* src = static_cast<char const*>(mDeviceConvStates.rawPointer())
+            + static_cast<size_t>(layer * perLayerElems + batchIdx * perBatchElems) * elemSize;
+        rt::Tensor saved({1, mConfig.convDim, mConfig.convKernel}, DeviceType::kGPU, mConfig.convStateType,
+            "LinearKVCache::capturedConvState_" + std::to_string(layer));
+        CUDA_CHECK(cudaMemcpyAsync(saved.rawPointer(), src, perBatchBytes, cudaMemcpyDeviceToDevice, stream));
+        result.push_back(std::move(saved));
+    }
+    return result;
 }
 
 void LinearKVCache::resetForNewSequences(rt::Tensor const& reuseKVCacheLengths, cudaStream_t stream)
@@ -119,7 +244,7 @@ void LinearKVCache::resetForNewSequences(rt::Tensor const& reuseKVCacheLengths, 
         "The data type of the reuseKVCacheLengths tensor shall match the data type of the Device KVCache Lengths.");
 
     mActiveBatchSize = batchSize;
-    mDeviceKVCacheLengths.reshape({mActiveBatchSize});
+    check::check(mDeviceKVCacheLengths.reshape({mActiveBatchSize}), "Tensor reshape failed");
 
     // If all reuseSequenceLengths are 0, then we can set flag mKVCacheAllEmpty to true.
     int32_t const* reuseSequenceLengthsData = reuseKVCacheLengths.dataPointer<int32_t>();
@@ -160,22 +285,22 @@ void LinearKVCache::commitSequenceLength(int32_t increment, cudaStream_t stream)
     mKVCacheAllEmpty = false;
 }
 
-rt::Tensor& LinearKVCache::getKVCacheLengths()
+rt::Tensor& LinearKVCache::getKVCacheLengths() noexcept
 {
     return mDeviceKVCacheLengths;
 }
 
-LinearKVCache::CacheConfig LinearKVCache::getConfig() const
+LinearKVCache::CacheConfig LinearKVCache::getConfig() const noexcept
 {
     return mConfig;
 }
 
-int32_t LinearKVCache::getActiveBatchSize() const
+int32_t LinearKVCache::getActiveBatchSize() const noexcept
 {
     return mActiveBatchSize;
 }
 
-bool LinearKVCache::getKVCacheAllEmpty() const
+bool LinearKVCache::getKVCacheAllEmpty() const noexcept
 {
     return mKVCacheAllEmpty;
 }
@@ -185,7 +310,7 @@ void LinearKVCache::setActiveBatchSize(int32_t newActiveBatchSize)
     check::check(newActiveBatchSize >= 0 && newActiveBatchSize <= mConfig.maxBatchSize,
         "Invalid active batch size: must be in range [0, maxBatchSize]");
     mActiveBatchSize = newActiveBatchSize;
-    mDeviceKVCacheLengths.reshape({mActiveBatchSize});
+    check::check(mDeviceKVCacheLengths.reshape({mActiveBatchSize}), "Tensor reshape failed");
 }
 
 } // namespace rt

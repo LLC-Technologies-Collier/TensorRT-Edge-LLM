@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -299,12 +299,12 @@ void Phi4MMViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
     }
 
     // Copy image to device.
-    mImageDevice.reshape({1, height, width, channels});
-    CUDA_CHECK(cudaMemcpyAsync(mImageDevice.rawPointer(), imageData, height * width * channels * sizeof(unsigned char),
-        cudaMemcpyHostToDevice, stream));
+    check::check(mImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
+    CUDA_CHECK(cudaMemcpyAsync(
+        mImageDevice.rawPointer(), imageData, height * width * channels, cudaMemcpyHostToDevice, stream));
 
     // Normalize image
-    mNormalizedImageDevice.reshape({1, height, width, channels});
+    check::check(mNormalizedImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
 
     // Transpose to patch
@@ -439,7 +439,7 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    rt::Tensor& /*ropeRotaryCosSinDevice*/, cudaStream_t stream)
+    rt::Tensor& /*ropeRotaryCosSinDevice*/, cudaStream_t stream) noexcept
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;

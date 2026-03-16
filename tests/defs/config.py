@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -188,6 +188,14 @@ class TestConfig:
         str] = None  # "input_aware" or "frequency"
     vocab_reduction_max_samples: Optional[int] = None
 
+    warmup: Optional[int] = None
+
+    # Add TensorRT native operations flag
+    trt_native_ops: Optional[bool] = None
+
+    # Debug flag for verbose output
+    debug: Optional[bool] = None
+
     # Declarative parameter specifications
     _PARAMETER_SPECS = [
         # Core parameters for engine identification
@@ -220,24 +228,28 @@ class TestConfig:
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("is_eagle",
-                      "eagle",
-                      {TaskType.EXPORT, TaskType.BUILD, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM},
+                      "eagle", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("draft_model_id",
-                      "",
-                      {TaskType.EXPORT, TaskType.BUILD, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM},
+                      "", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("draft_llm_precision",
-                      "",
-                      {TaskType.EXPORT, TaskType.BUILD, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM},
+                      "", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("draft_lm_head_precision",
-                      "",
-                      {TaskType.EXPORT, TaskType.BUILD, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM},
+                      "", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("max_verify_tree_size",
                       "mvts",
@@ -275,29 +287,21 @@ class TestConfig:
                       }, {ModelType.VLM},
                       is_required=False),
 
-        # Benchmark parameters
-        ParameterSpec("input_seq_len", "isl", {TaskType.BENCHMARK},
-                      {ModelType.LLM, ModelType.VLM}),
-        ParameterSpec("output_seq_len", "osl", {TaskType.BENCHMARK},
-                      {ModelType.LLM, ModelType.VLM}),
-        ParameterSpec("text_token_length", "ttl", {TaskType.BENCHMARK},
-                      {ModelType.VLM}),
-        ParameterSpec("image_token_length", "itl", {TaskType.BENCHMARK},
-                      {ModelType.VLM}),
-
-        # Inference parameters
-        ParameterSpec("test_case", "", {TaskType.INFERENCE},
+        # Inference/Benchmark parameters
+        ParameterSpec("test_case", "",
+                      {TaskType.INFERENCE, TaskType.BENCHMARK},
                       {ModelType.LLM, ModelType.VLM}),
         ParameterSpec("batch_size",
-                      "bs", {TaskType.INFERENCE},
+                      "bs", {TaskType.BENCHMARK, TaskType.INFERENCE},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
 
         # Vocabulary reduction parameters
         ParameterSpec("reduced_vocab_size",
-                      "rvs",
-                      {TaskType.EXPORT, TaskType.BUILD, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM},
+                      "rvs", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("vocab_reduction_method",
                       "vrm", {TaskType.EXPORT}, {ModelType.LLM, ModelType.VLM},
@@ -305,6 +309,12 @@ class TestConfig:
         ParameterSpec("vocab_reduction_max_samples",
                       "vrms", {TaskType.EXPORT},
                       {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+        ParameterSpec("trt_native_ops",
+                      "ootb", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
     ]
 
@@ -462,6 +472,8 @@ class TestConfig:
             elif part.startswith('vrms'):
                 parsed_params['vocab_reduction_max_samples'] = int(part[4:])
             # For inference parameters
+            elif part.startswith('ootb'):
+                parsed_params['trt_native_ops'] = True
             else:
                 parsed_params['test_case'] = part
 
@@ -535,6 +547,15 @@ class TestConfig:
                 if self.max_draft_tree_size is None:
                     self.max_draft_tree_size = 60
 
+        warmup_env = os.environ.get('WARMUP')
+        if warmup_env is not None and self.warmup is None:
+            self.warmup = int(warmup_env)
+
+        # Read debug flag from environment variable
+        debug_env = os.environ.get('DEBUG')
+        if debug_env is not None and self.debug is None:
+            self.debug = debug_env.lower() in ('1', 'true', 'yes')
+
         missing_params = []
         invalid_params = []
 
@@ -587,6 +608,8 @@ class TestConfig:
             model_id += "-fp8kv"
         if self.reduced_vocab_size:
             model_id += f"-rvs{self.reduced_vocab_size}"
+        if self.trt_native_ops:
+            model_id += "-ootb"
         return model_id
 
     def get_engine_id(self) -> str:
@@ -626,6 +649,7 @@ class TestConfig:
             "Llama-3.2-1B": "llama-3.2-models/Llama-3.2-1B",
             "Llama-3.2-3B": "llama-3.2-models/Llama-3.2-3B",
             "Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
+            "Qwen3-1.7B": "Qwen3/Qwen3-1.7B",
             "Qwen3-8B": "Qwen3/Qwen3-8B",
             "Qwen3-4B-Instruct-2507": "Qwen3/Qwen3-4B-Instruct-2507",
             "Qwen3-VL-2B-Instruct": "Qwen3/Qwen3-VL-2B-Instruct",
@@ -680,7 +704,17 @@ class TestConfig:
                 "eagle3": "Qwen3/qwen3_8b_eagle3",
             },
             "Qwen3-4B-Instruct-2507": {
-                "eagle3": "EAGLE3-Qwen3-4B-v2",
+                "v2": "EAGLE3-Qwen3-4B-v2",
+                "v2.1": "EAGLE3-Qwen3-4B-v2.1",
+            },
+            "Qwen3-VL-4B-Instruct": {
+                "eagle3": "EAGLE3-Qwen3-VL-4B-v1.1",
+            },
+            "Qwen3-1.7B": {
+                "eagle3": "Qwen3/Qwen3-1.7B_eagle3",
+            },
+            "Qwen3-VL-8B-Instruct": {
+                "v0": "Qwen3/qwen3-vl-8b-eagle3-v0",
             },
             # Add more mappings as needed
         }
@@ -704,11 +738,16 @@ class TestConfig:
                 f"Available: {', '.join(draft_models.keys())}")
 
         model_dir_name = draft_models[self.draft_model_id]
-        model_dir = _find_directory(self.edgellm_data_dir, model_dir_name, 5)
+        # Search in llm_models_dir first, then fallback to edgellm_data_dir
+        model_dir = _find_directory(self.llm_models_dir, model_dir_name, 5)
+        if not model_dir:
+            model_dir = _find_directory(self.edgellm_data_dir, model_dir_name,
+                                        5)
         if not model_dir:
             raise ValueError(
                 f"Draft model directory not found: '{model_dir_name}' under "
-                f"{self.edgellm_data_dir} with search depth 5")
+                f"{self.llm_models_dir} or {self.edgellm_data_dir} with search depth 5"
+            )
         return model_dir
 
     def get_onnx_base_dir(self) -> str:

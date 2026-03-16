@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,8 +17,10 @@
 
 #include "tensor.h"
 
+#include "NvInferVersion.h"
 #include "checkMacros.h"
 #include "cudaMacros.h"
+#include <algorithm>
 #include <iomanip>
 #include <memory>
 #include <sstream>
@@ -45,6 +47,14 @@ constexpr char const* getDataTypeString(DataType const dataType)
     case DataType::kFP8: return "FLOAT8_E4M3";
     case DataType::kINT8: return "INT8";
     case DataType::kUINT8: return "UINT8";
+    case DataType::kBOOL: return "BOOL";
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 12)
+    case DataType::kE8M0: return "FLOAT8_E8M0";
+#endif
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 8)
+    case DataType::kFP4: return "FLOAT4";
+#endif
+    case DataType::kINT4: return "INT4";
     }
 
     return "UNKNOWN";
@@ -61,9 +71,14 @@ constexpr char const* getDeviceTypeString(DeviceType deviceType)
     return "UNKNOWN";
 }
 
-// Helper function to acquire the string representation of a numeric value.
-// With Float type, we always upcast the value to float32 for printing and emit
-// the float value with 4 decimal places.
+/*!
+ * Helper function to acquire the string representation of a numeric value.
+ * With Float type, we always upcast the value to float32 for printing and emit
+ * the float value with 4 decimal places.
+ *
+ * @throws std::runtime_error if data type is unsupported
+ * @throws std::runtime_error if string formatting fails
+ */
 template <typename T>
 std::string formatElement(T value)
 {
@@ -109,7 +124,14 @@ std::string formatElement(T value)
         }
         ss << std::fixed << std::setprecision(4) << fval;
     }
-    return ss.str();
+    if (ss.good())
+    {
+        return ss.str();
+    }
+    else
+    {
+        throw std::runtime_error("Element formatting failed");
+    }
 }
 
 template <typename T>
@@ -125,7 +147,7 @@ size_t getMaxFormatDataWidth(Coords const& shape, T const* data)
 
 template <typename T>
 void buildStringRecursive(std::stringstream& ss, T const* data, Coords const& shape,
-    std::array<int64_t, kMAX_DIMS> const& strides, size_t& offset, size_t dimension, size_t maxWidth,
+    std::array<int64_t, kMAX_DIMS> const& strides, size_t& offset, int32_t dimension, size_t maxWidth,
     std::string const& indent)
 {
     // Apply pytorch-style printing logic, for large tensors, we print the head and tail of the tensor
@@ -144,7 +166,7 @@ void buildStringRecursive(std::stringstream& ss, T const* data, Coords const& sh
         return;
     }
 
-    check::check(dimension < shape.getNumDims() && dimension >= 0, "Dimension shall in range of the shape.");
+    check::check(dimension < shape.getNumDims() && dimension >= 0, "Dimension shall be in range of the shape.");
     ss << "[";
     int64_t dimSize = shape[dimension];
 
@@ -198,7 +220,7 @@ void buildStringRecursive(std::stringstream& ss, T const* data, Coords const& sh
         }
         else
         {
-            for (size_t i = 0; i < dimSize; ++i)
+            for (int32_t i = 0; i < dimSize; ++i)
             {
                 if (i > 0)
                 {
@@ -236,7 +258,7 @@ std::string formatString(Tensor const& tensor)
     }
 
     size_t offset = 0;
-    size_t const startDim{0};
+    int32_t const startDim{0};
     std::string const startIndent{"       "};
     std::stringstream ss;
     ss << "\nTensor(";
@@ -285,6 +307,13 @@ std::string formatString(Tensor const& tensor)
             ss, static_cast<int8_t const*>(dataPtr), shape, strides, offset, startDim, maxWidth, startIndent);
         break;
     }
+    case DataType::kBOOL:
+    {
+        size_t maxWidth = getMaxFormatDataWidth(shape, static_cast<uint8_t const*>(dataPtr));
+        buildStringRecursive(
+            ss, static_cast<uint8_t const*>(dataPtr), shape, strides, offset, startDim, maxWidth, startIndent);
+        break;
+    }
     case DataType::kFP8:
     {
 #if SUPPORTS_FP8
@@ -313,19 +342,39 @@ std::string formatString(Tensor const& tensor)
     return ss.str();
 }
 
-double toKB(size_t bytes)
+double toKB(size_t bytes) noexcept
 {
     return static_cast<double>(bytes) / 1024.0;
 }
 
-double toMB(size_t bytes)
+double toMB(size_t bytes) noexcept
 {
     return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
 
-double toGB(size_t bytes)
+double toGB(size_t bytes) noexcept
 {
     return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+}
+
+int32_t getMaxInt32Value(Tensor const& tensor)
+{
+    check::check(tensor.getDeviceType() == DeviceType::kCPU, "Tensor must be on CPU");
+    check::check(tensor.getDataType() == DataType::kINT32, "Tensor must be INT32 type");
+
+    int64_t const volume = tensor.getShape().volume();
+    if (volume == 0)
+    {
+        return 0;
+    }
+
+    int32_t const* data = tensor.dataPointer<int32_t>();
+    int32_t maxValue = data[0];
+    for (int64_t i = 1; i < volume; ++i)
+    {
+        maxValue = std::max(maxValue, data[i]);
+    }
+    return maxValue;
 }
 
 } // namespace utils

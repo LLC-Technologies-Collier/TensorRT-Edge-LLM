@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -254,12 +254,12 @@ template <int CTA_M, int CTA_N, int CTA_K, int STAGES, bool ldmatrix, int shared
 __device__ __inline__ void share_to_reg_one_stage_B_T2(
     half const* src, half* src_scales, half* dst, half* dst_fp16, int warp_offset_m, int warp_offset_n, int k_0_1)
 {
-    constexpr int kSmemCol = CTA_K + SMEM_PAD_B;
+    [[maybe_unused]] constexpr int kSmemCol = CTA_K + SMEM_PAD_B;
     int r0 = ((threadIdx.x / 8 / 2) * 8 + threadIdx.x % 8);
     int c0 = ((threadIdx.x / 8) % 2) * 8;
     int r = r0 / 4;
     int c = (r0 % 4) * 16 + c0;
-    int c_swizzled = ((c / PACK_SIZE) ^ (r % 2) & 7) * PACK_SIZE;
+    [[maybe_unused]] int c_swizzled = ((c / PACK_SIZE) ^ (r % 2) & 7) * PACK_SIZE;
 
     if constexpr (ldmatrix)
     {
@@ -477,7 +477,7 @@ __global__ void gemm_w4a16_T2(half const* __restrict__ A, half const* __restrict
 }
 
 void gemm_forward_cuda_new(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
-    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
+    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream) noexcept
 {
     // The GEMM kernel will load packed int4 weights as fp16 data tensor.
     half const* kernel = reinterpret_cast<half const*>(weights_device);

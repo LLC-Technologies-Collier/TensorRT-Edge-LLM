@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +34,7 @@ namespace tokenizer
 // Chat template role names
 constexpr char kRoleSystem[] = "system";
 
-Tokenizer::Tokenizer()
+Tokenizer::Tokenizer() noexcept
     : mNumVocab(0)
     , mBosId(-1)
     , mEosId(-1)
@@ -521,7 +521,8 @@ std::vector<Rank> Tokenizer::encode(std::string const& text, bool addBos, bool a
     return output;
 }
 
-bool Tokenizer::partitionSpecialTokens(std::string const& text, std::forward_list<textPartition>& partitions) const
+bool Tokenizer::partitionSpecialTokens(
+    std::string const& text, std::forward_list<textPartition>& partitions) const noexcept
 {
     try
     {
@@ -623,7 +624,7 @@ bool Tokenizer::isInitialized() const noexcept
     return mInitialized && mPreTokenizer && mTokenEncoder;
 }
 
-void Tokenizer::appendBos(std::vector<Rank>& tokens) const noexcept
+void Tokenizer::appendBos(std::vector<Rank>& tokens) const
 {
     if (mBosId != -1)
     {
@@ -635,7 +636,7 @@ void Tokenizer::appendBos(std::vector<Rank>& tokens) const noexcept
     }
 }
 
-void Tokenizer::appendEos(std::vector<Rank>& tokens) const noexcept
+void Tokenizer::appendEos(std::vector<Rank>& tokens) const
 {
     if (mEosId != -1)
     {
@@ -746,9 +747,11 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
     // Extract system prompt from first message or use default
     auto const& leadMessage = request.messages.front();
     std::string systemPrompt{};
+    bool hasExplicitSystemMessage = false;
 
     if (leadMessage.role == kRoleSystem)
     {
+        hasExplicitSystemMessage = true;
         for (auto const& content : leadMessage.contents)
         {
             if (content.type == "text")
@@ -764,11 +767,13 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
     }
     else if (applyChatTemplate && !mChatTemplate.defaultSystemPrompt.empty())
     {
+        hasExplicitSystemMessage = true;
         systemPrompt = mChatTemplate.defaultSystemPrompt;
     }
 
-    // Format system prompt
-    if (!systemPrompt.empty())
+    // Format system prompt (also format when there's an explicit system message with empty content,
+    // since some models like Qwen3-ASR expect the system role block even when empty)
+    if (!systemPrompt.empty() || (hasExplicitSystemMessage && applyChatTemplate))
     {
         if (applyChatTemplate)
         {

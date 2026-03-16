@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -125,6 +125,10 @@ def _generate_llm_export_commands(
 
     if config.reduced_vocab_size:
         llm_cmd.append(f"--reduced_vocab_dir={config.get_reduced_vocab_dir()}")
+
+    # Add TensorRT native operations flag if enabled
+    if config.trt_native_ops:
+        llm_cmd.append("--trt_native_ops")
 
     return [(llm_cmd, 1200)]
 
@@ -335,6 +339,9 @@ def _generate_draft_build_commands(
         f"--maxDraftTreeSize={config.max_draft_tree_size}"
     ])
 
+    if config.debug:
+        draft_cmd.append("--debug")
+
     commands.append((draft_cmd, 1200))
     return commands
 
@@ -363,6 +370,9 @@ def generate_build_commands(
         if config.max_lora_rank > 0:
             cmd.append(f"--maxLoraRank={config.max_lora_rank}")
 
+        if config.debug:
+            cmd.append("--debug")
+
         commands.append((cmd, 1200))
 
     elif config.model_type == ModelType.VLM:
@@ -384,6 +394,9 @@ def generate_build_commands(
         if config.max_lora_rank > 0:
             llm_cmd.append(f"--maxLoraRank={config.max_lora_rank}")
 
+        if config.debug:
+            llm_cmd.append("--debug")
+
         commands.append((llm_cmd, 1200))
 
         # VLM visual build command
@@ -395,6 +408,9 @@ def generate_build_commands(
             f"--maxImageTokens={config.max_image_tokens}",
             f"--maxImageTokensPerImage={config.max_image_tokens_per_image}"
         ])
+
+        if config.debug:
+            visual_cmd.append("--debug")
 
         commands.append((visual_cmd, 1200))
 
@@ -431,6 +447,9 @@ def generate_inference_commands(
     if config.batch_size is not None:
         cmd.append(f"--batchSize={config.batch_size}")
 
+    if config.debug:
+        cmd.append("--debug")
+
     commands.append((cmd, 6000))
     return commands
 
@@ -441,26 +460,32 @@ def generate_benchmark_commands(
     """Generate benchmark commands - returns list of (command, timeout) tuples"""
     commands = []
 
-    if config.model_type == ModelType.LLM:
-        cmd = [executable_files['llm_benchmark']]
-        cmd.extend([
-            f"--engineDir={config.get_llm_engine_dir()}",
-            f"--inputLength={config.max_input_len}",
-            f"--maxLength={config.output_seq_len + config.max_input_len}",
-            "--warmUp=2", "--numRuns=10"
-        ])
+    cmd = [executable_files['llm_inference']]
+    cmd.extend([
+        f"--engineDir={config.get_llm_engine_dir()}",
+        f"--inputFile={config.get_test_case_file()}",
+        f"--outputFile={config.get_output_json_file()}", f"--dumpProfile"
+    ])
 
-    elif config.model_type == ModelType.VLM:
-        cmd = [executable_files['vlm_benchmark']]
-        cmd.extend([
-            f"--engineDir={config.get_llm_engine_dir()}",
-            f"--visualEngineDir={config.get_visual_engine_dir()}",
-            f"--textTokenLength={config.text_token_length}",
-            f"--imageTokenLength={config.image_token_length}",
-            f"--outputLength={config.output_seq_len}",
-            f"--batchSize={config.max_batch_size}", "--warmUp=2",
-            "--numRuns=10"
-        ])
+    # Add EAGLE parameters
+    if config.is_eagle:
+        cmd.append("--eagle")
+        cmd.append(f"--eagleDraftTopK={config.eagle_draft_top_k}")
+        cmd.append(f"--eagleDraftStep={config.eagle_draft_step}")
+        cmd.append(f"--eagleVerifyTreeSize={config.max_verify_tree_size}")
 
-    commands.append((cmd, 1200))
+    if config.model_type == ModelType.VLM:
+        cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")
+
+    # Add batch size override if specified
+    if config.batch_size is not None:
+        cmd.append(f"--batchSize={config.batch_size}")
+
+    # Add warmup if specified
+    cmd.append(f"--warmup={config.warmup or 10}")
+
+    if config.debug:
+        cmd.append("--debug")
+
+    commands.append((cmd, 6000))
     return commands

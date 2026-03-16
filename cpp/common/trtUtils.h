@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,8 +22,8 @@
 #include <NvInfer.h>
 #include <dlfcn.h>
 #include <memory>
+#include <optional>
 #include <stdexcept>
-
 namespace trt_edgellm
 {
 
@@ -53,7 +53,7 @@ struct DlDeleter
  *
  * @return Unique pointer to library handle, or nullptr on failure
  */
-inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void)
+inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void) noexcept
 {
     char const* pluginPath = std::getenv("EDGELLM_PLUGIN_PATH");
 
@@ -73,7 +73,27 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void)
         LOG_ERROR("Cannot open plugin library: %s", dlerror());
         return std::unique_ptr<void, DlDeleter>(nullptr);
     }
+
+    // Sync log level with the plugin (follows the TRT initLibNvInferPlugins pattern).
+    using InitPluginsFn = bool (*)(void*, char const*);
+    auto initPlugins = reinterpret_cast<InitPluginsFn>(dlsym(handle.get(), "initEdgellmPlugins"));
+    if (initPlugins)
+    {
+        initPlugins(static_cast<nvinfer1::ILogger*>(&gLogger), "");
+    }
+
     return handle;
 }
+
+//! Capture a TensorRT CUDA graph from an execution context and stream.
+//! @return Pair of graph and graph exec on success, std::nullopt on failure
+std::optional<std::pair<cudaGraph_t, cudaGraphExec_t>> captureTRTCudaGraph(
+    nvinfer1::IExecutionContext* context, cudaStream_t stream);
+
+//! Convert TensorRT dimensions to a string representation.
+std::string dimsToString(nvinfer1::Dims const& dims) noexcept;
+
+//! Print the engine information for a specific profile index.
+std::string printEngineInfo(nvinfer1::ICudaEngine const* engine, int32_t profileIndex) noexcept;
 
 } // namespace trt_edgellm

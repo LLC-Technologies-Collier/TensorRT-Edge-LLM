@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -113,6 +113,76 @@ inline constexpr char const* kPastKeyValuesTemplate = "past_key_values";
  */
 inline constexpr char const* kPresentKeyValuesTemplate = "present_key_values";
 
+/*!
+ * @brief K cache tensor template for TensorRT native KVCacehUpdate operations - use with layer index formatting
+ *
+ * Template: "k_cache_{layer_idx}"
+ * Shape: [batch_size, num_kv_heads, seq_len, head_dim] (FLOAT16)
+ */
+inline constexpr char const* kKCacheTemplate = "k_cache";
+
+/*!
+ * @brief V cache tensor template for TensorRT native KVCacheUpdate operations - use with layer index formatting
+ *
+ * Template: "v_cache_{layer_idx}"
+ * Shape: [batch_size, num_kv_heads, seq_len, head_dim] (FLOAT16)
+ */
+inline constexpr char const* kVCacheTemplate = "v_cache";
+
+/*!
+ * @brief Present K cache tensor template for TensorRT native KVCacheUpdate operations - use with layer index formatting
+ *
+ * Template: "present_k_cache_{layer_idx}"
+ * Shape: [batch_size, num_kv_heads, seq_len, head_dim] (FLOAT16)
+ */
+inline constexpr char const* kPresentKCacheTemplate = "present_k_cache";
+
+/*!
+ * @brief Present V cache tensor template for TensorRT native KVCacheUpdate operations - use with layer index formatting
+ *
+ * Template: "present_v_cache_{layer_idx}"
+ * Shape: [batch_size, num_kv_heads, seq_len, head_dim] (FLOAT16)
+ */
+inline constexpr char const* kPresentVCacheTemplate = "present_v_cache";
+
+/*! @} */
+
+/*! @name SSM (Mamba) State Bindings
+ * @{
+ */
+
+/*!
+ * @brief Past SSM state tensor template for Mamba layers
+ *
+ * Template: "ssm_state_{mamba_layer_idx}"
+ * Shape: [batch_size, mamba_num_heads, mamba_head_dim, ssm_state_size] (FLOAT16)
+ */
+inline constexpr char const* kSSMStateTemplate = "ssm_state";
+
+/*!
+ * @brief Present SSM state tensor template for Mamba layers
+ *
+ * Template: "present_ssm_state_{mamba_layer_idx}"
+ * Shape: [batch_size, mamba_num_heads, mamba_head_dim, ssm_state_size] (FLOAT16)
+ */
+inline constexpr char const* kPresentSSMStateTemplate = "present_ssm_state";
+
+/*!
+ * @brief Past conv state tensor template for Mamba layers
+ *
+ * Template: "conv_state_{mamba_layer_idx}"
+ * Shape: [batch_size, conv_dim, conv_kernel_size] (FLOAT16)
+ */
+inline constexpr char const* kConvStateTemplate = "conv_state";
+
+/*!
+ * @brief Present conv state tensor template for Mamba layers
+ *
+ * Template: "present_conv_state_{mamba_layer_idx}"
+ * Shape: [batch_size, conv_dim, conv_kernel_size] (FLOAT16)
+ */
+inline constexpr char const* kPresentConvStateTemplate = "present_conv_state";
+
 /*! @} */
 
 /*! @name Eagle Speculative Decoding Bindings
@@ -175,11 +245,25 @@ inline constexpr char const* kVisualOutput = "output";
 inline constexpr char const* kRotaryPosEmb = "rotary_pos_emb";
 
 /*!
- * @brief Window attention mask for Qwen2.5-VL models
+ * @brief Cumulative sequence lengths for ragged ViT attention
  *
- * Shape: [1, sequence_length, sequence_length] (FLOAT16)
+ * Shape: [num_images + 1] (INT32)
  */
-inline constexpr char const* kWindowAttentionMask = "window_attention_mask";
+inline constexpr char const* kCuSeqlens = "cu_seqlens";
+
+/*!
+ * @brief Shape-only input used to convey runtime max sequence-length for FMHA launch
+ *
+ * Shape: [max_seqlen] (INT32)
+ */
+inline constexpr char const* kMaxSeqLenCarrier = "max_seqlen_carrier";
+
+/*!
+ * @brief Cumulative window sequence lengths for Qwen2.5-VL window attention
+ *
+ * Shape: [num_windows + 1] (INT32)
+ */
+inline constexpr char const* kCuWindowSeqlens = "cu_window_seqlens";
 
 /*!
  * @brief Window index for Qwen2.5-VL sliding window attention
@@ -246,6 +330,78 @@ inline constexpr char const* kVocabMapFileName = "vocab_map.safetensors";
 
 /*! @} */
 
+/*! @name Audio Encoder Bindings (Qwen3-Omni)
+ * @{
+ */
+
+/*!
+ * @brief Audio padded features tensor - chunked and padded Mel-spectrogram
+ *
+ * Shape: [num_chunks, mel_bins, max_chunk_len] (FLOAT16)
+ */
+inline constexpr char const* kAudioPaddedFeatures = "padded_feature";
+
+/*!
+ * @brief Audio padded mask indices - nonzero indices from mask
+ *
+ * Shape: [num_valid_elements, 2] (INT64)
+ * Each row is [chunk_idx, position_idx] indicating valid positions after CNN downsampling
+ */
+inline constexpr char const* kAudioPaddedMaskIndices = "padded_mask_after_cnn_indices";
+
+/*!
+ * @brief Audio attention mask - block-diagonal mask for chunk-wise attention
+ *
+ * Shape: [num_attention_elems, num_attention_elems] (FLOAT16)
+ * Block-diagonal matrix where each block corresponds to one audio chunk
+ */
+inline constexpr char const* kAudioAttentionMask = "attention_mask";
+
+/*!
+ * @brief Audio encoder output - audio embeddings
+ *
+ * Shape: [num_audio_tokens, hidden_size] (FLOAT16)
+ */
+inline constexpr char const* kAudioOutput = "last_hidden_state";
+
+/*! @} */
+
+/*! @name CodePredictor Bindings (Qwen3-Omni)
+ * @{
+ */
+
+/*!
+ * @brief LM head weight tensor - dynamically bound weight for CodePredictor
+ *
+ * Shape: [vocab_size, hidden_size] (FLOAT16)
+ * This is used for dynamic lm_head selection in CodePredictor (15 different heads for RVQ layers)
+ */
+inline constexpr char const* kLmHeadWeight = "lm_head_weight";
+
+/*! @} */
+
+/*! @name Code2Wav Vocoder Bindings (Qwen3-Omni)
+ * @{
+ */
+
+/*!
+ * @brief Code2Wav input codes tensor - RVQ codec codes for vocoder
+ *
+ * Shape: [batch_size, num_quantizers, sequence_length] (INT32)
+ * num_quantizers: 15 for Qwen3-Omni
+ */
+inline constexpr char const* kCode2WavCodes = "codes";
+
+/*!
+ * @brief Code2Wav output waveform tensor - generated audio waveform
+ *
+ * Shape: [batch_size, 1, waveform_length] (FLOAT32)
+ * Values in range [-1.0, 1.0]
+ */
+inline constexpr char const* kCode2WavWaveform = "waveform";
+
+/*! @} */
+
 /*! @name LoRA (Low-Rank Adaptation) Bindings
  * @{
  */
@@ -293,12 +449,84 @@ inline std::string formatKVCacheName(int32_t layerIdx, bool isPast = true)
 }
 
 /*!
+ * @brief Format K cache binding name for a specific layer (TensorRT native operations)
+ *
+ * @param layerIdx The decoder layer index
+ * @param isPast Whether this is past (true) or present (false) K cache
+ * @return Formatted binding name like "k_cache_0" or "present_k_cache_0"
+ */
+inline std::string formatKCacheName(int32_t layerIdx, bool isPast = true)
+{
+    return std::string(isPast ? kKCacheTemplate : kPresentKCacheTemplate) + "_" + std::to_string(layerIdx);
+}
+
+/*!
+ * @brief Format V cache binding name for a specific layer (TensorRT native operations)
+ *
+ * @param layerIdx The decoder layer index
+ * @param isPast Whether this is past (true) or present (false) V cache
+ * @return Formatted binding name like "v_cache_0" or "present_v_cache_0"
+ */
+inline std::string formatVCacheName(int32_t layerIdx, bool isPast = true)
+{
+    return std::string(isPast ? kVCacheTemplate : kPresentVCacheTemplate) + "_" + std::to_string(layerIdx);
+}
+
+/*!
+ * @brief Format SSM state binding name for a specific Mamba layer
+ *
+ * @param mambaLayerIdx The Mamba layer index (0-based, only counting Mamba layers)
+ * @param isPast Whether this is past (true) or present (false) SSM state
+ * @return Formatted binding name like "ssm_state_0" or "present_ssm_state_0"
+ */
+inline std::string formatSSMStateName(int32_t mambaLayerIdx, bool isPast = true)
+{
+    return std::string(isPast ? kSSMStateTemplate : kPresentSSMStateTemplate) + "_" + std::to_string(mambaLayerIdx);
+}
+
+/*!
+ * @brief Check if a binding name is an SSM state tensor
+ *
+ * @param bindingName The tensor binding name to check
+ * @return True if the binding is an SSM state tensor
+ */
+inline bool isSSMStateBinding(std::string const& bindingName)
+{
+    return bindingName.find(kSSMStateTemplate) != std::string::npos
+        || bindingName.find(kPresentSSMStateTemplate) != std::string::npos;
+}
+
+/*!
+ * @brief Format conv state binding name for a specific Mamba layer
+ *
+ * @param mambaLayerIdx The Mamba layer index (0-based, only counting Mamba layers)
+ * @param isPast Whether this is past (true) or present (false) conv state
+ * @return Formatted binding name like "conv_state_0" or "present_conv_state_0"
+ */
+inline std::string formatConvStateName(int32_t mambaLayerIdx, bool isPast = true)
+{
+    return std::string(isPast ? kConvStateTemplate : kPresentConvStateTemplate) + "_" + std::to_string(mambaLayerIdx);
+}
+
+/*!
+ * @brief Check if a binding name is a conv state tensor
+ *
+ * @param bindingName The tensor binding name to check
+ * @return True if the binding is a conv state tensor
+ */
+inline bool isConvStateBinding(std::string const& bindingName)
+{
+    return bindingName.find(kConvStateTemplate) != std::string::npos
+        || bindingName.find(kPresentConvStateTemplate) != std::string::npos;
+}
+
+/*!
  * @brief Check if a binding name is a LoRA weight tensor
  *
  * @param bindingName The tensor binding name to check
  * @return True if the binding is a LoRA weight tensor
  */
-inline bool isLoraBinding(std::string const& bindingName)
+inline bool isLoraBinding(std::string const& bindingName) noexcept
 {
     return bindingName.find(kLoraAPrefix) != std::string::npos || bindingName.find(kLoraBPrefix) != std::string::npos;
 }
@@ -309,10 +537,14 @@ inline bool isLoraBinding(std::string const& bindingName)
  * @param bindingName The tensor binding name to check
  * @return True if the binding is a KV cache tensor
  */
-inline bool isKVCacheBinding(std::string const& bindingName)
+inline bool isKVCacheBinding(std::string const& bindingName) noexcept
 {
     return bindingName.find(kPastKeyValuesTemplate) != std::string::npos
-        || bindingName.find(kPresentKeyValuesTemplate) != std::string::npos;
+        || bindingName.find(kPresentKeyValuesTemplate) != std::string::npos
+        || bindingName.find(kKCacheTemplate) != std::string::npos
+        || bindingName.find(kVCacheTemplate) != std::string::npos
+        || bindingName.find(kPresentKCacheTemplate) != std::string::npos
+        || bindingName.find(kPresentVCacheTemplate) != std::string::npos;
 }
 
 /*!

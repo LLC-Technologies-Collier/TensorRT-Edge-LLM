@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -409,68 +409,6 @@ void phi4mmPostprocessVisionTokens(rt::Tensor const& srcEmbedding, rt::Tensor& d
         srcEmbedding.dataPointer<half>(), dstEmbedding.dataPointer<half>(), indices, gn);
 }
 
-__global__ void initMaskToMinKernel(half* attentionMask, int32_t const totalElements)
-{
-    auto const tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= totalElements)
-    {
-        return;
-    }
-
-    // Mask used to disable attention between "patches". Use -20000.0F to avoid data overflow in
-    // TensorRT which could produce NaN output if we supply -MAX_FLOAT_FP16 mask values.
-    half const disabledMaskValue{-20000.0F};
-    attentionMask[tid] = disabledMaskValue;
-}
-
-__global__ void initAttentionMaskKernel(
-    int64_t const* cuSeqlens, half* attentionMask, int64_t const cuSeqlensSize, int64_t const curHW)
-{
-    // Each CTA process one cuSeqlen and set zero to attentionMask[start:end, start:end]
-    // Each CTA get assigned (16, 16) threads.
-    auto const bIdx = blockIdx.x;
-    auto const start = cuSeqlens[bIdx];
-    auto const end = cuSeqlens[bIdx + 1];
-    auto const tIdx = threadIdx.x;
-    auto const tidy = threadIdx.y;
-
-    for (auto i = start + tIdx; i < end; i += 16)
-    {
-        for (auto j = start + tidy; j < end; j += 16)
-        {
-            auto const posIdx = i * curHW + j;
-            attentionMask[posIdx] = __float2half(0.0f);
-        }
-    }
-}
-
-void initAttentionMaskQwenViT(rt::Tensor const& cuSeqlens, rt::Tensor& attentionMask, cudaStream_t stream)
-{
-    check::check(
-        cuSeqlens.getDeviceType() == rt::DeviceType::kGPU && attentionMask.getDeviceType() == rt::DeviceType::kGPU,
-        "Device type shall all be GPU for these tensors.");
-    check::check(cuSeqlens.getDataType() == DataType::kINT64 && attentionMask.getDataType() == DataType::kHALF,
-        "Data type check failed for the input tensors.");
-    check::check(cuSeqlens.getShape().getNumDims() == 1, "Cu seqlens shape shall be [num].");
-    check::check(attentionMask.getShape().getNumDims() == 3 && attentionMask.getShape()[0] == 1,
-        "Attention mask shape shall be [1, curHW, curHW].");
-
-    int64_t const cuSeqlensSize = cuSeqlens.getShape()[0];
-    int64_t const curHW = attentionMask.getShape()[1];
-    int64_t const totalElements = curHW * curHW;
-
-    // Initialize attention mask to small value to indicate "disabled" attention.
-    uint32_t const initBlockSize = 256;
-    uint32_t const initGridSize = (totalElements + initBlockSize - 1) / initBlockSize;
-    initMaskToMinKernel<<<initGridSize, initBlockSize, 0, stream>>>(attentionMask.dataPointer<half>(), totalElements);
-
-    // Set zero to target positions
-    dim3 blockSize{16, 16};
-    uint32_t const gridSize = cuSeqlensSize - 1;
-    initAttentionMaskKernel<<<gridSize, blockSize, 0, stream>>>(
-        cuSeqlens.dataPointer<int64_t>(), attentionMask.dataPointer<half>(), cuSeqlensSize, curHW);
-}
-
 __global__ void initRotaryPosEmbQwenKernel(float* rotaryPosEmb, int64_t const T, int64_t const H, int64_t const W,
     int64_t const mergeSize, int64_t const startIdx, int64_t const vitPosEmbDim, float const rotaryBaseFrequency,
     float const scale)
@@ -488,7 +426,6 @@ __global__ void initRotaryPosEmbQwenKernel(float* rotaryPosEmb, int64_t const T,
     auto const hOrWPos = (tid % (vitPosEmbDim)) / (vitPosEmbDim / 2);
     auto const dimIdx = tid % (vitPosEmbDim / 2);
 
-    int64_t const llmGridH = H / mergeSize;
     int64_t const llmGridW = W / mergeSize;
     auto const llmGridHIdx = hwIdx / (llmGridW * mergeSize * mergeSize);
     auto const llmGridWIdx = (hwIdx % (llmGridW * mergeSize * mergeSize)) / (mergeSize * mergeSize);

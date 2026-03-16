@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -331,6 +331,16 @@ void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float 
         static_cast<void*>(&rotaryBaseFrequency), static_cast<void*>(&rotaryEmbeddingMaxPositions),
         static_cast<void*>(&interleaved)};
     CUDA_CHECK(cudaLaunchKernel(kernelPtr, grid, block, kernelArgs, 0, stream));
+}
+
+void initializeTextOnlyMRopeCosSin(
+    float* cosSinCache, float rotaryBaseFrequency, int64_t rotaryDim, int64_t maxPositions, cudaStream_t stream)
+{
+    // When all 3 MRoPE sections (T, H, W) use sequential positions pos[i] = i, the MRoPE
+    // formula reduces to standard RoPE with rotaryScale=1. Reuse initializeNormalRopeCosSin
+    // to avoid constructing temporary position ID buffers.
+    initializeNormalRopeCosSin(cosSinCache, rotaryBaseFrequency, 1.0f, static_cast<int32_t>(rotaryDim),
+        static_cast<int32_t>(maxPositions), stream);
 }
 
 } // namespace kernel

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "common/hashUtils.h"
 #include "common/tensor.h"
 #include "multimodal/multimodalRunner.h"
 #include "profiling/metrics.h"
@@ -23,12 +24,11 @@
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
 namespace trt_edgellm
-{
-namespace
 {
 /*! \brief Structure to hold cached system prompt and its KV cache
  */
@@ -38,7 +38,6 @@ struct SystemPromptKVCache
     std::vector<tokenizer::Rank> tokenizedPrompt; //!< Tokenized version of the system prompt
     rt::Tensor kvCacheContent;                    //!< Cached KV cache content for the system prompt
 };
-} // namespace
 
 namespace rt
 {
@@ -84,6 +83,7 @@ struct SpecDecodeInferenceContext
     int32_t generationRound;                    //!< Current generation round (shared across all batches)
     int32_t maxGenerateLength;                  //!< Maximum generation length
     int32_t activeBatchSize;                    //!< Current active batch size
+    std::string loraWeightsName{""};            //!< LoRA adapter name used by this request
     cudaStream_t stream;                        //!< CUDA stream
 
     /*!
@@ -92,10 +92,11 @@ struct SpecDecodeInferenceContext
      * @param maxGenLength Maximum generation length
      * @param multimodal Optional multimodal embeddings
      * @param deepstackFeatures Deepstack features for Qwen3-VL (raw features before embedding)
+     * @param loraName LoRA weights name used by this request
      * @param cudaStream CUDA stream for operations
      */
     void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& multimodal,
-        rt::OptionalInputTensors const& deepstackFeatures, cudaStream_t cudaStream);
+        rt::OptionalInputTensors const& deepstackFeatures, std::string const& loraName, cudaStream_t cudaStream);
 };
 
 /*!
@@ -123,14 +124,17 @@ public:
      * @brief Construct speculative decode runtime
      * @param engineDir Directory containing engine files
      * @param multimodalEngineDir Directory containing multimodal engine files
+     * @param loraWeightsMap Map of LoRA weight names to file paths
      * @param draftingConfig Eagle drafting configuration
      * @param stream CUDA stream for operations
+     * @throws std::runtime_error if directories do not contain expected data, or runner initialization fails
      */
     LLMInferenceSpecDecodeRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
-        EagleDraftingConfig const& draftingConfig, cudaStream_t stream);
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, EagleDraftingConfig const& draftingConfig,
+        cudaStream_t stream);
 
     //! @brief Destructor
-    ~LLMInferenceSpecDecodeRuntime() = default;
+    ~LLMInferenceSpecDecodeRuntime() noexcept = default;
 
     //! @brief Capture CUDA graphs for Eagle decoding stages to optimize performance.
     //!
@@ -139,6 +143,7 @@ public:
     //!
     //! @param stream CUDA stream
     //! @return True if all stage captures succeed, false otherwise
+    //! @throws std::runtime_error if a tensor reshape operation fails
     //! @note If capture fails for any stage, the inference can proceed without CUDA graph capture,
     //! but at cost of performance degradation.
     bool captureDecodingCudaGraph(cudaStream_t stream);
@@ -149,23 +154,24 @@ public:
      * @param response Output response with generated tokens and text
      * @param stream CUDA stream
      * @return True on success, false on failure
+     * @throws std::runtime_error if an LLM or CUDA operation fails
      */
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream);
 
     //! Get LLM prefill stage metrics
-    metrics::LLMPrefillMetrics const& getPrefillMetrics() const
+    metrics::LLMPrefillMetrics const& getPrefillMetrics() const noexcept
     {
         return mPrefillMetrics;
     }
 
     //! Get Eagle generation stage metrics
-    metrics::EagleGenerationMetrics const& getEagleGenerationMetrics() const
+    metrics::EagleGenerationMetrics const& getEagleGenerationMetrics() const noexcept
     {
         return mEagleGenerationMetrics;
     }
 
     //! Get multimodal metrics (returns empty metrics if no multimodal runner)
-    metrics::MultimodalMetrics getMultimodalMetrics() const
+    metrics::MultimodalMetrics getMultimodalMetrics() const noexcept
     {
         return mMultimodalRunner ? mMultimodalRunner->getMultimodalMetrics() : metrics::MultimodalMetrics{};
     }
@@ -180,10 +186,11 @@ private:
     std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;   //!< Draft model engine runner
     std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr}; //!< Multimodal runner (optional)
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;             //!< Tokenizer
-    std::unordered_map<std::string, SystemPromptKVCache>
+    hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
         mSystemPromptKVCacheBase; //!< System prompt KVCache for base model
-    std::unordered_map<std::string, SystemPromptKVCache>
-        mSystemPromptKVCacheDraft; //!< System prompt KVCache for draft model
+    hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
+        mSystemPromptKVCacheDraft;         //!< System prompt KVCache for draft model
+    std::string mEmptyLoraWeightsName{""}; //!< Empty LoRA weights name for default case
 
     // Pre-define key runtime GPU tensors and initialize them during construction.
     // [1] I/O Tensors to work with base and eagle draft engine.
@@ -239,37 +246,45 @@ private:
 
     // Key functions to drive the spec-decode runtime, defined in a consumer-producer pattern.
     // Consume tokenized IDS as input and produce hidden states for the whole sequence and first generated token.
+    //! @throws std::runtime_error if a CUDA error occurs
     bool runBaseModelPrefill(SpecDecodeInferenceContext& context);
 
     // Consume the base model hidden states and input token of the sequence. Produce the draft hidden states and logits
     // for the last token of the sequence.
+    //! @throws std::runtime_error if tensor shapes do not match, or a CUDA error occurs
     bool runDraftModelPrefill(SpecDecodeInferenceContext& context);
 
     // Consume the draft hidden states and logits for the last token of the sequence. Produce a speculative draft tree
     // that described by a sequence of draft tokens and tree mask that describe the tree structure.
+    //! @throws std::runtime_error if tensor shapes are invalid, or a CUDA operation fails
     bool constructDraftTree(SpecDecodeInferenceContext& context);
 
-    // Consume the speulative draft tree, produce selected tokens and corresponding hidden states.
+    // Consume the speculative draft tree, produce selected tokens and corresponding hidden states.
+    //! @throws std::runtime_error if tensor shapes are invalid, or a CUDA operation fails
     bool runBaseModelVerification(SpecDecodeInferenceContext& context);
 
     // Consume the selected tokens and base model hidden state, produce the draft hidden states and logits for the last
     // token of the accepted sequence.
+    //! @throws std::runtime_error if a CUDA operation fails
     bool runDraftModelAcceptToken(SpecDecodeInferenceContext& context);
 
     // Consume the token sequence & KVCache to produce the next token directly.
     bool runVanillaDecoding(SpecDecodeInferenceContext& context);
 
     // Consume system prompt, produce the hash table of system prompt KVCache if kv cache reuse is enabled.
+    //! @throws std::runtime_error if a CUDA operation fails
     bool genAndSaveSystemPromptKVCache(SpecDecodeInferenceContext& context, int32_t genAndSaveBatchIdx);
 
     // Consume batched input ids and the hash table of system prompt KVCache, produce the padded input ids and input
     // lengths. Instantiate the KVCache from the hash table if the system prompt has been cached.
+    //! @throws std::runtime_error if system prompt is malformed
     bool setUpForPrefillExecution(SpecDecodeInferenceContext& context);
 
     // Batch eviction support
     //! @brief Perform batch eviction
     //! @param context Inference context
     //! @return True on success, false on failure
+    //! @throws std::runtime_error if a CUDA error occurs
     bool performBatchEvict(SpecDecodeInferenceContext& context);
 
     // Stage-specific metrics

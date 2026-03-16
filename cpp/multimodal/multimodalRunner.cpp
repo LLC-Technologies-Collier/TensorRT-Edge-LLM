@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 
 #include "multimodalRunner.h"
 #include "common/mmapReader.h"
+#include "multimodal/audioRunner.h"
 #include "multimodal/internViTRunner.h"
 #include "multimodal/phi4mmViTRunner.h"
 #include "multimodal/qwenViTRunner.h"
@@ -24,6 +25,7 @@
 #include "profiling/timer.h"
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -37,7 +39,7 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
 {
     mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
 
-    // Construct engine path from directory
+    // Construct engine path from directory (engineDir already points to visual/ subdirectory)
     std::string enginePath = engineDir + "/visual.engine";
 
     // Load engine
@@ -87,6 +89,16 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
         multimodalRunner
             = std::make_unique<QwenViTRunner>(multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
     }
+    else if (modelType == multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER)
+    {
+        multimodalRunner = std::make_unique<Qwen3OmniAudioRunner>(multimodalEngineDir, stream);
+    }
+    else if (modelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
+    {
+        // Qwen3-Omni Vision Encoder: Visual engine should exist
+        multimodalRunner
+            = std::make_unique<QwenViTRunner>(multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+    }
     else if (modelType == multimodal::ModelType::INTERNVL)
     {
         multimodalRunner = std::make_unique<InternViTRunner>(multimodalEngineDir, stream);
@@ -113,8 +125,9 @@ rt::OptionalInputTensors MultimodalRunner::getDeepstackFeatures()
     return {};
 }
 
-bool MultimodalRunner::preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
-    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+bool MultimodalRunner::preprocessSystemPrompt([[maybe_unused]] std::string const& systemPrompt,
+    [[maybe_unused]] tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice,
+    [[maybe_unused]] cudaStream_t stream)
 {
     // Default implementation is to do nothing for system prompt preprocessing and ND-RoPE parameter generation.
     return true;

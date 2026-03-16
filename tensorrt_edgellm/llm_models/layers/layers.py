@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,8 +22,13 @@ from transformers.models.llama.modeling_llama import (LlamaAttention, LlamaMLP,
                                                       apply_rotary_pos_emb,
                                                       repeat_kv)
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2MLP
+from transformers.models.qwen3_moe.modeling_qwen3_moe import \
+    Qwen3MoeSparseMoeBlock
 
 from .attention_plugin import attention_plugin
+from .attention_trt import EdgeLLMAttentionTRTNative
+from .layer_utils import EdgeLLMQKNorm, EdgeLLMQKVProj
+from .mamba_plugin import causal_conv1d_plugin, update_ssm_state_plugin
 
 # FP8 (E4M3) quantization constants
 # Max finite value representable by NVIDIA FP8 E4M3 format; used to derive per-tensor KV cache scale.
@@ -141,29 +146,14 @@ class EdgeLLMAttention(nn.Module):
         else:
             self.head_dim: int = attention_module.config.hidden_size // self.num_attention_heads
 
-        # Copy projection layers from original attention module
-        # Phi4MM uses a fused qkv_proj; we support both split and fused Q/K/V paths for compatibility.
-        if hasattr(attention_module, 'q_proj'):
-            assert hasattr(attention_module, 'k_proj') and hasattr(attention_module, 'v_proj'), \
-                "q_proj, k_proj, and v_proj must be present"
-            self.fused_qkv_proj = False
-            self.q_proj = attention_module.q_proj
-            self.k_proj = attention_module.k_proj
-            self.v_proj = attention_module.v_proj
-        elif hasattr(attention_module, 'qkv_proj'):
-            self.fused_qkv_proj = True
-            self.q_dim = self.num_attention_heads * self.head_dim
-            self.kv_dim = self.num_key_value_heads * self.head_dim
-            self.qkv_proj = attention_module.qkv_proj
+        # Sliding window size (from model config, None = no sliding window)
+        self.sliding_window_size: Optional[int] = getattr(
+            attention_module.config, 'sliding_window', None) or None
 
+        self.qkv_proj = EdgeLLMQKVProj(attention_module, eagle3_draft)
         self.o_proj = attention_module.o_proj
 
-        # Qwen3 models have QK normalization layers
-        self.q_norm = getattr(attention_module, 'q_norm', None)
-        self.k_norm = getattr(attention_module, 'k_norm', None)
-
-        # Llama4 models have QK normalization layers
-        self.qk_norm = getattr(attention_module, 'qk_norm', None)
+        self.qk_norm = EdgeLLMQKNorm(attention_module)
 
         # Maximum sequence length for positional embeddings
         self.max_position_embeddings: int = attention_module.config.max_position_embeddings
@@ -223,48 +213,20 @@ class EdgeLLMAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Apply Q, K, V projections
-        if self.fused_qkv_proj:
-            # Fused qkv_proj path (for Phi4MM)
-            qkv_out = self.qkv_proj(hidden_states)
-            query_states = qkv_out[..., :self.q_dim]
-            key_states = qkv_out[..., self.q_dim:self.q_dim + self.kv_dim]
-            value_states = qkv_out[..., self.q_dim + self.kv_dim:]
-        else:
-            # Separate q/k/v projections path
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+        query_states, key_states, value_states = self.qkv_proj(hidden_states)
 
-        # Calculate shared shapes for normalization
-        if self.q_norm is not None or self.k_norm is not None or self.qk_norm is not None:
-            input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, self.head_dim)
+        norm_shape = [bsz, q_len, -1, self.head_dim]
+        query_states, key_states = self.qk_norm(query_states, key_states,
+                                                norm_shape)
 
-        if self.q_norm is not None:
-            query_states = self.q_norm(
-                query_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-        if self.k_norm is not None:
-            key_states = self.k_norm(
-                key_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-
-        if self.qk_norm is not None:
-            query_states = self.qk_norm(
-                query_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-            key_states = self.qk_norm(
-                key_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-
-        # Concatenate QKV for the plugin
-        qkv = torch.concat([query_states, key_states, value_states], dim=-1)
-
-        dtype = qkv.dtype
+        dtype = query_states.dtype
 
         # Convert to FP16 for plugin compatibility
         # For int8 quantization, we always need to explicitly convert to FP16
-        qkv = qkv.to(torch.float16)
+        query_states = query_states.to(torch.float16)
+        key_states = key_states.to(torch.float16)
+        value_states = value_states.to(torch.float16)
+
         fp8_kv_cache = past_key_value.dtype == torch.float8_e4m3fn
         if fp8_kv_cache:
             assert self.k_v_scale_quant_orig is not None, \
@@ -279,7 +241,9 @@ class EdgeLLMAttention(nn.Module):
 
         # Call fused attention plugin
         attn_output, present_key_value = attention_plugin(
-            qkv,
+            query_states,
+            key_states,
+            value_states,
             past_key_value,
             context_lengths,
             rope_rotary_cos_sin,
@@ -289,6 +253,8 @@ class EdgeLLMAttention(nn.Module):
             enable_tree_attention,
             self.head_dim,
             fp8_kv_cache,
+            self.sliding_window_size
+            if self.sliding_window_size is not None else -1,
             attention_mask,
             position_ids,
             k_v_scale_quant_orig=self.k_v_scale_quant_orig,
@@ -318,39 +284,11 @@ class EdgeLLMAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Apply Q, K, V projections
-        if self.fused_qkv_proj:
-            # Fused qkv_proj path (for Phi4MM)
-            qkv_out = self.qkv_proj(hidden_states)
-            query_states = qkv_out[..., :self.q_dim]
-            key_states = qkv_out[..., self.q_dim:self.q_dim + self.kv_dim]
-            value_states = qkv_out[..., self.q_dim + self.kv_dim:]
-        else:
-            # Separate q/k/v projections path
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+        query_states, key_states, value_states = self.qkv_proj(hidden_states)
 
-        # Calculate shared shapes for normalization
-        if self.q_norm is not None or self.k_norm is not None or self.qk_norm is not None:
-            input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, self.head_dim)
-
-        if self.q_norm is not None:
-            query_states = self.q_norm(
-                query_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-        if self.k_norm is not None:
-            key_states = self.k_norm(
-                key_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-
-        if self.qk_norm is not None:
-            query_states = self.qk_norm(
-                query_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-            key_states = self.qk_norm(
-                key_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
+        norm_shape = [bsz, q_len, -1, self.head_dim]
+        query_states, key_states = self.qk_norm(query_states, key_states,
+                                                norm_shape)
 
         query_states = query_states.view(bsz, q_len, self.num_attention_heads,
                                          self.head_dim).transpose(1, 2)
@@ -435,6 +373,9 @@ class EdgeLLMDecoderLayer(nn.Module):
 
         self.eagle3_draft = eagle3_draft
         self.torch_dtype = torch_dtype
+        self.laurel = None
+        self.pre_feedforward_layernorm = None
+        self.post_feedforward_layernorm = None
 
         # Handle both config and module inputs
         if isinstance(config_or_module, nn.Module):
@@ -449,6 +390,36 @@ class EdgeLLMDecoderLayer(nn.Module):
                 torch_dtype)
             self.post_attention_layernorm = decoder_layer.post_attention_layernorm.to(
                 torch_dtype)
+
+            laurel_module = getattr(decoder_layer, 'laurel', None)
+            if laurel_module is not None:
+                if self.eagle3_draft:
+                    raise ValueError(
+                        "LAuReL is not supported for EAGLE3 draft models. "
+                        "EAGLE3 concatenates inputs to 2x hidden size before attention, "
+                        "which is incompatible with Gemma3n LAuReL modules.")
+
+                self.pre_feedforward_layernorm = getattr(
+                    decoder_layer, 'pre_feedforward_layernorm', None)
+                self.post_feedforward_layernorm = getattr(
+                    decoder_layer, 'post_feedforward_layernorm', None)
+
+                missing = []
+                if self.pre_feedforward_layernorm is None:
+                    missing.append("pre_feedforward_layernorm")
+                if self.post_feedforward_layernorm is None:
+                    missing.append("post_feedforward_layernorm")
+                if missing:
+                    missing_str = ", ".join(missing)
+                    raise ValueError(
+                        "LAuReL requires pre/post feedforward layernorms. "
+                        f"Missing: {missing_str}.")
+
+                self.laurel = laurel_module.to(torch_dtype)
+                self.pre_feedforward_layernorm = self.pre_feedforward_layernorm.to(
+                    torch_dtype)
+                self.post_feedforward_layernorm = self.post_feedforward_layernorm.to(
+                    torch_dtype)
 
             # Replace attention with custom implementation
             self.self_attn = EdgeLLMAttention(decoder_layer.self_attn,
@@ -480,20 +451,6 @@ class EdgeLLMDecoderLayer(nn.Module):
 
             self.self_attn = EdgeLLMAttention(attention_module,
                                               eagle3_draft=eagle3_draft)
-            if eagle3_draft:
-                # Double the input dimension for the attention module
-                self.self_attn.q_proj = nn.Linear(
-                    attention_module.q_proj.in_features * 2,
-                    attention_module.q_proj.out_features,
-                    bias=attention_module.q_proj.bias is not None)
-                self.self_attn.k_proj = nn.Linear(
-                    attention_module.k_proj.in_features * 2,
-                    attention_module.k_proj.out_features,
-                    bias=attention_module.k_proj.bias is not None)
-                self.self_attn.v_proj = nn.Linear(
-                    attention_module.v_proj.in_features * 2,
-                    attention_module.v_proj.out_features,
-                    bias=attention_module.v_proj.bias is not None)
 
     def forward(
         self,
@@ -536,6 +493,10 @@ class EdgeLLMDecoderLayer(nn.Module):
             if self.input_layernorm is not None:
                 hidden_states = self.input_layernorm(hidden_states)
 
+        laurel_output: Optional[torch.Tensor] = None
+        if self.laurel is not None:
+            laurel_output = self.laurel(hidden_states)
+
         # Self attention with residual connection
         hidden_states, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -546,13 +507,26 @@ class EdgeLLMDecoderLayer(nn.Module):
             rope_rotary_cos_sin=rope_rotary_cos_sin,
             context_lengths=context_lengths,
         )
-        hidden_states = residual + hidden_states
+        if self.laurel is not None:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+            hidden_states = (hidden_states + laurel_output) * (2.0**-0.5)
 
-        # MLP with residual connection
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+        else:
+            hidden_states = residual + hidden_states
+
+            # MLP with residual connection
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            if isinstance(self.mlp, Qwen3MoeSparseMoeBlock):
+                hidden_states = hidden_states[0]
+            hidden_states = residual + hidden_states
 
         return hidden_states, present_key_value
 
@@ -585,16 +559,453 @@ class EdgeLLMDecoderLayer(nn.Module):
             if self.input_layernorm is not None:
                 hidden_states = self.input_layernorm(hidden_states)
 
+        laurel_output: Optional[torch.Tensor] = None
+        if self.laurel is not None:
+            laurel_output = self.laurel(hidden_states)
+
         # Self Attention
         hidden_states = self.self_attn.quant_forward(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings)
-        hidden_states = residual + hidden_states
+        if self.laurel is not None:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+            hidden_states = (hidden_states + laurel_output) * (2.0**-0.5)
 
-        # Fully Connected
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+        else:
+            hidden_states = residual + hidden_states
+
+            # Fully Connected
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            if isinstance(self.mlp, Qwen3MoeSparseMoeBlock):
+                hidden_states = hidden_states[0]
+            hidden_states = residual + hidden_states
+
+        return hidden_states
+
+
+class EdgeLLMDecoderLayerTRTNative(nn.Module):
+    """
+    Decoder layer with TensorRT native attention operations.
+    
+    This module implements a transformer decoder layer with TensorRT native attention operation.
+    Attributes:
+        hidden_size: Hidden dimension size
+        mlp: Multi-layer perceptron component
+        post_attention_layernorm: Post-attention layer normalization
+        self_attn: TensorRT native attention module with fused operations
+    """
+
+    def __init__(self,
+                 config_or_module: Union[nn.Module, Any],
+                 torch_dtype: torch.dtype = torch.float16,
+                 layer_index: int = 0,
+                 eagle3_draft: bool = False) -> None:
+        """
+        Initialize the EdgeLLMDecoderLayerTRTNative module.
+        
+        Args:
+            config_or_module: Decoder layer module
+            torch_dtype: Data type of the module
+        """
+        super().__init__()
+
+        self.torch_dtype = torch_dtype
+        self.eagle3_draft = eagle3_draft
+        self.layer_index = layer_index
+        if hasattr(config_or_module, 'hidden_size'):
+            self.hidden_size: int = config_or_module.hidden_size
+        else:
+            self.hidden_size: int = config_or_module.self_attn.hidden_size
+        self.self_attn = None
+        self.mlp = None
+        self.input_layernorm = None
+        self.post_attention_layernorm = None
+        self.hidden_norm = None
+        self.laurel = None
+        self.pre_feedforward_layernorm = None
+        self.post_feedforward_layernorm = None
+
+        if isinstance(config_or_module, nn.Module):
+            self._init_with_module(config_or_module)
+        else:
+            self._init_with_config(config_or_module)
+
+        assert self.self_attn is not None
+        assert self.mlp is not None
+
+    def _init_with_module(self, decoder_layer: nn.Module):
+
+        self.mlp = decoder_layer.mlp
+        self.input_layernorm = decoder_layer.input_layernorm.to(
+            self.torch_dtype)
+        self.post_attention_layernorm = decoder_layer.post_attention_layernorm.to(
+            self.torch_dtype)
+
+        laurel_module = getattr(decoder_layer, 'laurel', None)
+        if laurel_module is not None:
+            if self.eagle3_draft:
+                raise ValueError(
+                    "LAuReL is not supported for EAGLE3 draft models. "
+                    "EAGLE3 concatenates inputs to 2x hidden size before attention, "
+                    "which is incompatible with Gemma3n LAuReL modules.")
+
+            self.pre_feedforward_layernorm = getattr(
+                decoder_layer, 'pre_feedforward_layernorm', None)
+            self.post_feedforward_layernorm = getattr(
+                decoder_layer, 'post_feedforward_layernorm', None)
+
+            missing = []
+            if self.pre_feedforward_layernorm is None:
+                missing.append("pre_feedforward_layernorm")
+            if self.post_feedforward_layernorm is None:
+                missing.append("post_feedforward_layernorm")
+            if missing:
+                missing_str = ", ".join(missing)
+                raise ValueError(
+                    "LAuReL requires pre/post feedforward layernorms. "
+                    f"Missing: {missing_str}.")
+
+            self.laurel = laurel_module.to(self.torch_dtype)
+            self.pre_feedforward_layernorm = self.pre_feedforward_layernorm.to(
+                self.torch_dtype)
+            self.post_feedforward_layernorm = self.post_feedforward_layernorm.to(
+                self.torch_dtype)
+        self.self_attn = EdgeLLMAttentionTRTNative(
+            decoder_layer.self_attn, eagle3_draft=self.eagle3_draft)
+
+    def _init_with_config(self, config: Any):
+        # Construct new components from config (for draft models)
+        self.post_attention_layernorm = LlamaRMSNorm(
+            self.hidden_size, eps=config.rms_norm_eps).to(self.torch_dtype)
+
+        # Handle input layernorm based on model type and layer index
+        if self.eagle3_draft:
+            # EAGLE3 draft: all layers have input_layernorm and hidden_norm
+            self.hidden_norm = LlamaRMSNorm(self.hidden_size,
+                                            eps=config.rms_norm_eps).to(
+                                                self.torch_dtype)
+            self.input_layernorm = LlamaRMSNorm(self.hidden_size,
+                                                eps=config.rms_norm_eps).to(
+                                                    self.torch_dtype)
+
+        # Create attention module from config based on model type
+        if "qwen" in config.model_type:
+            attention_module = Qwen2Attention(config, self.layer_index)
+            self.mlp = Qwen2MLP(config)
+        else:
+            attention_module = LlamaAttention(config, self.layer_index)
+            self.mlp = LlamaMLP(config)
+
+        self.self_attn = EdgeLLMAttentionTRTNative(
+            attention_module, eagle3_draft=self.eagle3_draft)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        k_cache: Optional[torch.Tensor] = None,
+        v_cache: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Forward pass through the decoder layer for ONNX export.
+        
+        Args:
+            hidden_states: Input hidden states of shape (batch, seq_len, embed_dim)
+            rope_rotary_cos_sin: RoPE rotary embeddings of shape (batch, seq_len, head_dim)
+            context_lengths: Context length tensor of shape (batch,)
+            kvcache_start_index: Start index of KV cache of shape (kv_cache_start_batch_size,), required
+            k_cache: Key cache (batch, num_heads, capacity, head_dim)
+            v_cache: Value cache (batch, num_heads, capacity, head_dim)
+            attention_mask: Attention mask of shape (batch, seq_len, seq_len + past_len), optional
+            position_ids: Position IDs of shape (batch, seq_len), optional
+            inputs_embeds: Input embeddings for EAGLE3 draft (batch, seq_len, hidden_size), optional
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (hidden_states, present_k_cache, present_v_cache)
+        """
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
 
+        if self.eagle3_draft:
+            if inputs_embeds is None:
+                raise ValueError("inputs_embeds is required for EAGLE3 draft")
+            # EAGLE3 draft: apply layernorm to both inputs and concatenate
+            hidden_states = self.hidden_norm(hidden_states)
+            inputs_embeds = self.input_layernorm(inputs_embeds)
+            hidden_states = torch.cat((inputs_embeds, hidden_states), dim=-1)
+        else:
+            # Standard processing: apply input layernorm if available
+            if self.input_layernorm is not None:
+                hidden_states = self.input_layernorm(hidden_states)
+
+        laurel_output: Optional[torch.Tensor] = None
+        if self.laurel is not None:
+            laurel_output = self.laurel(hidden_states)
+
+        hidden_states, present_k_cache, present_v_cache = self.self_attn(
+            hidden_states=hidden_states,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            rope_rotary_cos_sin=rope_rotary_cos_sin,
+            context_lengths=context_lengths,
+            kvcache_start_index=kvcache_start_index,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+
+        if self.laurel is not None:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+            hidden_states = (hidden_states + laurel_output) * (2.0**-0.5)
+
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+        else:
+            hidden_states = residual + hidden_states
+
+            # MLP with residual connection
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+
+        return hidden_states, present_k_cache, present_v_cache
+
+
+class EdgeLLMMambaLayer(nn.Module):
+    """Wraps a NemotronHMamba2Mixer for ONNX export using TensorRT Mamba plugins.
+
+    Extracts all weights from the original mixer and replaces the forward logic
+    with calls to ``causal_conv1d_plugin`` and ``update_ssm_state_plugin`` custom
+    ops so that ``torch.onnx.export`` traces them into the corresponding ONNX
+    custom ops consumed by the C++ TensorRT plugins.
+    """
+
+    def __init__(self, mixer: nn.Module) -> None:
+        super().__init__()
+
+        # Config extracted from the mixer
+        self.num_heads: int = mixer.num_heads
+        self.head_dim: int = mixer.head_dim
+        self.n_groups: int = mixer.n_groups
+        self.intermediate_size: int = mixer.intermediate_size
+        self.ssm_state_size: int = mixer.ssm_state_size
+        self.conv_dim: int = mixer.conv_dim
+        self.conv_kernel_size: int = mixer.conv_kernel_size
+
+        # Projections (keep the original nn.Linear modules)
+        self.in_proj = mixer.in_proj
+        self.out_proj = mixer.out_proj
+
+        # Conv1d weights: mixer.conv1d is nn.Conv1d with shape [conv_dim, 1, kernel]
+        self.register_buffer("conv1d_weight", mixer.conv1d.weight.data)
+        self.register_buffer(
+            "conv1d_bias",
+            mixer.conv1d.bias.data
+            if mixer.conv1d.bias is not None else torch.zeros(self.conv_dim),
+        )
+
+        # SSM parameters
+        self.A_log = mixer.A_log  # nn.Parameter [num_heads]
+        self.D = mixer.D  # nn.Parameter [num_heads]
+        self.dt_bias = mixer.dt_bias  # nn.Parameter [num_heads]
+
+        # Gated RMSNorm parameters
+        self.register_buffer("norm_weight", mixer.norm.weight.data)
+        self.norm_eps: float = mixer.norm.variance_epsilon
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            hidden_states: [batch, seq_len, hidden_size]
+            conv_state: [batch, conv_dim, conv_kernel_size]
+            ssm_state: [batch, num_heads, head_dim, ssm_state_size]
+
+        Returns:
+            (output [batch, seq_len, hidden_size],
+             conv_state_out [batch, conv_dim, conv_kernel_size],
+             ssm_state_out [batch, num_heads, head_dim, ssm_state_size])
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+
+        # 1. Input projection
+        projected = self.in_proj(hidden_states)
+
+        groups_state_size = self.n_groups * self.ssm_state_size
+        d_mlp = (projected.shape[-1] - 2 * self.intermediate_size -
+                 2 * groups_state_size - self.num_heads) // 2
+        _, _, gate, hidden_states_B_C, dt = projected.split(
+            [
+                d_mlp, d_mlp, self.intermediate_size, self.conv_dim,
+                self.num_heads
+            ],
+            dim=-1,
+        )
+
+        hidden_states_B_C = hidden_states_B_C.to(torch.float16)
+        dt = dt.to(torch.float16)
+        conv_state = conv_state.to(torch.float16)
+
+        # 2. Causal conv1d via plugin (no activation baked in)
+        hidden_states_B_C, conv_state_out = causal_conv1d_plugin(
+            hidden_states_B_C,
+            self.conv1d_weight,
+            self.conv1d_bias,
+            conv_state,
+            stride=1,
+            padding=self.conv_kernel_size - 1,
+            dilation=1,
+            groups=self.conv_dim,
+        )
+        hidden_states_B_C = torch.nn.functional.silu(hidden_states_B_C)
+
+        x, B_val, C_val = hidden_states_B_C.split(
+            [self.intermediate_size, groups_state_size, groups_state_size],
+            dim=-1,
+        )
+
+        # 3. Reshape for SSM plugin  [batch, seq, ...] → [batch, seq, heads/groups, dim/dstate]
+        x_ssm = x.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        B_ssm = B_val.view(batch_size, seq_len, self.n_groups,
+                           self.ssm_state_size)
+        C_ssm = C_val.view(batch_size, seq_len, self.n_groups,
+                           self.ssm_state_size)
+
+        A = -torch.exp(self.A_log.float())
+
+        ssm_output, ssm_state_out = update_ssm_state_plugin(
+            x_ssm,
+            A,
+            B_ssm,
+            C_ssm,
+            self.D,
+            dt,
+            self.dt_bias,
+            ssm_state,
+            dt_softplus=1,
+            ngroups=self.n_groups,
+        )
+
+        # ssm_output: [batch, seq, num_heads, head_dim] → [batch, seq, intermediate_size]
+        ssm_output = ssm_output.view(batch_size, seq_len,
+                                     self.intermediate_size)
+
+        # 4. Gated RMSNorm (norm_before_gate=False): GroupRMSNorm(x * SiLU(gate)) * weight
+        ssm_output = self._gated_rmsnorm(ssm_output, gate)
+
+        # 5. Output projection
+        output = self.out_proj(ssm_output)
+
+        return output, conv_state_out, ssm_state_out
+
+    def _gated_rmsnorm(self, x: torch.Tensor,
+                       gate: torch.Tensor) -> torch.Tensor:
+        """Gated RMSNorm with ``norm_before_gate=False`` and group-wise variance."""
+        group_size = self.intermediate_size // self.n_groups
+        # norm_before_gate=False: gate first, then normalize
+        gated = (x * torch.nn.functional.silu(gate)).float()
+        gated_grouped = gated.view(*gated.shape[:-1], -1, group_size)
+        variance = gated_grouped.pow(2).mean(-1, keepdim=True)
+        normed = gated_grouped * torch.rsqrt(variance + self.norm_eps)
+        normed = normed.view(*x.shape)
+        return (normed * self.norm_weight).to(x.dtype)
+
+
+class EdgeLLMHybridBlock(nn.Module):
+    """Wraps a single NemotronHBlock for ONNX export.
+
+    Supports three block types:
+      - ``"mamba"``: pre-norm → :class:`EdgeLLMMambaLayer` → residual
+      - ``"attention"``: pre-norm → :class:`EdgeLLMAttention` → residual
+      - ``"mlp"``: pre-norm → MLP → residual
+    """
+
+    def __init__(self,
+                 hf_block: nn.Module,
+                 torch_dtype: torch.dtype = torch.float16) -> None:
+        super().__init__()
+        self.block_type: str = hf_block.block_type
+        self.norm = hf_block.norm.to(torch_dtype)
+
+        if self.block_type == "mamba":
+            self.mixer = EdgeLLMMambaLayer(hf_block.mixer)
+        elif self.block_type == "attention":
+            self.mixer = EdgeLLMAttention(hf_block.mixer)
+        elif self.block_type == "mlp":
+            self.mixer = hf_block.mixer
+        else:
+            raise ValueError(f"Unknown block_type: {self.block_type}")
+
+    # ------------------------------------------------------------------
+    # Mamba forward
+    # ------------------------------------------------------------------
+    def forward_mamba(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        residual = hidden_states
+        hidden_states = self.norm(hidden_states)
+        hidden_states, conv_state_out, ssm_state_out = self.mixer(
+            hidden_states, conv_state, ssm_state)
+        hidden_states = residual + hidden_states
+        return hidden_states, conv_state_out, ssm_state_out
+
+    # ------------------------------------------------------------------
+    # Attention forward
+    # ------------------------------------------------------------------
+    def forward_attention(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_value: torch.Tensor,
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        residual = hidden_states
+        hidden_states = self.norm(hidden_states)
+        hidden_states, present_key_value = self.mixer(
+            hidden_states=hidden_states,
+            past_key_value=past_key_value,
+            rope_rotary_cos_sin=rope_rotary_cos_sin,
+            context_lengths=context_lengths,
+            kvcache_start_index=kvcache_start_index,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        hidden_states = residual + hidden_states
+        return hidden_states, present_key_value
+
+    # ------------------------------------------------------------------
+    # MLP forward
+    # ------------------------------------------------------------------
+    def forward_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.norm(hidden_states)
+        hidden_states = self.mixer(hidden_states)
+        hidden_states = residual + hidden_states
         return hidden_states

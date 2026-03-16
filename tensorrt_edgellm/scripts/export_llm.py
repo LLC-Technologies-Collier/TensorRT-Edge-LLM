@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -88,6 +88,18 @@ def main() -> None:
                         required=False,
                         action='store_true',
                         help="Whether to use FP8 KV cache")
+    parser.add_argument("--trt_native_ops",
+                        required=False,
+                        action='store_true',
+                        help="Whether to use TensorRT native operations")
+    parser.add_argument(
+        "--export_models",
+        type=str,
+        required=False,
+        default=None,
+        help=
+        "Comma-separated list of models to export for Qwen3-Omni (e.g., 'thinker,talker' or 'code_predictor'). Default: export all models"
+    )
 
     args = parser.parse_args()
 
@@ -98,8 +110,10 @@ def main() -> None:
                          device=args.device,
                          is_eagle_base=args.is_eagle_base,
                          reduced_vocab_dir=args.reduced_vocab_dir,
+                         export_models=args.export_models,
                          chat_template_path=args.chat_template_path,
-                         fp8_kv_cache=args.fp8_kv_cache)
+                         fp8_kv_cache=args.fp8_kv_cache,
+                         trt_native_ops=args.trt_native_ops)
 
         print("LLM model export completed successfully!")
 

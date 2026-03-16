@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,8 +30,9 @@ namespace file_io
  * @param srcPath Source file path
  * @param dstPath Destination file path
  * @return True on success, false on failure
+ * @note This function catches std::filesystem::filesystem_error internally and returns false
  */
-bool copyFile(std::string const& srcPath, std::string const& dstPath);
+bool copyFile(std::string const& srcPath, std::string const& dstPath) noexcept;
 
 } // namespace file_io
 } // namespace trt_edgellm

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -99,7 +99,7 @@ std::string normalizeRegex(std::string const& expr);
  * @return true if file exists, size can be determined, and is within limit;
  *         false if file doesn't exist, size cannot be determined, or exceeds limit
  */
-bool validateFileSize(std::filesystem::path const& filePath, size_t maxSizeBytes);
+bool validateFileSize(std::filesystem::path const& filePath, size_t maxSizeBytes) noexcept;
 
 /*!
  * @defgroup UnicodeUtils Unicode utility functions and structures
@@ -144,21 +144,21 @@ struct codepointFlags
      * @brief Construct from uint16 flags
      * @param flags Flag value
      */
-    inline codepointFlags(uint16_t const flags = 0)
+    inline codepointFlags(uint16_t const flags = 0) noexcept
     {
         *reinterpret_cast<uint16_t*>(this) = flags;
     }
 
     //! @brief Convert to uint16
     //! @return Flags as uint16
-    inline uint16_t asUint() const
+    inline uint16_t asUint() const noexcept
     {
         return *reinterpret_cast<uint16_t const*>(this);
     }
 
     //! @brief Get category flag
     //! @return Category flag value
-    inline uint16_t categoryFlag() const
+    inline uint16_t categoryFlag() const noexcept
     {
         return this->asUint() & MASK_CATEGORIES;
     }
@@ -166,26 +166,47 @@ struct codepointFlags
 
 /// \cond INTERNAL
 // Unicode category mappings
-//! @brief Map from regex patterns to category flags
+//! @brief Map from regex patterns to category flags.
+//! Covers both single-letter categories (e.g. \\p{L}) and two-letter subcategories
+//! (e.g. \\p{Lu}, \\p{Ll}) that appear in tokenizer pre-tokenizer regexes such as
+//! the PreTrainedTokenizer / LLaMA-style split pattern.
 static std::map<std::string, int> const kUatEnum = {
+    // Top-level categories
     {"\\p{N}", codepointFlags::NUMBER},
     {"\\p{L}", codepointFlags::LETTER},
     {"\\p{P}", codepointFlags::PUNCTUATION},
+    {"\\p{M}", codepointFlags::ACCENT_MARK},
+    // Letter subcategories — all collapsed to LETTER for ASCII approximation
+    {"\\p{Lu}", codepointFlags::LETTER}, //!< Uppercase Letter
+    {"\\p{Ll}", codepointFlags::LETTER}, //!< Lowercase Letter
+    {"\\p{Lt}", codepointFlags::LETTER}, //!< Titlecase Letter
+    {"\\p{Lm}", codepointFlags::LETTER}, //!< Modifier Letter
+    {"\\p{Lo}", codepointFlags::LETTER}, //!< Other Letter
+    // Mark subcategories — all collapsed to ACCENT_MARK
+    {"\\p{Mn}", codepointFlags::ACCENT_MARK}, //!< Nonspacing Mark
+    {"\\p{Mc}", codepointFlags::ACCENT_MARK}, //!< Spacing Combining Mark
+    {"\\p{Me}", codepointFlags::ACCENT_MARK}, //!< Enclosing Mark
+    // Number subcategories
+    {"\\p{Nd}", codepointFlags::NUMBER}, //!< Decimal Number
+    {"\\p{Nl}", codepointFlags::NUMBER}, //!< Letter Number
+    {"\\p{No}", codepointFlags::NUMBER}, //!< Other Number
 };
 
-//! @brief Map from category flags to codepoints
+//! @brief Map from category flags to collapsed proxy codepoints (single bytes used in collapsed text)
 static std::map<int, int> const kUcatCpt = {
     {codepointFlags::NUMBER, 0xD1},
     {codepointFlags::LETTER, 0xD2},
     {codepointFlags::PUNCTUATION, 0xD3},
+    {codepointFlags::ACCENT_MARK, 0x0B}, //!< Vertical-tab as mark proxy (matches unicodeCollapseText)
 };
 
-//! @brief Map from category flags to character ranges
+//! @brief Map from category flags to ASCII character ranges used inside collapsed regex character classes
 static std::map<int, std::string> const kUcatMap = {
     {codepointFlags::NUMBER, "\x30-\x39"},          // 0-9
     {codepointFlags::LETTER, "\x41-\x5A\x61-\x7A"}, // A-Za-z
     {codepointFlags::PUNCTUATION,
         "\x21-\x23\x25-\x2A\x2C-\x2F\x3A-\x3B\x3F-\x40\\\x5B-\\\x5D\x5F\\\x7B\\\x7D"}, // !-#%-*,-/:-;?-@\[-\]_\{\}
+    {codepointFlags::ACCENT_MARK, ""}, //!< No ASCII marks; proxy byte 0x0B covers collapsed non-ASCII marks
 };
 /// \endcond
 
@@ -194,6 +215,7 @@ static std::map<int, std::string> const kUcatMap = {
  * @param expr Regex expression with Unicode categories
  * @param regex Output compiled regex
  * @return True on success, false on failure
+ * @throws std::runtime_error if regex processing fails
  */
 bool unicodeCollapseRegex(std::string const& expr, std::regex& regex);
 
@@ -216,6 +238,7 @@ std::vector<size_t> unicodeRegexSplit(std::string const& text, std::regex const&
  * @brief Convert UTF-8 string to codepoints
  * @param utf8 UTF-8 encoded string
  * @return Vector of codepoints
+ * @throws std::invalid_argument if input is not valid UTF-8
  */
 std::vector<uint32_t> unicodeCptsFromUtf8(std::string const& utf8);
 
@@ -224,6 +247,7 @@ std::vector<uint32_t> unicodeCptsFromUtf8(std::string const& utf8);
  * @param utf8 UTF-8 encoded string
  * @param offset Offset in string (updated after extraction)
  * @return Extracted codepoint
+ * @throws std::invalid_argument if input is not valid UTF-8
  */
 uint32_t unicodeCptFromUtf8(std::string const& utf8, size_t& offset);
 
@@ -231,6 +255,7 @@ uint32_t unicodeCptFromUtf8(std::string const& utf8, size_t& offset);
  * @brief Convert codepoint to UTF-8 string
  * @param cp Codepoint value
  * @return UTF-8 encoded string
+ * @throws std::invalid_argument if input is not a valid Unicode code point
  */
 std::string unicodeCptToUtf8(uint32_t cp);
 

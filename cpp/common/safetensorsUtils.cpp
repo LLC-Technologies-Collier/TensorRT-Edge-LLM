@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,7 +36,10 @@ namespace safetensors
 namespace
 {
 
-// Helper function to convert TensorRT data type to safetensors dtype string
+//! @brief Helper function to convert TensorRT data type to safetensors dtype string
+//! @param dataType TensorRT data type
+//! @return Safetensors dtype string
+//! @throws std::runtime_error If data type is unsupported
 std::string dataTypeToString(nvinfer1::DataType dataType)
 {
     switch (dataType)
@@ -46,6 +49,7 @@ std::string dataTypeToString(nvinfer1::DataType dataType)
     case nvinfer1::DataType::kBF16: return "BF16";
     case nvinfer1::DataType::kINT8: return "I8";
     case nvinfer1::DataType::kUINT8: return "U8";
+    case nvinfer1::DataType::kBOOL: return "BOOL";
     case nvinfer1::DataType::kINT32: return "I32";
     case nvinfer1::DataType::kINT64: return "I64";
     case nvinfer1::DataType::kFP8: return "F8_E4M3";
@@ -53,7 +57,10 @@ std::string dataTypeToString(nvinfer1::DataType dataType)
     }
 }
 
-// Helper function to convert safetensors dtype string to TensorRT data type
+//! @brief Helper function to convert safetensors dtype string to TensorRT data type
+//! @param dtype Safetensors dtype string
+//! @return TensorRT data type
+//! @throws std::runtime_error If data type is unsupported
 nvinfer1::DataType stringToDataType(std::string const& dtype)
 {
     if (dtype == "F32")

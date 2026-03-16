@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -50,7 +50,7 @@ def test_build_project(env_config: EnvironmentConfig,
     # Use trt_package_dir from env_config
     if env_config.trt_package_dir:
         cmake_cmd.append(f'-DTRT_PACKAGE_DIR={env_config.trt_package_dir}')
-    cmake_cmd.append(f'-DCUDA_VERSION={device_config.cuda_version}')
+    cmake_cmd.append(f'-DCUDA_CTK_VERSION={device_config.cuda_version}')
 
     if device_config.target in [
             'jetson-orin', 'auto-thor', 'jetson-thor', 'gb10'
@@ -58,6 +58,11 @@ def test_build_project(env_config: EnvironmentConfig,
         cmake_cmd.append(f'-DEMBEDDED_TARGET={device_config.target}')
         cmake_cmd.append(
             '-DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake')
+
+    # Enable CuTe DSL FMHA for Blackwell+ (SM >= 100) targets
+    if device_config.compute_capability is not None and device_config.compute_capability in (
+            100, 101, 110):
+        cmake_cmd.append('-DENABLE_CUTE_DSL_FMHA=ON')
 
     build_cmd = ' && '.join([
         f'mkdir -p {build_dir}', f'cd {build_dir}', ' '.join(cmake_cmd),

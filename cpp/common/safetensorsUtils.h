@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,6 +42,7 @@ namespace safetensors
  * @param tensors Vector of tensors to save
  * @param stream CUDA stream for async operations
  * @return True on success, false on failure
+ * @throws std::runtime_error If CUDA operations fail or data type is unsupported
  */
 bool saveSafetensors(std::filesystem::path const& filePath, std::vector<Tensor> const& tensors, cudaStream_t stream);
 
@@ -54,6 +55,7 @@ bool saveSafetensors(std::filesystem::path const& filePath, std::vector<Tensor> 
  * @param tensors Output vector to store loaded tensors
  * @param stream CUDA stream for async operations
  * @return True on success, false on failure
+ * @throws std::runtime_error If CUDA operations fail, data type is unsupported, or tensor allocation fails
  */
 bool loadSafetensors(std::filesystem::path const& filePath, std::vector<Tensor>& tensors, cudaStream_t stream);
 

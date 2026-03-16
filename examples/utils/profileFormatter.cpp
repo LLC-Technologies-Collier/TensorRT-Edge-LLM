@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@
 #include "common/logger.h"
 #include "common/tensor.h"
 #include "memoryMonitor.h"
+#include "profiling/layerProfiler.h"
 #include "profiling/timer.h"
 #include <algorithm>
 #include <atomic>
@@ -306,10 +307,50 @@ void outputMultimodalProfile(std::ostream& output, metrics::MultimodalMetrics co
     if (multimodalMetrics.getTotalRuns() > 0)
     {
         output << "=== Multimodal Processing ===" << std::endl;
-        output << "Total Image Tokens: " << multimodalMetrics.totalImageTokens << std::endl;
+
+        // Show audio stats if present (Qwen3-Omni)
+        if (multimodalMetrics.totalAudios > 0)
+        {
+            output << "Total Audio Clips: " << multimodalMetrics.totalAudios << std::endl;
+            output << "Total Audio Tokens: " << multimodalMetrics.totalAudioTokens << std::endl;
+        }
+
+        // Show image stats if present
+        if (multimodalMetrics.totalImages > 0)
+        {
+            output << "Total Images: " << multimodalMetrics.totalImages << std::endl;
+            output << "Total Image Tokens: " << multimodalMetrics.totalImageTokens << std::endl;
+        }
+
+        // Show combined stats
+        int64_t totalTokens = multimodalMetrics.totalImageTokens + multimodalMetrics.totalAudioTokens;
+        if (totalTokens > 0)
+        {
+            output << "Total Multimodal Tokens: " << totalTokens << std::endl;
+        }
+
         output << "Average Time per Token: " << std::fixed << std::setprecision(4)
                << getMultimodalAverageTimePerToken(multimodalMetrics) << " ms" << std::endl;
         appendStageTimingData(output, metrics::StageNames::kMULTIMODAL_PROCESSING, "Multimodal Processing");
+    }
+}
+
+void outputTalkerProfile(std::ostream& output, metrics::MultimodalMetrics const& talkerMetrics)
+{
+    if (talkerMetrics.getTotalRuns() > 0)
+    {
+        output << "=== Talker Audio Generation ===" << std::endl;
+        output << "Total Audio Outputs: " << talkerMetrics.totalAudios << std::endl;
+        output << "Total Audio Codes: " << talkerMetrics.totalAudioTokens << std::endl;
+
+        if (talkerMetrics.totalAudioTokens > 0)
+        {
+            output << "Average Codes per Output: " << std::fixed << std::setprecision(1)
+                   << static_cast<float>(talkerMetrics.totalAudioTokens) / talkerMetrics.totalAudios << std::endl;
+        }
+
+        appendStageTimingData(output, metrics::StageNames::kTALKER_GENERATION, "Talker Generation");
+        appendStageTimingData(output, metrics::StageNames::kCODE_PREDICTOR, "CodePredictor");
     }
 }
 
@@ -384,9 +425,26 @@ void addJsonMultimodalSummary(nlohmann::json& summary, metrics::MultimodalMetric
 {
     if (multimodalMetrics.getTotalRuns() > 0)
     {
+        int64_t totalTokens = multimodalMetrics.totalImageTokens + multimodalMetrics.totalAudioTokens;
+
         summary["multimodal"] = {{"total_runs", multimodalMetrics.getTotalRuns()},
             {"total_images", multimodalMetrics.totalImages}, {"total_image_tokens", multimodalMetrics.totalImageTokens},
+            {"total_audios", multimodalMetrics.totalAudios}, {"total_audio_tokens", multimodalMetrics.totalAudioTokens},
+            {"total_multimodal_tokens", totalTokens},
             {"average_time_per_token_ms", getMultimodalAverageTimePerToken(multimodalMetrics)}};
+    }
+}
+
+void addJsonTalkerSummary(nlohmann::json& summary, metrics::MultimodalMetrics const& talkerMetrics)
+{
+    if (talkerMetrics.getTotalRuns() > 0)
+    {
+        summary["talker"] = {{"total_runs", talkerMetrics.getTotalRuns()},
+            {"total_audio_outputs", talkerMetrics.totalAudios}, {"total_audio_codes", talkerMetrics.totalAudioTokens},
+            {"average_codes_per_output",
+                talkerMetrics.totalAudios > 0
+                    ? static_cast<float>(talkerMetrics.totalAudioTokens) / talkerMetrics.totalAudios
+                    : 0.0f}};
     }
 }
 
@@ -550,5 +608,172 @@ std::string sanitizeUtf8ForJson(std::string const& input)
 
         LOG_WARNING("Sanitized output from %zu to %zu bytes", input.size(), sanitized.size());
         return sanitized;
+    }
+}
+
+namespace
+{
+//! Helper function to calculate total time for a layer
+double calculateLayerTotalTime(trt_edgellm::layerProfiler::LayerProfile const& layer)
+{
+    return std::accumulate(layer.timeMs.begin(), layer.timeMs.end(), 0.0, std::plus<double>());
+}
+
+//! Helper function to calculate total stage time from metrics
+double calculateStageTotalTime(trt_edgellm::layerProfiler::LayerProfilerMetrics const& metrics)
+{
+    double total = 0.0;
+    for (auto const& layer : metrics.layers)
+    {
+        total += calculateLayerTotalTime(layer);
+    }
+    return total;
+}
+
+//! Print layer profile in table format (prints ALL layers, not just top N)
+void printLayerProfileTable(std::ostream& output, trt_edgellm::layerProfiler::LayerProfilerMetrics const& metrics)
+{
+    if (!metrics.enabled || metrics.iterationCount <= 0 || metrics.layers.empty())
+    {
+        return;
+    }
+
+    output << std::endl
+           << "=== " << metrics.stageName << " Layer Performance Profile (" << metrics.iterationCount
+           << " iterations) ===" << std::endl;
+
+    double totalStageTime = calculateStageTotalTime(metrics);
+    output << "   Time(ms)     Avg.(ms)   Median(ms)   Time(%)   Layer" << std::endl;
+
+    // Sort layers by total time (descending) - use pointers to avoid copying
+    std::vector<trt_edgellm::layerProfiler::LayerProfile const*> sortedLayers;
+    for (auto const& layer : metrics.layers)
+    {
+        sortedLayers.push_back(&layer);
+    }
+    std::sort(sortedLayers.begin(), sortedLayers.end(), [](auto const& a, auto const& b) {
+        double totalA = std::accumulate(a->timeMs.begin(), a->timeMs.end(), 0.0);
+        double totalB = std::accumulate(b->timeMs.begin(), b->timeMs.end(), 0.0);
+        return totalA > totalB;
+    });
+
+    // Print ALL layers
+    for (auto const* layer : sortedLayers)
+    {
+        if (layer->timeMs.empty())
+        {
+            continue;
+        }
+
+        double totalTime = calculateLayerTotalTime(*layer);
+        double avgTime = totalTime / layer->timeMs.size();
+        double percentage = totalStageTime > 0.0 ? (totalTime / totalStageTime) * 100.0 : 0.0;
+
+        auto stats = StatisticalAnalysis::calculate(layer->timeMs);
+
+        output << std::fixed << std::setprecision(2) << std::setw(12) << totalTime << std::fixed << std::setprecision(4)
+               << std::setw(12) << avgTime << std::fixed << std::setprecision(4) << std::setw(12) << stats.median
+               << std::fixed << std::setprecision(1) << std::setw(12) << percentage << "   " << layer->name
+               << std::endl;
+    }
+
+    // Print stage total
+    double avgStageTime = totalStageTime / metrics.iterationCount;
+    output << std::fixed << std::setprecision(2) << std::setw(12) << totalStageTime << std::fixed
+           << std::setprecision(4) << std::setw(12) << avgStageTime << std::fixed << std::setprecision(4)
+           << std::setw(12) << avgStageTime << std::fixed << std::setprecision(1) << std::setw(12) << 100.0
+           << "   Stage Total" << std::endl;
+}
+
+//! Print detailed layer analysis with performance insights
+void printDetailedLayerAnalysis(std::ostream& output, trt_edgellm::layerProfiler::LayerProfilerMetrics const& metrics)
+{
+    if (!metrics.enabled || metrics.iterationCount <= 0 || metrics.layers.empty())
+    {
+        return;
+    }
+
+    output << std::endl << "=== " << metrics.stageName << " Detailed Layer Performance Analysis ===" << std::endl;
+
+    double totalStageTime = calculateStageTotalTime(metrics);
+
+    for (auto const& layer : metrics.layers)
+    {
+        if (layer.timeMs.empty())
+        {
+            continue;
+        }
+
+        auto stats = StatisticalAnalysis::calculate(layer.timeMs);
+        double totalTime = calculateLayerTotalTime(layer);
+        double percentage = totalStageTime > 0.0 ? (totalTime / totalStageTime) * 100.0 : 0.0;
+
+        output << "Layer: " << layer.name << std::endl;
+        output << "  Count: " << stats.count << ", Total: " << std::fixed << std::setprecision(2) << totalTime << " ms"
+               << std::endl;
+        output << "  Min: " << std::fixed << std::setprecision(4) << stats.min << " ms, Max: " << stats.max << " ms"
+               << std::endl;
+        output << "  Mean: " << std::fixed << std::setprecision(4) << stats.mean << " ms, Median: " << stats.median
+               << " ms" << std::endl;
+        output << "  P95: " << std::fixed << std::setprecision(4) << stats.p95 << " ms, P99: " << stats.p99 << " ms"
+               << std::endl;
+        output << "  StdDev: " << std::fixed << std::setprecision(4) << stats.stddev << " ms, Stage %: " << std::fixed
+               << std::setprecision(1) << percentage << "%" << std::endl;
+
+        // Detect performance issues
+        double coeffVar = stats.mean > 0.0 ? (stats.stddev / stats.mean) * 100.0 : 0.0;
+        if (coeffVar > 10.0)
+        {
+            output << "  HIGH VARIABILITY: Coefficient of variation = " << std::fixed << std::setprecision(1)
+                   << coeffVar << "%" << std::endl;
+        }
+
+        // Check for warmup issues
+        if (layer.timeMs.size() >= 3)
+        {
+            float firstRun = layer.timeMs[0];
+            float avgLaterRuns = 0.0f;
+            size_t laterRunCount = std::min(size_t(3), layer.timeMs.size() - 1);
+            for (size_t i = 1; i <= laterRunCount; ++i)
+            {
+                avgLaterRuns += layer.timeMs[i];
+            }
+            avgLaterRuns /= laterRunCount;
+
+            if (firstRun > avgLaterRuns * 1.5f)
+            {
+                output << "  WARMUP DETECTED: First run (" << std::fixed << std::setprecision(2) << firstRun
+                       << " ms) is " << std::fixed << std::setprecision(1) << (firstRun / avgLaterRuns)
+                       << "x slower than later runs" << std::endl;
+            }
+        }
+        output << std::endl;
+    }
+}
+} // anonymous namespace
+
+void outputLayerProfiles(std::ostream& output, bool detailed)
+{
+    using namespace trt_edgellm::layerProfiler;
+    using namespace trt_edgellm::metrics;
+
+    // Collect metrics from all profilers
+    LayerProfilerMetrics const& metrics = LayerProfiler::getInstance().getMetrics();
+
+    if (metrics.enabled && metrics.iterationCount > 0)
+    {
+        // Print table format (all layers)
+        printLayerProfileTable(output, metrics);
+
+        // Optionally print detailed analysis
+        if (detailed)
+        {
+            printDetailedLayerAnalysis(output, metrics);
+        }
+    }
+    else
+    {
+        output << "=== Layer Profile ===" << std::endl;
+        output << "No layer profiling data available (layer profiling was not enabled)" << std::endl;
     }
 }

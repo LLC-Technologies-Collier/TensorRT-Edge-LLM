@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,13 +24,14 @@ The module contains:
 - EdgeLLMModelForCausalLM: Wrapper for causal language modeling tasks
 """
 
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
+from .. import model_utils
 from ..layers.gather_nd import custom_gather_nd
-from ..layers.layers import EdgeLLMDecoderLayer
+from ..layers.layers import EdgeLLMDecoderLayer, EdgeLLMHybridBlock
 from ..layers.reduced_lm_head import reduce_lm_head
 
 
@@ -49,7 +50,6 @@ class EdgeLLMModel(nn.Module):
         vocab_size: Size of the vocabulary
         layers: List of decoder layers
         norm: RMS normalization layer
-        embed_tokens: Token embedding layer
         rotary_emb: Rotary embedding layer
         is_eagle_base: Whether this is an EAGLE3 base model
     """
@@ -73,7 +73,13 @@ class EdgeLLMModel(nn.Module):
 
         # Keep all the original components
         self.torch_dtype = hf_model.dtype
-        self.embed_tokens = hf_model.embed_tokens.to(self.torch_dtype)
+
+        # embed_tokens is optional (e.g., Talker/CodePredictor use projected embeddings as input)
+        if hasattr(hf_model, 'embed_tokens'):
+            self.embed_tokens = hf_model.embed_tokens.to(self.torch_dtype)
+        else:
+            self.embed_tokens = None
+
         self.norm = hf_model.norm.to(self.torch_dtype)
 
         # Replace decoder layers with our custom ones
@@ -164,6 +170,186 @@ class EdgeLLMModel(nn.Module):
         return hidden_states, present_key_values, all_hidden_states
 
 
+class EdgeLLMHybridModel(nn.Module):
+    """EdgeLLM model for hybrid architectures like Nemotron-Nano (Mamba+Attention+MLP).
+
+    Unlike :class:`EdgeLLMModel` which assumes uniform attention+MLP layers,
+    this class reads ``config.layers_block_type`` to wrap each block
+    appropriately and routes state (KV cache for attention, SSM state for
+    Mamba) through the correct blocks.
+    """
+
+    def __init__(self, hf_model: nn.Module) -> None:
+        super().__init__()
+
+        self.config = hf_model.config
+        self.vocab_size = self.config.vocab_size
+        self.torch_dtype = hf_model.dtype
+        norm_layer = getattr(hf_model, 'norm', None) or hf_model.norm_f
+        self.norm = norm_layer.to(self.torch_dtype)
+
+        self.block_types: List[str] = list(self.config.layers_block_type)
+
+        self.layers = nn.ModuleList([
+            EdgeLLMHybridBlock(hf_layer, self.torch_dtype)
+            for hf_layer in hf_model.layers
+        ])
+
+        # Set max_position_embeddings on attention mixers
+        for layer in self.layers:
+            if layer.block_type == "attention":
+                layer.mixer.max_position_embeddings = (
+                    self.config.max_position_embeddings)
+
+        # Pre-compute index maps for attention / mamba layers
+        self.attn_layer_indices: List[int] = [
+            i for i, bt in enumerate(self.block_types) if bt == "attention"
+        ]
+        self.mamba_layer_indices: List[int] = [
+            i for i, bt in enumerate(self.block_types) if bt == "mamba"
+        ]
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def num_attention_layers(self) -> int:
+        return len(self.attn_layer_indices)
+
+    @property
+    def num_mamba_layers(self) -> int:
+        return len(self.mamba_layer_indices)
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        conv_states: Tuple[torch.Tensor, ...],
+        ssm_states: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], Tuple[
+            torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
+        """
+        Returns:
+            (hidden_states, present_key_values, present_conv_states, present_ssm_states)
+        """
+        hidden_states = inputs_embeds
+        present_key_values: Tuple[torch.Tensor, ...] = ()
+        present_conv_states: Tuple[torch.Tensor, ...] = ()
+        present_ssm_states: Tuple[torch.Tensor, ...] = ()
+
+        attn_idx = 0
+        mamba_idx = 0
+
+        for idx, layer in enumerate(self.layers):
+            bt = self.block_types[idx]
+
+            if bt == "mamba":
+                hidden_states, conv_state_out, ssm_state_out = layer.forward_mamba(
+                    hidden_states, conv_states[mamba_idx],
+                    ssm_states[mamba_idx])
+                present_conv_states += (conv_state_out, )
+                present_ssm_states += (ssm_state_out, )
+                mamba_idx += 1
+
+            elif bt == "attention":
+                hidden_states, present_kv = layer.forward_attention(
+                    hidden_states,
+                    past_key_values[attn_idx],
+                    rope_rotary_cos_sin,
+                    context_lengths,
+                    kvcache_start_index,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                )
+                present_key_values += (present_kv, )
+                attn_idx += 1
+
+            elif bt == "mlp":
+                hidden_states = layer.forward_mlp(hidden_states)
+
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, present_key_values, present_conv_states, present_ssm_states
+
+
+class EdgeLLMHybridModelForCausalLM(nn.Module):
+    """Causal LM wrapper for hybrid Mamba+Attention architectures."""
+
+    def __init__(
+        self,
+        hf_model: nn.Module,
+        reduced_vocab_size: Optional[int] = None,
+        vocab_map: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+
+        language_model, config = model_utils.prepare_language_model_and_config(
+            hf_model)
+        self.torch_dtype = hf_model.dtype
+        self.config = config
+        embed_layer = getattr(language_model, 'embed_tokens',
+                              None) or language_model.embeddings
+        self.embed_tokens = embed_layer.to(self.torch_dtype)
+
+        self.model = EdgeLLMHybridModel(language_model)
+
+        if reduced_vocab_size is not None and vocab_map is not None:
+            print(
+                f"Reducing vocabulary size from {hf_model.lm_head.out_features}"
+                f" to {reduced_vocab_size}")
+            self.lm_head = reduce_lm_head(hf_model.lm_head, reduced_vocab_size,
+                                          vocab_map)
+        else:
+            self.lm_head = hf_model.lm_head
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        conv_states: Tuple[torch.Tensor, ...],
+        ssm_states: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        last_token_ids: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], Tuple[
+            torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
+        """
+        Returns:
+            (logits, present_key_values, present_conv_states, present_ssm_states)
+        """
+        hidden_states, present_key_values, present_conv_states, present_ssm_states = self.model(
+            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+            conv_states=conv_states,
+            ssm_states=ssm_states,
+            rope_rotary_cos_sin=rope_rotary_cos_sin,
+            context_lengths=context_lengths,
+            kvcache_start_index=kvcache_start_index,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+        )
+
+        last_hidden_state_gathered = custom_gather_nd(hidden_states,
+                                                      last_token_ids, 1)
+        logits = self.lm_head(last_hidden_state_gathered)
+        logits = logits.to(torch.float32)
+
+        return logits, tuple(present_key_values), tuple(
+            present_conv_states), tuple(present_ssm_states)
+
+
 class EdgeLLMModelForCausalLM(nn.Module):
     """
     EdgeLLM Model for Causal Language Modeling.
@@ -177,6 +363,7 @@ class EdgeLLMModelForCausalLM(nn.Module):
         lm_head: Language model head for token prediction
         config: Model configuration object
         is_eagle_base: Whether this is an EAGLE3 base model
+        embed_tokens: Token embedding layer
     """
 
     def __init__(self,
@@ -195,18 +382,11 @@ class EdgeLLMModelForCausalLM(nn.Module):
         """
         super().__init__()
 
-        # Auto-detect VLM models and extract language model
-        if hasattr(hf_model, 'language_model'):
-            # VLM model with language_model attribute
-            language_model = hf_model.language_model
-            self.config = hf_model.config.text_config
-            if hasattr(hf_model.config, "quantization_config"):
-                self.config.quantization_config = hf_model.config.quantization_config
-        else:
-            # Standard model or Phi4MM (uses model.model attribute)
-            language_model = hf_model.model
-            self.config = hf_model.config
+        language_model, config = model_utils.prepare_language_model_and_config(
+            hf_model)
         self.torch_dtype = hf_model.dtype
+        self.config = config
+        self.embed_tokens = language_model.embed_tokens.to(self.torch_dtype)
 
         # Create EdgeLLMModel with the original model
         self.model = EdgeLLMModel(language_model, is_eagle_base)
@@ -264,7 +444,9 @@ class EdgeLLMModelForCausalLM(nn.Module):
             For EAGLE3 base: (logits, past_key_values, hidden_states)
         """
         # Determine output configuration based on model type
-        output_hidden_states = self.is_eagle_base
+        # Enable hidden states output for EAGLE base and Qwen3-Omni Thinker
+        is_qwen3_omni_thinker = self.config.model_type == "qwen3_omni_text"
+        output_hidden_states = self.is_eagle_base or is_qwen3_omni_thinker
 
         # Forward pass through the model
         hidden_states, present_key_values, all_hidden_states = self.model(
@@ -300,8 +482,29 @@ class EdgeLLMModelForCausalLM(nn.Module):
             hidden_states = torch.cat(
                 [hidden_states_0, hidden_states_1, hidden_states_2],
                 dim=-1).to(self.torch_dtype)
-
             return logits, hidden_states, tuple(present_key_values)
 
-        # Standard model: return logits and past key values
+        elif is_qwen3_omni_thinker:
+            # Qwen3-Omni Thinker: return accept_hidden_layer hidden states for Talker
+            # accept_hidden_layer (e.g. 14): thinker_hidden (used for hidden_projection in Talker)
+            # Note: Layer 0 (thinker_embed) is the same as inputs_embeds, already available in runtime
+            # Output shape: [batch_size, seq_len, hidden_size]
+
+            # Read accept_hidden_layer from config (auto from talker_config or default 14)
+            accept_layer = getattr(self.config, 'accept_hidden_layer', 14)
+            if hasattr(self.config, 'talker_config') and hasattr(
+                    self.config.talker_config, 'accept_hidden_layer'):
+                accept_layer = self.config.talker_config.accept_hidden_layer
+
+            if accept_layer >= len(all_hidden_states):
+                raise ValueError(
+                    f"accept_hidden_layer ({accept_layer}) exceeds number of layers ({len(all_hidden_states)})"
+                )
+
+            hidden_states_output = all_hidden_states[accept_layer].to(
+                self.torch_dtype)
+
+            return logits, hidden_states_output, tuple(present_key_values)
+
+        # Standard model: return only logits and kv cache (original behavior)
         return logits, tuple(present_key_values)

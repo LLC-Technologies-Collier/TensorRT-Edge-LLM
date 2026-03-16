@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,7 +44,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from transformers import AutoProcessor, AutoTokenizer
 
-from ..llm_models.model_utils import is_vlm
+from ..llm_models.model_utils import (_is_qwen3_asr_model,
+                                      _is_qwen3_omni_model, is_vlm)
 
 
 @dataclass
@@ -82,6 +83,9 @@ class MultimodalUserMessage(Message):
 
     def add_video_content(self, video: str):
         self.content.append({"type": "video", "video": video})
+
+    def add_audio_content(self, audio: str):
+        self.content.append({"type": "audio", "audio": audio})
 
 
 @dataclass
@@ -180,13 +184,13 @@ def _extract_content_pattern(tokenizer: Any, system_prompt: SystemMessage,
                              text_only_formatted: str,
                              placeholder_text: str) -> Optional[str]:
     """
-    Extract the pattern for a specific content type (image/video) by comparing
+    Extract the pattern for a specific content type (image/video/audio) by comparing
     with text-only message.
     
     Args:
         tokenizer: The loaded tokenizer
         system_prompt: System message to use
-        content_type: Type of content ('image' or 'video')
+        content_type: Type of content ('image', 'video', or 'audio')
         placeholder: Placeholder string for the content
         text_only_formatted: Formatted text-only message
         placeholder_text: The text placeholder used
@@ -200,6 +204,8 @@ def _extract_content_pattern(tokenizer: Any, system_prompt: SystemMessage,
         user_with_content.add_image_content(placeholder)
     elif content_type == 'video':
         user_with_content.add_video_content(placeholder)
+    elif content_type == 'audio':
+        user_with_content.add_audio_content(placeholder)
     else:
         return None
 
@@ -350,6 +356,29 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
     user_prefix, user_suffix = _extract_prefix_suffix(
         user_formatted[len(system_formatted):], user_prompt.content)
 
+    # Some models (e.g. Qwen3-ASR) inject extra role blocks into the
+    # system-only output (an empty user turn).  This causes system_suffix
+    # to contain markers that belong to the user role.  Strip them so
+    # the C++ runtime doesn't emit a spurious empty user block.
+    if user_prefix and user_prefix in system_suffix:
+        system_suffix = system_suffix[:system_suffix.find(user_prefix)]
+    elif not user_prefix and system_suffix:
+        # User extraction failed (e.g. template ignores text-only user
+        # messages).  If system_suffix has an embedded user block it will
+        # look like  SUFFIX + user_prefix + SUFFIX  where SUFFIX is the
+        # end-of-turn marker that appears at both ends.  Decompose it.
+        for length in range(1, len(system_suffix) // 2 + 1):
+            candidate = system_suffix[:length]
+            if (system_suffix.endswith(candidate)
+                    and len(system_suffix) > 2 * len(candidate)):
+                user_prefix = system_suffix[length:-length]
+                user_suffix = candidate
+                system_suffix = candidate
+                print(
+                    f"Extracted user role patterns from system suffix: "
+                    f"prefix={repr(user_prefix)}, suffix={repr(user_suffix)}")
+                break
+
     # Extract assistant role patterns (compare with user case)
     assistant_prompt = AssistantMessage()
     assistant_formatted = _format_messages(
@@ -412,6 +441,24 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
                                                  placeholder_text)
         if video_pattern:
             content_types['video'] = {'format': video_pattern}
+
+    # Check for Omni models (audio + vision + text)
+    elif _is_qwen3_omni_model(model_dir) or _is_qwen3_asr_model(model_dir):
+        print(
+            "Detected Omni-modal model (audio + vision), using special token placeholders..."
+        )
+        # For Omni models, use special tokens as placeholders that the C++ multimodal runners expect
+        # These are single tokens that Qwen3OmniAudioRunner and QwenViTRunner will find and replace
+        content_types['audio'] = {'format': '<|audio_pad|>'}
+        content_types['image'] = {'format': '<|image_pad|>'}
+        content_types['video'] = {'format': '<|video_pad|>'}
+        print(
+            "  Using special token placeholders: <|audio_pad|>, <|image_pad|>, <|video_pad|>"
+        )
+        print(
+            "  Note: These will be expanded by Qwen3OmniAudioRunner/VisionRunner during inference"
+        )
+
     else:
         print(
             "Text-only LLM detected, skipping multimodal content pattern extraction"

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -61,6 +61,12 @@ def main() -> None:
         help=
         "Device to load the model on (default: cuda, options: cpu, cuda, cuda:0, cuda:1, etc.)"
     )
+    parser.add_argument(
+        "--trt_native_ops",
+        action="store_true",
+        help=
+        "Use TensorRT native operations instead of custom attention plugin (default: False)"
+    )
 
     args = parser.parse_args()
 
@@ -69,7 +75,8 @@ def main() -> None:
         export_draft_model(draft_model_dir=args.draft_model_dir,
                            output_dir=args.output_dir,
                            base_model_dir=args.base_model_dir,
-                           device=args.device)
+                           device=args.device,
+                           trt_native_ops=args.trt_native_ops)
 
         print("EAGLE3 Draft model export completed successfully!")
 

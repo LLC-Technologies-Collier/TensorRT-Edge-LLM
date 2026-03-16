@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,8 +26,8 @@ namespace trt_edgellm
 //! \cond INTERNAL
 //! Global profiling control flag accessors (defined in timer.cpp)
 //! When false, no profiling data (metrics or timing) will be recorded
-bool getProfilingEnabled();
-void setProfilingEnabled(bool enabled);
+bool getProfilingEnabled() noexcept;
+void setProfilingEnabled(bool enabled) noexcept;
 //! \endcond
 
 namespace metrics
@@ -40,12 +40,18 @@ namespace metrics
  */
 namespace StageNames
 {
-inline std::string const kLLM_PREFILL = "llm_prefill";                               //!< LLM prefill stage
-inline std::string const kLLM_GENERATION = "llm_generation";                         //!< LLM generation stage
-inline std::string const kMULTIMODAL_PROCESSING = "multimodal_processing";           //!< Multimodal processing stage
-inline std::string const kEAGLE_DRAFT_PREFILL = "eagle_draft_prefill";               //!< Eagle draft prefill stage
+inline std::string const kLLM_PREFILL = "llm_prefill";                     //!< LLM prefill stage
+inline std::string const kLLM_GENERATION = "llm_generation";               //!< LLM generation stage
+inline std::string const kLLM_LAYER = "llm_layer";                         //!< LLM layer profiling
+inline std::string const kMULTIMODAL_PROCESSING = "multimodal_processing"; //!< Multimodal processing stage (legacy)
+inline std::string const kAUDIO_ENCODER = "audio_encoder";                 //!< Audio encoder stage
+inline std::string const kVISION_ENCODER = "vision_encoder";               //!< Vision encoder stage
+inline std::string const kEAGLE_DRAFT_PREFILL = "eagle_draft_prefill";     //!< Eagle draft prefill stage
 inline std::string const kEAGLE_CONSTRUCT_DRAFT_TREE = "eagle_construct_draft_tree"; //!< Eagle draft tree construction
 inline std::string const kEAGLE_BASE_VERIFICATION = "eagle_base_verification";       //!< Eagle base verification stage
+inline std::string const kCODE2WAV = "code2wav";                                     //!< Code2Wav vocoder stage
+inline std::string const kTALKER_GENERATION = "talker_generation";                   //!< Talker audio frame generation
+inline std::string const kCODE_PREDICTOR = "code_predictor"; //!< CodePredictor RVQ code generation
 } // namespace StageNames
 
 /*!
@@ -57,11 +63,11 @@ class BaseMetrics
 {
 public:
     //! @brief Virtual destructor
-    virtual ~BaseMetrics() = default;
+    virtual ~BaseMetrics() noexcept = default;
 
     //! @brief Get total number of runs
     //! @return Total runs count
-    int64_t getTotalRuns() const
+    int64_t getTotalRuns() const noexcept
     {
         return totalRuns;
     }
@@ -84,7 +90,7 @@ public:
     //! @brief Record a prefill run
     //! @param reused Number of reused tokens
     //! @param computed Number of computed tokens
-    void recordRun(int64_t reused, int64_t computed)
+    void recordRun(int64_t reused, int64_t computed) noexcept
     {
         if (!getProfilingEnabled())
         {
@@ -108,7 +114,7 @@ public:
 
     //! @brief Record a generation run
     //! @param generated Number of generated tokens
-    void recordRun(int64_t generated)
+    void recordRun(int64_t generated) noexcept
     {
         if (!getProfilingEnabled())
         {
@@ -122,18 +128,22 @@ public:
 /*!
  * @brief Multimodal processing stage metrics
  *
- * Tracks image processing statistics.
+ * Tracks image and audio processing statistics.
  */
 class MultimodalMetrics : public BaseMetrics
 {
 public:
     int64_t totalImages{0};      //!< Total number of processed images
     int64_t totalImageTokens{0}; //!< Total number of image tokens generated
+    int64_t totalAudios{0};      //!< Total number of processed audio clips (Qwen3-Omni)
+    int64_t totalAudioTokens{0}; //!< Total number of audio tokens generated (Qwen3-Omni)
 
     //! @brief Record a multimodal processing run
     //! @param imageCount Number of images processed
     //! @param imageTokens Number of image tokens generated
-    void recordRun(int64_t imageCount, int64_t imageTokens)
+    //! @param audioCount Number of audio clips processed (optional, for Qwen3-Omni)
+    //! @param audioTokens Number of audio tokens generated (optional, for Qwen3-Omni)
+    void recordRun(int64_t imageCount, int64_t imageTokens, int64_t audioCount = 0, int64_t audioTokens = 0) noexcept
     {
         if (!getProfilingEnabled())
         {
@@ -142,6 +152,8 @@ public:
         totalRuns++;
         totalImages += imageCount;
         totalImageTokens += imageTokens;
+        totalAudios += audioCount;
+        totalAudioTokens += audioTokens;
     }
 };
 
@@ -159,7 +171,7 @@ public:
     //! @brief Record an Eagle generation run
     //! @param iterations Number of iterations
     //! @param generatedTokens Number of generated tokens
-    void recordRun(int64_t iterations, int64_t generatedTokens)
+    void recordRun(int64_t iterations, int64_t generatedTokens) noexcept
     {
         if (!getProfilingEnabled())
         {

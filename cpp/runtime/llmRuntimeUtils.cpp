@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,6 +39,7 @@ std::ostream& operator<<(std::ostream& os, RopeType const& type)
     case RopeType::kDynamic: os << "Dynamic"; break;
     case RopeType::kLongRope: os << "LongRope"; break;
     case RopeType::kMRope: os << "MRope"; break;
+    case RopeType::kNoRope: os << "NoRope"; break;
     }
     return os;
 }
@@ -60,6 +61,19 @@ std::string formatRopeConfig(RopeConfig const& config)
 RopeConfig collectRopeConfig(nlohmann::json const& config)
 {
     RopeConfig ropeConfig{};
+
+    // Check for explicit use_rope flag (set by hybrid model export)
+    if (config.contains("use_rope") && config["use_rope"].is_boolean() && !config["use_rope"].get<bool>())
+    {
+        ropeConfig.type = RopeType::kNoRope;
+        if (config.contains("max_position_embeddings"))
+        {
+            ropeConfig.maxPositionEmbeddings = config["max_position_embeddings"].get<int32_t>();
+        }
+        LOG_INFO("Collected rope config: %s", formatRopeConfig(ropeConfig).c_str());
+        return ropeConfig;
+    }
+
     auto ropeScalingIt = config.find("rope_scaling");
     if (ropeScalingIt != config.end())
     {
@@ -75,6 +89,7 @@ RopeConfig collectRopeConfig(nlohmann::json const& config)
             if (ropeTypeStr == "default" && mropeSectionIt != ropeScalingIt->end())
             {
                 // transformers `Qwen2_5_VLVisionConfig` change type from 'mrope' to 'default'
+                // Talker uses same config (3D position_ids + interleaved MRoPE) as in PyTorch.
                 ropeConfig.type = RopeType::kMRope;
             }
             else if (ropeTypeStr == "default" || ropeTypeStr == "llama3")
@@ -149,8 +164,7 @@ RopeConfig collectRopeConfig(nlohmann::json const& config)
     return ropeConfig;
 }
 
-bool initializeRopeCosSinCache(
-    rt::Tensor& cosSinCache, RopeConfig const& config, nlohmann::json const& modelConfig, cudaStream_t stream)
+bool initializeRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& config, cudaStream_t stream) noexcept
 {
     if (config.type == RopeType::kMRope)
     {
@@ -200,8 +214,46 @@ bool initializeRopeCosSinCache(
     return true;
 }
 
-bool initializeLongRopeCosSinCache(rt::Tensor& shortCosSinCache, rt::Tensor& longCosSinCache, RopeConfig const& config,
-    nlohmann::json const& modelConfig, cudaStream_t stream)
+bool initializeNopeCosSinCache(rt::Tensor& cosSinCache, cudaStream_t stream) noexcept
+{
+    if (cosSinCache.getShape().getNumDims() != 3 || cosSinCache.getDataType() != DataType::kFLOAT)
+    {
+        LOG_ERROR("NoRope CosSinCache should be float tensor with dimensions: [1, maxLength, rotaryDim].");
+        return false;
+    }
+
+    int64_t maxLength = cosSinCache.getShape()[1];
+    int64_t rotaryDim = cosSinCache.getShape()[2];
+    int64_t halfDim = rotaryDim / 2;
+
+    std::vector<float> hostBuf(static_cast<size_t>(maxLength * rotaryDim));
+    for (int64_t pos = 0; pos < maxLength; ++pos)
+    {
+        for (int64_t d = 0; d < halfDim; ++d)
+        {
+            hostBuf[pos * rotaryDim + d] = 1.0F;
+        }
+        for (int64_t d = halfDim; d < rotaryDim; ++d)
+        {
+            hostBuf[pos * rotaryDim + d] = 0.0F;
+        }
+    }
+
+    try
+    {
+        CUDA_CHECK(cudaMemcpyAsync(cosSinCache.dataPointer<float>(), hostBuf.data(), hostBuf.size() * sizeof(float),
+            cudaMemcpyHostToDevice, stream));
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("cudaMemcpyAsync for initializeNopeCosSinCache failed: %s", e.what());
+        return false;
+    }
+    return true;
+}
+
+bool initializeLongRopeCosSinCache(
+    rt::Tensor& shortCosSinCache, rt::Tensor& longCosSinCache, RopeConfig const& config, cudaStream_t stream)
 {
 
     if (config.type != RopeType::kLongRope)

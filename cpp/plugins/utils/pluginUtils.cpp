@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,24 @@
 
 #include "pluginUtils.h"
 #include "common/checkMacros.h"
+#include "common/logger.h"
 #include <memory>
+
+// Follow the TRT initLibNvInferPlugins(void*, char const*) convention:
+// the host application calls this after dlopen to pass its logger,
+// so plugin LOG_DEBUG messages respect the application's log level.
+extern "C" bool initEdgellmPlugins(void* logger, char const* /*libNamespace*/)
+{
+    if (logger)
+    {
+        auto* appLogger = dynamic_cast<trt_edgellm::logger::EdgeLLMLogger*>(static_cast<nvinfer1::ILogger*>(logger));
+        if (appLogger)
+        {
+            trt_edgellm::gLogger.setLevel(appLogger->getLevel());
+        }
+    }
+    return true;
+}
 
 using namespace nvinfer1;
 
@@ -25,6 +42,15 @@ namespace trt_edgellm
 {
 namespace plugins
 {
+
+void applyThorSMRenumberWAR(int32_t& smVersion)
+{
+    // Workaround for CUDA12/13 Thor re-numbering. The kernels themselves have version compatibility.
+    if (smVersion == 110)
+    {
+        smVersion = 101;
+    }
+}
 
 size_t alignTensorSize(size_t size)
 {

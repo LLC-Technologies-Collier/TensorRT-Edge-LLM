@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,15 +43,17 @@ public:
      * @param headSize Attention head dimension
      * @param smVersion CUDA compute capability (e.g., 89 for SM 8.9)
      * @param inputLayout Input tensor layout
+     * @throws std::runtime_error if a CUDA error occurs, or if the SM is not supported
      */
     ContextFMHARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t paddedSeqLen, int32_t numQHeads,
-        int32_t numKvHeads, int32_t headSize, int32_t smVersion, AttentionInputLayout inputLayout);
+        int32_t numKvHeads, int32_t headSize, int32_t smVersion, AttentionInputLayout inputLayout,
+        ContextAttentionMaskType maskType = ContextAttentionMaskType::CAUSAL, bool isSPadded = true);
 
     //! @brief Deleted default constructor
     ContextFMHARunner() = delete;
 
     //! @brief Destructor
-    ~ContextFMHARunner() = default;
+    ~ContextFMHARunner() noexcept = default;
 
     //! @brief Get required workspace size in bytes
     //! @return Workspace size
@@ -63,6 +65,7 @@ public:
      * Configures FMHA parameters. Device pointers must be set by caller.
      *
      * @param params FMHA parameter structure
+     * @throws std::runtime_error if input layout or alpha type is unsupported
      */
     void setupParams(FusedMultiheadAttentionParamsV2& params);
 
@@ -70,24 +73,29 @@ public:
      * @brief Dispatch FMHA kernel execution
      * @param params FMHA parameters with device pointers set
      * @param stream CUDA stream for kernel launch
+     * @throws std::runtime_error if device pointers are invalid, or a CUDA error happens
      */
     void dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& params, cudaStream_t const& stream);
 
     // Static methods to check kernel availability and load cubins into device.
     /*!
-     * @brief Check if FMHA can be implemented for given configuration
+     * @brief Check if FMHA can be implemented for given head size/layout/mask combination
      * @param headSize Attention head dimension
      * @param sm CUDA compute capability
      * @param dataType Data type
+     * @param inputLayout Input tensor layout
+     * @param maskType Attention mask type
      * @return True if implementation is available
      */
-    static bool canImplement(int32_t headSize, int32_t sm, nvinfer1::DataType dataType);
+    static bool canImplement(int32_t headSize, int32_t sm, nvinfer1::DataType dataType,
+        AttentionInputLayout inputLayout, ContextAttentionMaskType maskType) noexcept;
 
     /*!
      * @brief Load FMHA kernel cubins into device
      * @param sm CUDA compute capability
      * @param dataType Data type
      * @return True if successful
+     * @throws std::runtime_error if a CUDA driver error occurs
      */
     static bool loadContextFMHAKernels(int32_t sm, nvinfer1::DataType dataType);
 
@@ -98,8 +106,9 @@ private:
     int32_t mNumHeads;            //!< Number of query heads
     int32_t mNumKVHeads;          //!< Number of key-value heads
     int32_t mHeadSize;            //!< Attention head dimension
+    int32_t mSmVersion;           //!< CUDA compute capability
+    bool mIsSPadded;              //!< Whether input/output tensors are padded in S dimension
 
-    int32_t mSmVersion;         //!< CUDA compute capability
     LaunchParams mLaunchParams; //!< Kernel launch parameters
 };
 
