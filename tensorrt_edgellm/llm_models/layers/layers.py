@@ -22,6 +22,8 @@ from transformers.models.llama.modeling_llama import (LlamaAttention, LlamaMLP,
                                                       apply_rotary_pos_emb,
                                                       repeat_kv)
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2MLP
+from transformers.configuration_utils import PretrainedConfig
+
 from transformers.models.qwen3_moe.modeling_qwen3_moe import \
     Qwen3MoeSparseMoeBlock
 
