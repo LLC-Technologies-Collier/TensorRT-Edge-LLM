@@ -294,7 +294,9 @@ def symbolic_attention_plugin(
                                           outputs=2)
 
     q_sizes = _get_tensor_sizes(q)
-    attn_output_sizes = q_sizes[:-1] + [num_q_heads, head_size]
+    # query is (batch, seq, heads*head_dim)
+    # output is (batch, seq, num_q_heads, head_size)
+    attn_output_sizes = [q_sizes[0], q_sizes[1], num_q_heads, head_size]
     attn_output.setType(q_type.with_sizes(attn_output_sizes))
 
     # KV Cache output has the same shape as input past_key_value except for dimension 3 (sequence length)
@@ -352,6 +354,20 @@ def attention_plugin(
     position_ids: Optional[torch.Tensor] = None,
     k_v_scale_quant_orig: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # The plugin expects [batch, seq, hidden] for Q, K, V
+    if q.dim() == 3:
+        batch_size, seq_len, q_size = q.shape
+        batch_size_k, seq_len_k, k_size = k.shape
+        batch_size_v, seq_len_v, v_size = v.shape
+    else:
+        # Handle 4D if any
+        batch_size, seq_len, heads_q, dim_q = q.shape
+        q_size = heads_q * dim_q
+        batch_size_k, seq_len_k, heads_k, dim_k = k.shape
+        k_size = heads_k * dim_k
+        batch_size_v, seq_len_v, heads_v, dim_v = v.shape
+        v_size = heads_v * dim_v
+
     """
     Dummy TensorRT operation for attention computation, this is not used in the actual inference.
 
@@ -394,17 +410,12 @@ def attention_plugin(
         assert k_v_scale_quant_orig.numel(
         ) == 2, "k_v_scale_quant_orig must have 2 elements: [k_scale_quant_orig, v_scale_quant_orig]"
 
-    batch_size_q, seq_len_q, q_size = q.shape
-    batch_size_k, seq_len_k, k_size = k.shape
-    batch_size_v, seq_len_v, v_size = v.shape
     assert (
-        batch_size_q == batch_size_k == batch_size_v
-    ), f"batch_size of q/k/v should be equal. Got {batch_size_q}, {batch_size_k}, {batch_size_v}"
+        batch_size == batch_size_k == batch_size_v
+    ), f"batch_size of q/k/v should be equal. Got {batch_size}, {batch_size_k}, {batch_size_v}"
     assert (
-        seq_len_q == seq_len_k == seq_len_v
-    ), f"seq_len of q/k/v should be equal. Got {seq_len_q}, {seq_len_k}, {seq_len_v}"
-
-    batch_size, seq_len = batch_size_q, seq_len_q
+        seq_len == seq_len_k == seq_len_v
+    ), f"seq_len of q/k/v should be equal. Got {seq_len}, {seq_len_k}, {seq_len_v}"
 
     assert (
         q_size == head_size * num_q_heads

@@ -58,7 +58,8 @@ public:
      * initialization error
      */
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
-        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream,
+        bool enableCudaGraph = false);
 
     /*! \brief Destructor
      */
@@ -116,6 +117,14 @@ public:
             : mAudioRunner   ? mAudioRunner->getMultimodalMetrics()
                              : metrics::MultimodalMetrics{};
     }
+
+    LLMEngineRunner* getEngineRunner() const { return mLLMEngineRunner.get(); }
+    rt::Tensor const& getEmbeddingTable() const { return mEmbeddingTable; }
+    tokenizer::Tokenizer const& getTokenizer() const { return *mTokenizer; }
+
+    std::vector<int32_t> tokenize(std::string const& text, bool applyChatTemplate) const;
+    std::vector<int32_t> tokenize(LLMGenerationRequest::Request const& request, bool applyChatTemplate) const;
+    std::string decode(std::vector<int32_t> const& ids, bool skipSpecialTokens) const;
 
 private:
     /*! \brief Helper structure to hold token counting results

@@ -60,6 +60,7 @@ std::string formatRopeConfig(RopeConfig const& config)
 
 RopeConfig collectRopeConfig(nlohmann::json const& config)
 {
+    LOG_INFO("collectRopeConfig(): Start");
     RopeConfig ropeConfig{};
 
     // Check for explicit use_rope flag (set by hybrid model export)
@@ -75,7 +76,7 @@ RopeConfig collectRopeConfig(nlohmann::json const& config)
     }
 
     auto ropeScalingIt = config.find("rope_scaling");
-    if (ropeScalingIt != config.end())
+    if (ropeScalingIt != config.end() && ropeScalingIt->is_object())
     {
         auto ropeTypeIt = ropeScalingIt->find("type");
         if (ropeTypeIt == ropeScalingIt->end())

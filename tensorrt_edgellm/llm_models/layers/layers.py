@@ -28,7 +28,6 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import \
     Qwen3MoeSparseMoeBlock
 
 from .attention_plugin import attention_plugin
-from .attention_trt import EdgeLLMAttentionTRTNative
 from .layer_utils import EdgeLLMQKNorm, EdgeLLMQKVProj
 from .mamba_plugin import causal_conv1d_plugin, update_ssm_state_plugin
 
@@ -680,8 +679,16 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
                 self.torch_dtype)
             self.post_feedforward_layernorm = self.post_feedforward_layernorm.to(
                 self.torch_dtype)
+        # Robustly identify the attention module (linear_attn for Qwen3.5 MoE, self_attn for Llama/Qwen2)
+        attn_module = getattr(decoder_layer, "linear_attn", 
+                             getattr(decoder_layer, "self_attn", 
+                                    getattr(decoder_layer, "attn", None)))
+        if attn_module is None:
+            raise AttributeError(f"Could not find attention module in {type(decoder_layer)}")
+
+        from .attention_trt import EdgeLLMAttentionTRTNative
         self.self_attn = EdgeLLMAttentionTRTNative(
-            decoder_layer.self_attn, eagle3_draft=self.eagle3_draft)
+            attn_module, eagle3_draft=self.eagle3_draft)
 
     def _init_with_config(self, config: Any):
         # Construct new components from config (for draft models)
@@ -706,6 +713,7 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
             attention_module = LlamaAttention(config, self.layer_index)
             self.mlp = LlamaMLP(config)
 
+        from .attention_trt import EdgeLLMAttentionTRTNative
         self.self_attn = EdgeLLMAttentionTRTNative(
             attention_module, eagle3_draft=self.eagle3_draft)
 

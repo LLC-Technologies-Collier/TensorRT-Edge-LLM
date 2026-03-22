@@ -259,7 +259,8 @@ def is_qwen3_omni_submodel(model_name: str) -> bool:
 def create_dummy_inputs(model: nn.Module,
                         is_eagle_base: bool,
                         is_eagle_draft: bool,
-                        fp8_kv_cache: bool = False) -> Dict[str, Any]:
+                        fp8_kv_cache: bool = False,
+                        torch_dtype: torch.dtype = torch.float16) -> Dict[str, Any]:
     """
     Create dummy inputs for ONNX export.
     
@@ -268,17 +269,18 @@ def create_dummy_inputs(model: nn.Module,
         is_eagle_base: Whether this is an EAGLE base model
         is_eagle_draft: Whether this is an EAGLE draft model
         fp8_kv_cache: Whether to use FP8 KV cache
+        torch_dtype: The data type to use for floating point inputs
         
     Returns:
         dict: Dictionary containing dummy inputs
     """
     # Use hardcoded values
     batch_size = 1
-    seq_len = 2
-    past_len = 2
+    seq_len = 1
+    past_len = 0
 
     print(
-        f"Creating dummy inputs with batch_size={batch_size}, seq_len={seq_len}, past_len={past_len}"
+        f"Creating dummy inputs with batch_size={batch_size}, seq_len={seq_len}, past_len={past_len}, dtype={torch_dtype}"
     )
 
     # Get model configuration
@@ -306,19 +308,19 @@ def create_dummy_inputs(model: nn.Module,
     device = next(model.parameters()).device
 
     # Create dummy past key values
-    past_key_values = []
+    past_key_values_list = []
     for _ in range(num_layers):
-        # Only FP16 KV Cache is supported for now. More precision will be supported in the future.
+        # Match model dtype for KV cache
         past_key_value = torch.randn(batch_size,
                                      2,
                                      num_kv_heads,
                                      seq_len,
                                      head_dim,
-                                     dtype=torch.float16,
+                                     dtype=torch_dtype,
                                      device=device)
         if fp8_kv_cache:
             past_key_value = past_key_value.to(torch.float8_e4m3fn)
-        past_key_values.append(past_key_value)
+        past_key_values_list.append(past_key_value)
 
     # Create last_token_ids
     if not is_eagle_base and not is_eagle_draft:
@@ -347,21 +349,28 @@ def create_dummy_inputs(model: nn.Module,
                                  dtype=torch.int32,
                                  device=device)
 
-    # Base inputs that all models need
-    base_inputs = {
-        'past_key_values': tuple(past_key_values),
-        'last_token_ids': last_token_ids,
-        'rope_rotary_cos_sin': rope_rotary_cos_sin,
-        'context_lengths': context_lengths
-    }
+    # Create position_ids and attention_mask
+    # position_ids: [batch_size, seq_len]
+    position_ids = (torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0) + past_len).expand(batch_size, -1)
+    # attention_mask: [batch_size, 1, seq_len, seq_len + past_len]
+    attention_mask = torch.ones(batch_size, 1, seq_len, seq_len + past_len, dtype=torch.bool, device=device)
 
-    # Create input_embeds for all models instead of input_ids
+    # Base inputs that all models need
     inputs_embeds = torch.randn(batch_size,
                                 seq_len,
                                 hidden_size,
-                                dtype=torch.float16,
+                                dtype=torch_dtype,
                                 device=device)
-    base_inputs['inputs_embeds'] = inputs_embeds
+    base_inputs = {
+        'inputs_embeds': inputs_embeds,
+        'past_key_values': tuple(past_key_values_list),
+        'last_token_ids': last_token_ids,
+        'rope_rotary_cos_sin': rope_rotary_cos_sin,
+        'context_lengths': context_lengths,
+        'position_ids': position_ids,
+        'attention_mask_input': attention_mask,
+        'kvcache_start_index': torch.zeros(batch_size, dtype=torch.int32, device=device)
+    }
 
     # For Qwen3VL and Qwen3OmniThinker, add deepstack visual embeds
     if model_config.model_type in ["qwen3_vl_text", "qwen3_omni_text"]:
@@ -369,27 +378,10 @@ def create_dummy_inputs(model: nn.Module,
             torch.randn(batch_size,
                         seq_len,
                         hidden_size,
-                        dtype=torch.float16,
+                        dtype=torch_dtype,
                         device=device) for _ in range(3)
         ]
         base_inputs['deepstack_visual_embeds'] = deepstack_visual_embeds
-
-    # Create position_ids and attention_mask for all models
-    position_ids = torch.arange(seq_len, dtype=torch.int32,
-                                device=device).unsqueeze(0).expand(
-                                    batch_size, -1)
-    attention_mask = torch.ones(batch_size,
-                                seq_len,
-                                seq_len + past_len,
-                                dtype=torch.int32,
-                                device=device)
-    base_inputs['position_ids'] = position_ids
-    base_inputs['attention_mask'] = attention_mask
-
-    # kvcache_start_index is always required with shape [batch_size]
-    base_inputs['kvcache_start_index'] = torch.zeros(batch_size,
-                                                     dtype=torch.int32,
-                                                     device=device)
 
     # Add EAGLE-specific inputs
     if is_eagle_draft:
@@ -400,13 +392,13 @@ def create_dummy_inputs(model: nn.Module,
             batch_size,
             seq_len,
             target_hidden_size,
-            dtype=torch.float16,
+            dtype=torch_dtype,
             device=device)
         base_inputs['hidden_states_from_draft'] = torch.randn(
             batch_size,
             seq_len,
             hidden_size,
-            dtype=torch.float16,
+            dtype=torch_dtype,
             device=device)
 
     return base_inputs
@@ -435,8 +427,8 @@ def create_hybrid_dummy_inputs(
         model: EdgeLLMHybridModelForCausalLM) -> Dict[str, Any]:
     """Create dummy inputs for hybrid Mamba+Attention ONNX export."""
     batch_size = 1
-    seq_len = 2
-    past_len = 2
+    seq_len = 1
+    past_len = 0
 
     config = model.config
     hidden_size = config.hidden_size
@@ -595,7 +587,7 @@ def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
         },
     }
     for i in range(num_attn_layers):
-        dynamic_axes[f'past_key_values_{i}'] = {0: 'batch_size', 3: 'past_len'}
+        dynamic_axes[f'past_key_values_{i}'] = {0: 'batch_size', 3: 'q_len'}
         dynamic_axes[f'present_key_values_{i}'] = {
             0: 'batch_size',
             3: 'present_kv_cache_len'
@@ -650,8 +642,12 @@ def export_model_to_onnx_with_trt_native_ops(model, output_dir: str) -> None:
 def export_model_to_onnx(model: nn.Module,
                          output_dir: str,
                          is_eagle_base: bool,
-                         is_eagle_draft: bool,
-                         fp8_kv_cache: bool = False) -> None:
+                         output_hidden_states: bool,
+                         fp8_kv_cache: bool,
+                         is_eagle_draft: bool = False,
+                         dynamo: bool = False) -> None:
+    print(f"export_model_to_onnx: is_eagle_base={is_eagle_base}, is_eagle_draft={is_eagle_draft}, dynamo={dynamo}")
+
     """
     Export the model to ONNX format.
     
@@ -664,15 +660,22 @@ def export_model_to_onnx(model: nn.Module,
     """
     print(f"Exporting model to ONNX format: {output_dir}")
 
+    # Infer torch_dtype from model parameters
+    try:
+        torch_dtype = next(model.parameters()).dtype
+    except StopIteration:
+        torch_dtype = torch.float16
+
     dummy_inputs = create_dummy_inputs(model, is_eagle_base, is_eagle_draft,
-                                       fp8_kv_cache)
+                                       fp8_kv_cache, torch_dtype=torch_dtype)
 
     # Auto-detect if model should export hidden_states output
+    # - Explicitly requested via output_hidden_states
     # - EAGLE base: needs hidden_states for draft model input
     # - EAGLE draft: needs hidden_states for speculative decoding verification
     # - Qwen3-Omni Thinker: always export hidden_states (runtime decides whether to use it)
     model_type = getattr(model.config, 'model_type', '')
-    needs_hidden_states = is_eagle_base or is_eagle_draft or (
+    needs_hidden_states = output_hidden_states or is_eagle_base or is_eagle_draft or (
         model_type == "qwen3_omni_text")
 
     try:
@@ -684,37 +687,27 @@ def export_model_to_onnx(model: nn.Module,
         if model_config.model_type in ["qwen3_omni_thinker", "qwen3_asr"]:
             model_config = model_config.text_config
         num_layers = model_config.num_hidden_layers
+        require_deepstack_embeds = model_config.model_type in [
+            "qwen3_vl_text", "qwen3_omni_text"
+        ]
 
         # Prepare inputs - order must match model forward signature
         # For LLM: inputs_embeds, past_key_values, rope_rotary_cos_sin, context_lengths, last_token_ids, kvcache_start_index, position_ids, attention_mask, deepstack_visual_embeds
         # For Draft: inputs_embeds, past_key_values, rope_rotary_cos_sin, context_lengths, last_token_ids, kvcache_start_index, hidden_states_from_base, hidden_states_from_draft, position_ids, attention_mask
 
-        base_inputs = [
-            dummy_inputs['inputs_embeds'],
-            dummy_inputs['past_key_values'],
+        base_inputs = [dummy_inputs['inputs_embeds']]
+        # Add KV caches as individual 5D tensors: (KV0, KV1, ...)
+        base_inputs.extend(list(dummy_inputs['past_key_values']))
+        
+        base_inputs.extend([
             dummy_inputs['rope_rotary_cos_sin'],
             dummy_inputs['context_lengths'],
             dummy_inputs['last_token_ids'],
             dummy_inputs['kvcache_start_index'],
-        ]
+            dummy_inputs['position_ids'],
+            dummy_inputs['attention_mask_input'],
+        ])
 
-        if is_eagle_draft:
-            base_inputs.extend([
-                dummy_inputs['hidden_states_from_base'],
-                dummy_inputs['hidden_states_from_draft'],
-                dummy_inputs['position_ids'], dummy_inputs['attention_mask']
-            ])
-        elif is_eagle_base:
-            base_inputs.extend(
-                [dummy_inputs['position_ids'], dummy_inputs['attention_mask']])
-        else:
-            # Standard models pass None for position_ids and attention_mask
-            base_inputs.extend([None, None])
-
-        # For Qwen3VL and Qwen3Omni Thinker, add deepstack visual embeds
-        require_deepstack_embeds = model_config.model_type in [
-            "qwen3_vl_text", "qwen3_omni_text"
-        ]
         if require_deepstack_embeds:
             base_inputs.extend([dummy_inputs['deepstack_visual_embeds']])
 
@@ -730,10 +723,10 @@ def export_model_to_onnx(model: nn.Module,
         if is_eagle_draft:
             input_names += [
                 'hidden_states_input', 'hidden_states_from_draft',
-                'attention_pos_id', 'attention_mask'
+                'attention_pos_id', 'attention_mask_input'
             ]
         elif is_eagle_base:
-            input_names += ['attention_pos_id', 'attention_mask']
+            input_names += ['attention_pos_id', 'attention_mask_input']
 
         if require_deepstack_embeds:
             input_names += [f'deepstack_embeds_{i}' for i in range(3)]
@@ -753,14 +746,14 @@ def export_model_to_onnx(model: nn.Module,
             **{
                 f"past_key_values_{i}": {
                     0: "batch_size",
-                    3: "past_len"
+                    3: "q_len"
                 }
                 for i in range(num_layers)
             },
             **{
                 f"present_key_values_{i}": {
                     0: "batch_size",
-                    3: "present_kv_cache_len"
+                    3: "q_len_total"
                 }
                 for i in range(num_layers)
             },
@@ -785,11 +778,9 @@ def export_model_to_onnx(model: nn.Module,
                 0: "kv_cache_start_batch_size"
             },
             "logits": {
-                0:
-                "batch_size",
-                1:
-                "num_selected_tokens" if
-                (is_eagle_base or is_eagle_draft) else "num_tokens"
+                0: "batch_size",
+                1: "q_len",
+                2: "vocab_size"
             },
         }
 
@@ -797,11 +788,11 @@ def export_model_to_onnx(model: nn.Module,
             dynamic_axes.update({
                 "hidden_states_input": {
                     0: "batch_size",
-                    1: "seq_len"
+                    1: "q_len"
                 },
                 "hidden_states_from_draft": {
                     0: "batch_size",
-                    1: "seq_len"
+                    1: "q_len"
                 },
             })
 
@@ -810,7 +801,8 @@ def export_model_to_onnx(model: nn.Module,
             dynamic_axes.update({
                 "hidden_states": {
                     0: "batch_size",
-                    1: "seq_len"
+                    1: "q_len",
+                    2: "hidden_size"
                 },
             })
 
@@ -819,11 +811,6 @@ def export_model_to_onnx(model: nn.Module,
                 "attention_pos_id": {
                     0: "batch_size",
                     1: "q_len"
-                },
-                "attention_mask": {
-                    0: "batch_size",
-                    1: "q_len",
-                    2: "q_len_padded"
                 },
             })
 
@@ -844,7 +831,7 @@ def export_model_to_onnx(model: nn.Module,
 
         # Export to ONNX
         export_onnx(model, inputs, output_dir, input_names, output_names,
-                    dynamic_axes)
+                    dynamic_axes, dynamo=dynamo)
 
     except Exception as e:
         raise RuntimeError(f"Failed to export model to ONNX: {str(e)}")
@@ -853,12 +840,15 @@ def export_model_to_onnx(model: nn.Module,
 def export_llm_model(model_dir: str,
                      output_dir: str,
                      device: str = "cuda",
+                     dtype: str = "fp16",
+                     dynamo: bool = False,
                      is_eagle_base: bool = False,
                      reduced_vocab_dir: Optional[str] = None,
                      chat_template_path: Optional[str] = None,
                      fp8_kv_cache: bool = False,
                      trt_native_ops: bool = False,
-                     export_models: Optional[str] = None) -> None:
+                     export_models: Optional[str] = None,
+                     output_hidden_states: bool = False) -> None:
     """
     Export a language model to ONNX format with custom attention plugin.
     
@@ -890,7 +880,9 @@ def export_llm_model(model_dir: str,
         print(f"Exporting standard model to ONNX format")
 
     # Create output directory
+    print(f"DEBUG: Creating output directory at {output_dir}...")
     os.makedirs(output_dir, exist_ok=True)
+    print("DEBUG: Output directory created.")
 
     # Load reduced vocabulary map if provided
     reduced_vocab_size = None
@@ -902,14 +894,23 @@ def export_llm_model(model_dir: str,
 
     # Load model(s)
     # Always returns dict for uniform processing: {"model_name": model, ...}
+    print("DEBUG: Loading LLM model...")
+    # For large MoE models, we force trt_native_ops=True to bypass jit.trace fragility
+    is_large_moe = "122b" in model_dir.lower() or "moe" in model_dir.lower()
+    if is_large_moe:
+        print("DEBUG: Large MoE model detected, forcing trt_native_ops=True for stable export")
+        trt_native_ops = True
+
     models_or_dict, tokenizer, processor = load_llm_model(
         model_dir,
-        dtype='fp16',
+        dtype=dtype,
         device=device,
         is_eagle_base=is_eagle_base,
         reduced_vocab_size=reduced_vocab_size,
         vocab_map=vocab_map,
-        trt_native_ops=trt_native_ops)
+        trt_native_ops=trt_native_ops,
+        output_hidden_states=output_hidden_states)
+    print("DEBUG: LLM model loaded successfully.")
 
     # Normalize to dict (single model wrapped as {"model": model})
     models_dict = models_or_dict if isinstance(models_or_dict, dict) else {
@@ -933,12 +934,17 @@ def export_llm_model(model_dir: str,
             print(
                 "Detected MoE model, replacing MoE blocks with Int4MoePlugin")
             register_int4_moe_plugin_onnx_symbolic_functions()
+            print("DEBUG: Calling replace_moe_blocks_with_plugin...")
             model = replace_moe_blocks_with_plugin(model)
+            print("DEBUG: MoE blocks replaced.")
 
         # Step 1: Apply model modifications
+        print("DEBUG: Calling replace_torch_quant_linear_with_int4_plugin...")
         model = replace_torch_quant_linear_with_int4_plugin(model)
+        print("DEBUG: Linear layers replaced.")
 
         # Step 2: Export ONNX
+        print(f"DEBUG: Starting ONNX export for {model_name}...")
         if trt_native_ops:
             export_model_to_onnx_with_trt_native_ops(model, model_output_dir)
         elif isinstance(model, EdgeLLMHybridModelForCausalLM):
@@ -949,8 +955,9 @@ def export_llm_model(model_dir: str,
             export_qwen3_omni_submodel_to_onnx(model, dummy_inputs,
                                                model_output_dir, model_name)
         else:
-            export_model_to_onnx(model, model_output_dir, is_eagle_base, False,
-                                 fp8_kv_cache)
+            export_model_to_onnx(model, model_output_dir, is_eagle_base,
+                                 output_hidden_states, fp8_kv_cache,
+                                 dynamo=dynamo)
 
         # Step 3: Export config
         if isinstance(model, EdgeLLMHybridModelForCausalLM):
@@ -1089,8 +1096,9 @@ def export_draft_model(draft_model_dir: str,
         export_model_to_onnx(draft_model,
                              output_dir,
                              is_eagle_base=False,
-                             is_eagle_draft=True,
-                             fp8_kv_cache=False)
+                             output_hidden_states=False,
+                             fp8_kv_cache=False,
+                             is_eagle_draft=True)
 
     # Save draft model configuration
     draft_config = export_llm_config(draft_model.config, 'eagle_draft',

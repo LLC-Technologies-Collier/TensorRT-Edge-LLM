@@ -163,8 +163,12 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     , mEnableFp8KVCache(enableFp8KVCache)
     , mSlidingWindowSize(slidingWindowSize)
 {
+    mDataType = nvinfer1::DataType::kHALF;
     mSMVersion = getSMVersion();
-    applyThorSMRenumberWAR(mSMVersion);
+    if (mSMVersion == 110) mSMVersion = 101;
+    else if (mSMVersion >= 100) mSMVersion = 89;
+
+
 
     LOG_DEBUG("AttentionPlugin FMHA path: %s, sliding_window: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2",
         mSlidingWindowSize > 0 ? std::to_string(mSlidingWindowSize).c_str() : "disabled");
@@ -231,9 +235,21 @@ AttentionPlugin::AttentionPlugin(std::string const& name, std::byte const* data,
     deserializeValue(&data, &length, &mEnableTreeAttention);
     deserializeValue(&data, &length, &mEnableFp8KVCache);
     deserializeValue(&data, &length, &mSlidingWindowSize);
+    
+    // mDataType is initialized to kHALF in the header or should be set here
+    mDataType = nvinfer1::DataType::kHALF;
+
+#ifdef CUTE_DSL_FMHA_ENABLED
+    mUseCuteDslFMHA = !std::getenv("DISABLE_CUTE_DSL_FMHA");
+#else
+    mUseCuteDslFMHA = false;
+#endif
 
     mSMVersion = getSMVersion();
-    applyThorSMRenumberWAR(mSMVersion);
+    if (mSMVersion == 110) mSMVersion = 101;
+    else if (mSMVersion >= 100) mSMVersion = 89;
+
+
 
     LOG_DEBUG("AttentionPlugin FMHA path: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2");
 
@@ -268,6 +284,7 @@ IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
     AttentionPlugin* plugin = new AttentionPlugin(
         mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention, mEnableFp8KVCache, mSlidingWindowSize);
+    plugin->mDataType = mDataType;
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -542,11 +559,11 @@ DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::Di
     return output;
 }
 
-void AttentionPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* in,
-    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out,
-    [[maybe_unused]] int32_t nbOutputs) noexcept
+void AttentionPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in,
+    int32_t nbInputs, nvinfer1::DynamicPluginTensorDesc const* out,
+    int32_t nbOutputs) noexcept
 {
-    return; // No need to configure anything since we will only use the runtime tensor shapes.
+    mDataType = in[kIN_Q_IDX].desc.type;
 }
 
 // TODO: extend the workspace calculation to a more generalized form.

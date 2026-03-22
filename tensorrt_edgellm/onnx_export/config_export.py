@@ -31,8 +31,12 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     required_fields = [
         "vocab_size", "max_position_embeddings", "hidden_size",
         "intermediate_size", "num_hidden_layers", "num_attention_heads",
-        "num_key_value_heads", "rope_theta", "rope_scaling"
+        "num_key_value_heads"
     ]
+    optional_fields_with_defaults = {
+        "rope_theta": 10000.0,
+        "rope_scaling": None,
+    }
 
     llm_config = {}
     for field in required_fields:
@@ -40,8 +44,11 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
             raise KeyError(f"Required field '{field}' not found in config")
         llm_config[field] = config_dict[field]
 
-    # Handle LongRoPE (rope_scaling already validated in required_fields)
-    rope_scaling = config_dict["rope_scaling"]
+    for field, default in optional_fields_with_defaults.items():
+        llm_config[field] = config_dict.get(field, default)
+
+    # Handle LongRoPE
+    rope_scaling = llm_config["rope_scaling"]
     if rope_scaling and rope_scaling.get("type", None) == "longrope":
         if "original_max_position_embeddings" not in config_dict:
             raise KeyError(

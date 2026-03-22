@@ -22,6 +22,7 @@
 #include "runtime/imageUtils.h"
 
 #include <cstdint>
+#include <functional>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
@@ -93,6 +94,9 @@ struct LLMGenerationRequest
     bool enableThinking{false};
     // Always disable speculative decoding for this request even if Eagle Draft engine is loaded.
     bool disableSpecDecode{false};
+
+    uint64_t randomSeed{0};
+    std::function<void(int32_t, int32_t)> tokenCallback{nullptr};
 };
 
 /*! \brief LLM Generation Response structure

@@ -69,7 +69,31 @@ struct SourceLocation
 class EdgeLLMLogger : public nvinfer1::ILogger
 {
 public:
-    EdgeLLMLogger() noexcept = default;
+    EdgeLLMLogger() noexcept
+    {
+        char const* envLevel = std::getenv("EDGELLM_LOG_LEVEL");
+        if (envLevel)
+        {
+            std::string level(envLevel);
+            if (level == "VERBOSE" || level == "DEBUG")
+            {
+                mMinLevel = nvinfer1::ILogger::Severity::kVERBOSE;
+            }
+            else if (level == "INFO")
+            {
+                mMinLevel = nvinfer1::ILogger::Severity::kINFO;
+            }
+            else if (level == "WARNING")
+            {
+                mMinLevel = nvinfer1::ILogger::Severity::kWARNING;
+            }
+            else if (level == "ERROR")
+            {
+                mMinLevel = nvinfer1::ILogger::Severity::kERROR;
+            }
+        }
+        fprintf(stderr, "[EdgeLLMLogger] Initialized with level: %d\n", (int)mMinLevel);
+    }
     ~EdgeLLMLogger() noexcept = default;
 
     /*!
@@ -106,8 +130,8 @@ public:
 
         // Format and output the message
         std::string formattedMsg = formatLogEntry(level, msg, loc);
-        std::ostream& stream = (level <= nvinfer1::ILogger::Severity::kWARNING) ? std::cerr : std::cout;
-        stream << formattedMsg << std::endl;
+        // Ensure it's flushed immediately
+        std::cerr << formattedMsg << std::endl << std::flush;
     }
 
     /*!

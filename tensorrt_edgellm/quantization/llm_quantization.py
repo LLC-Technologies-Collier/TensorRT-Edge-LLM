@@ -274,6 +274,7 @@ def quantize_llm(
     quantization: Optional[str],
     lm_head_quantization: Optional[str],
     kv_cache_quantization: Optional[str],
+    calib_size: int = 512,
 ) -> Union[AutoModelForCausalLM, AutoModelForImageTextToText]:
     """
     Quantize a language model using the specified quantization method.
@@ -284,6 +285,7 @@ def quantize_llm(
         quantization: Quantization method ("fp8", "int4_awq", "nvfp4")
         dataset_dir: Dataset for calibration
         lm_head_quantization: Optional LM head quantization method
+        calib_size: Number of samples to use for calibration
         
     Returns:
         Quantized model
@@ -307,8 +309,8 @@ def quantize_llm(
     data_loader = get_llm_calib_dataloader(tokenizer=tokenizer,
                                            dataset_dir=dataset_dir,
                                            batch_size=batch_size,
-                                           num_samples=512,
-                                           max_length=512)
+                                           num_samples=calib_size,
+                                           max_length=128)
     quant_config = get_llm_quant_config(quantization, lm_head_quantization,
                                         kv_cache_quantization)
     model = quantize_model(model, quant_config, data_loader)
@@ -402,7 +404,8 @@ def quantize_and_save_llm(model_dir: str,
                           dataset_dir: str = "cnn_dailymail",
                           lm_head_quantization: Optional[str] = None,
                           kv_cache_quantization: Optional[str] = None,
-                          device: str = "cuda") -> None:
+                          device: str = "cuda",
+                          calib_size: int = 512) -> None:
     """
     Load a model, quantize it if specified, and save the result.
     
@@ -416,7 +419,9 @@ def quantize_and_save_llm(model_dir: str,
         dtype: Model data type for loading ("fp16")
         dataset_dir: Dataset name or path for calibration data
         lm_head_quantization: Optional separate quantization for language model head (only "fp8", "nvfp4", and "mxfp8" are currently supported)
+        kv_cache_quantization: Optional separate quantization for KV cache
         device: Device to use for model loading and quantization ("cuda", "cpu")
+        calib_size: Number of samples to use for calibration
         
     Raises:
         ValueError: If model loading fails or quantization parameters are invalid
@@ -429,7 +434,8 @@ def quantize_and_save_llm(model_dir: str,
         print(f"Model is already quantized, skipping quantization.")
     else:
         model = quantize_llm(model, tokenizer, dataset_dir, quantization,
-                             lm_head_quantization, kv_cache_quantization)
+                             lm_head_quantization, kv_cache_quantization,
+                             calib_size=calib_size)
 
     quant_end_time = time.time()
     print(f"Quantization finished in {quant_end_time - start_time}s.")
@@ -439,7 +445,7 @@ def quantize_and_save_llm(model_dir: str,
 
     _sanitize_generation_config(model)
     with torch.inference_mode():
-        model.save_pretrained(output_dir)
+        model.save_pretrained(output_dir, safe_serialization=False)
     tokenizer.save_pretrained(output_dir)
     if processor is not None:
         processor.save_pretrained(output_dir)
@@ -508,7 +514,8 @@ def quantize_and_save_draft(
 
     _sanitize_generation_config(draft_model)
     with torch.inference_mode():
-        draft_model.save_pretrained(output_dir)
+        # Set safe_serialization=False to support MoE models with shared tensors
+        draft_model.save_pretrained(output_dir, safe_serialization=False)
 
     # Save the quant config
     quant_config = get_quant_config(draft_model)

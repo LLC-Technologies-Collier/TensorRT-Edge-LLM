@@ -88,6 +88,7 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
     std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
     EagleDraftingConfig const& draftingConfig, cudaStream_t stream)
 {
+    LOG_INFO("LLMInferenceSpecDecodeRuntime(): Start");
     mDraftingConfig = draftingConfig;
 
     // Load shared embedding table from embedding.safetensors (shared between base and draft models)

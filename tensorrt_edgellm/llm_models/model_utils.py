@@ -35,6 +35,7 @@ from transformers import (AutoConfig, AutoModelForCausalLM,
                           AutoModelForImageTextToText, AutoProcessor,
                           AutoTokenizer, PreTrainedModel)
 
+from accelerate.hooks import remove_hook_from_module
 from .models.eagle3_draft import Eagle3DraftModel
 
 
@@ -55,6 +56,33 @@ def is_mxfp8_linear(module: nn.Module) -> bool:
     if is_quantized_linear(module):
         return module.input_quantizer.block_sizes is not None and module.input_quantizer.block_sizes.get(
             "scale_bits", None) == (8, 0)
+    return False
+
+
+def is_int4_awq_quantized(model: nn.Module) -> bool:
+    """Check if the model is INT4 AWQ quantized."""
+    from modelopt.torch.quantization.utils import is_quantized_linear
+    for module in model.modules():
+        if is_quantized_linear(module):
+            if hasattr(module, "input_quantizer") and hasattr(module.input_quantizer, "num_bits"):
+                if module.input_quantizer.num_bits == 4:
+                    return True
+    return False
+
+
+def is_nvfp4_quantized(model: nn.Module) -> bool:
+    """Check if the model is NVFP4 quantized."""
+    for module in model.modules():
+        if is_nvfp4_linear(module):
+            return True
+    return False
+
+
+def is_mxfp8_quantized(model: nn.Module) -> bool:
+    """Check if the model is MXFP8 quantized."""
+    for module in model.modules():
+        if is_mxfp8_linear(module):
+            return True
     return False
 
 
@@ -372,6 +400,8 @@ def load_hf_model(
     # Convert dtype string to torch dtype
     if dtype == "fp16":
         torch_dtype = torch.float16
+    elif dtype == "bf16":
+        torch_dtype = torch.bfloat16
     else:
         raise ValueError(f"Unsupported dtype: {dtype}")
     device = torch.device(device)
@@ -435,9 +465,31 @@ def load_hf_model(
     else:
         # Try loading as AutoModelForCausalLM first
         try:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_dir, torch_dtype=torch_dtype,
-                trust_remote_code=True).to(device)
+            # Use device_map="auto" for CUDA to support massive models (e.g. 122B MoE)
+            # which cannot fit in host RAM if loaded on CPU first.
+            model_kwargs = {
+                "torch_dtype": torch_dtype,
+                "low_cpu_mem_usage": True,
+                "trust_remote_code": True,
+            }
+            if device.type == "cuda":
+                print(f"Using device_map='sequential' for {device}")
+                model_kwargs["device_map"] = "sequential"
+                # MoE models require explicit offload folder when using device_map='auto'
+                offload_dir = "/tmp/qwen_offload"
+                print(f"DEBUG: Creating local offload folder at {offload_dir}...")
+                os.makedirs(offload_dir, exist_ok=True)
+                print(f"DEBUG: Offload folder created successfully.")
+                model_kwargs["offload_folder"] = offload_dir
+                model_kwargs["ignore_mismatched_sizes"] = True
+                
+                # Limit memory to avoid OOM on 128GB node
+                # Force almost everything to Disk by setting very small max_memory
+                model_kwargs["max_memory"] = {0: "10GiB", "cpu": "10GiB"}
+            else:
+                model_kwargs["device_map"] = "cpu"
+
+            model = AutoModelForCausalLM.from_pretrained(model_dir, **model_kwargs)
         except Exception as e_causal:
             print(f"AutoModelForCausalLM failed: {e_causal}")
             # If that fails, try AutoModelForImageTextToText
@@ -451,7 +503,14 @@ def load_hf_model(
                 raise ValueError(
                     f"Could not load model from {model_dir}. Error: {e}")
     if not is_gptq_model(model):
-        model.to(torch_dtype)
+        # from_pretrained with device_map already handles the dtype and device.
+        # Calling .to() on offloaded models will raise RuntimeError from accelerate.
+        try:
+            print("DEBUG: Attempting model.to(torch_dtype)...")
+            model.to(torch_dtype)
+            print("DEBUG: model.to() successful.")
+        except Exception as e:
+            print(f"DEBUG: model.to() skipped or failed: {e}")
 
     # Set tokenizer padding token if needed
     if tokenizer.pad_token != "<unk>":
@@ -475,6 +534,75 @@ def load_hf_model(
         # Processor not available for this model
         pass
 
+    # Ensure model is in eval mode and no gradients
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # 1. Strip accelerate hooks BEFORE moving any tensors.
+    # This is critical as the hooks often block moves or call .data_ptr().
+    print("DEBUG: Stripping accelerate hooks for export compatibility...")
+    remove_hook_from_module(model, recurse=True)
+
+    # 2. Targeted move of non-meta tensors to target device and dtype.
+    # We do this manually because model.to() fails on offloaded/meta models.
+    print(f"DEBUG: Exhaustive targeted move of non-meta tensors to {device} ({torch_dtype})...")
+    for m_name, m in model.named_modules():
+        # Move registered buffers
+        for b_name, b in m.named_buffers(recurse=False):
+            if b.device.type != 'meta' and b.device.type != device:
+                try:
+                    m._buffers[b_name] = b.to(device=device, dtype=torch_dtype)
+                except Exception as e:
+                    print(f"DEBUG: Failed to move buffer {m_name}.{b_name}: {e}")
+        
+        # Move registered parameters
+        for p_name, p in m.named_parameters(recurse=False):
+            if p.device.type != 'meta' and p.device.type != device:
+                try:
+                    # We must preserve the Parameter wrapper
+                    new_p = nn.Parameter(p.to(device=device, dtype=torch_dtype), requires_grad=False)
+                    setattr(m, p_name, new_p)
+                except Exception as e:
+                    print(f"DEBUG: Failed to move parameter {m_name}.{p_name}: {e}")
+        
+        # Move ModelOpt specific hidden/scalar attributes
+        for obj in [m] + ([m.input_quantizer] if hasattr(m, "input_quantizer") else []) \
+                       + ([m.weight_quantizer] if hasattr(m, "weight_quantizer") else []) \
+                       + ([m.output_quantizer] if hasattr(m, "output_quantizer") else []):
+            for attr_name in dir(obj):
+                if attr_name.startswith('__'): continue
+                try:
+                    attr_val = getattr(obj, attr_name)
+                    if torch.is_tensor(attr_val):
+                        if attr_val.device.type != 'meta' and attr_val.device.type != device:
+                            setattr(obj, attr_name, attr_val.to(device=device, dtype=torch_dtype))
+                except Exception:
+                    pass
+            # Explicitly check for ModelOpt specific names if dir() missed them
+            for hidden_attr in ["calibrated_amax", "learned_amax", "amax", "_amax"]:
+                if hasattr(obj, hidden_attr):
+                    try:
+                        val = getattr(obj, hidden_attr)
+                        if torch.is_tensor(val) and val.device.type != 'meta' and val.device.type != device:
+                            setattr(obj, hidden_attr, val.to(device=device, dtype=torch_dtype))
+                    except Exception:
+                        pass
+
+    # 3. Set dynamic quantization AFTER moving everything to CUDA.
+    # This ensures that any attributes added by set_dynamic_quant are also on CUDA.
+    print(f"DEBUG: Setting dynamic quantization for {dtype}...")
+    set_dynamic_quant(model, dtype)
+
+    # 4. Final model.to() call to catch any remaining edge cases.
+    # Now that hooks are stripped and meta tensors are skipped in targeted moves,
+    # this call should be safe and catch everything.
+    print(f"DEBUG: Final model.to({device}, {torch_dtype}) call...")
+    try:
+        model.to(device=device, dtype=torch_dtype)
+    except Exception as e:
+        print(f"DEBUG: Final model.to() skipped: {e}")
+
     return model, tokenizer, processor
 
 
@@ -485,7 +613,8 @@ def load_llm_model(
     is_eagle_base: bool,
     reduced_vocab_size: Optional[int] = None,
     vocab_map: Optional[torch.Tensor] = None,
-    trt_native_ops: bool = False
+    trt_native_ops: bool = False,
+    output_hidden_states: bool = False
 ) -> tuple[nn.Module, AutoTokenizer, Optional[AutoProcessor]]:
     """
     Load a language model (standard or EAGLE base).
@@ -513,7 +642,6 @@ def load_llm_model(
         print(f"Loading standard model from {model_dir}")
 
     model, tokenizer, processor = load_hf_model(model_dir, dtype, device)
-    set_dynamic_quant(model, dtype)
 
     # Create EdgeLLMModel wrappers based on model type
     if _is_qwen3_tts_model(model_dir):
@@ -535,7 +663,8 @@ def load_llm_model(
         if not trt_native_ops:
             edge_model = {}
             edge_model["thinker"] = EdgeLLMModelForCausalLM(
-                hf_model, is_eagle_base, reduced_vocab_size, vocab_map)
+                hf_model, is_eagle_base, reduced_vocab_size, vocab_map,
+                output_hidden_states)
 
             if hasattr(model, 'has_talker') and model.has_talker:
                 from .models.qwen3_omni_talker import (
@@ -564,7 +693,8 @@ def load_llm_model(
         elif not trt_native_ops:
             edge_model = {}
             edge_model["model"] = EdgeLLMModelForCausalLM(
-                hf_model, is_eagle_base, reduced_vocab_size, vocab_map)
+                hf_model, is_eagle_base, reduced_vocab_size, vocab_map,
+                output_hidden_states)
         else:
             edge_model = EdgeLLMModelTRTNative(hf_model, is_eagle_base,
                                                reduced_vocab_size, vocab_map)
@@ -599,6 +729,8 @@ def load_eagle3_draft_model(draft_model_dir: str,
     # Convert dtype string to torch dtype
     if dtype == "fp16":
         torch_dtype = torch.float16
+    elif dtype == "bf16":
+        torch_dtype = torch.bfloat16
     else:
         raise ValueError(f"Unsupported dtype: {dtype}")
 

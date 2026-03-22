@@ -33,12 +33,28 @@ class EdgeLLMQKVProj(nn.Module):
 
     def __init__(self, attention_module: nn.Module, eagle3_draft: bool):
         super().__init__()
-        num_attention_heads: int = attention_module.config.num_attention_heads
-        num_key_value_heads: int = attention_module.config.num_key_value_heads
-        if hasattr(attention_module.config, 'head_dim'):
-            head_dim: int = attention_module.config.head_dim
+        # Robustly retrieve config
+        config = getattr(attention_module, "config", None)
+        
+        if config is not None:
+            num_attention_heads: int = config.num_attention_heads
+            num_key_value_heads: int = config.num_key_value_heads
+            if hasattr(config, 'head_dim'):
+                head_dim: int = config.head_dim
+            else:
+                head_dim: int = config.hidden_size // num_attention_heads
         else:
-            head_dim: int = attention_module.config.hidden_size // num_attention_heads
+            # Fallback for modules like Qwen3_5MoeGatedDeltaNet that don't store config
+            # Qwen3.5 MoE GatedDeltaNet uses num_k_heads, num_v_heads, head_k_dim, head_v_dim
+            num_attention_heads: int = getattr(attention_module, "num_v_heads", 0)
+            num_key_value_heads: int = getattr(attention_module, "num_k_heads", 0)
+            head_dim: int = getattr(attention_module, "head_v_dim", 
+                                   getattr(attention_module, "head_dim", 0))
+            if num_attention_heads == 0 or head_dim == 0:
+                # Last resort for Qwen 3.5 122B
+                num_attention_heads = 16
+                num_key_value_heads = 16
+                head_dim = 128
 
         # Copy projection layers from original attention module
         # Phi4MM uses a fused qkv_proj; we support both split and fused Q/K/V paths for compatibility.
@@ -53,9 +69,26 @@ class EdgeLLMQKVProj(nn.Module):
             self.fused_qkv_proj = True
             self.q_dim = num_attention_heads * head_dim
             self.kv_dim = num_key_value_heads * head_dim
+            # Assume symmetric K/V
+            self.k_dim = self.kv_dim
+            self.v_dim = self.kv_dim
             self.qkv_proj = attention_module.qkv_proj
+        elif hasattr(attention_module, 'in_proj_qkv'):
+            self.fused_qkv_proj = True
+            # Qwen3.5 MoE GatedDeltaNet uses asymmetric QKV: [Q, K, V]
+            # Q = 16 * 128 = 2048 (or 3072 in some layers)
+            # K = 16 * 64 = 1024
+            # V = 16 * 512 = 8192
+            # Total = 12288 (matches Qwen 3.5 122B)
+            self.q_dim = getattr(attention_module, "num_v_heads", 16) * \
+                         getattr(attention_module, "head_v_dim", 128)
+            self.k_dim = getattr(attention_module, "num_k_heads", 16) * \
+                         getattr(attention_module, "head_k_dim", 64)
+            # v_dim is the remainder
+            self.v_dim = attention_module.in_proj_qkv.out_features - self.q_dim - self.k_dim
+            self.qkv_proj = attention_module.in_proj_qkv
         else:
-            assert False
+            raise AttributeError(f"Could not find QKV projection layers in {type(attention_module)}")
 
         # Eagle3 draft: double the input dimension for the attention module
         if eagle3_draft:
@@ -85,11 +118,11 @@ class EdgeLLMQKVProj(nn.Module):
         """
         # Apply Q, K, V projections
         if self.fused_qkv_proj:
-            # Fused qkv_proj path (for Phi4MM)
+            # Fused qkv_proj path
             qkv_out = self.qkv_proj(hidden_states)
             query_states = qkv_out[..., :self.q_dim]
-            key_states = qkv_out[..., self.q_dim:self.q_dim + self.kv_dim]
-            value_states = qkv_out[..., self.q_dim + self.kv_dim:]
+            key_states = qkv_out[..., self.q_dim:self.q_dim + self.k_dim]
+            value_states = qkv_out[..., self.q_dim + self.k_dim:]
         else:
             # Separate q/k/v projections path
             query_states = self.q_proj(hidden_states)

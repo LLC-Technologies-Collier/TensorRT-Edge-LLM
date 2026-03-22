@@ -105,7 +105,7 @@ static constexpr int32_t kGENERATION_PROFILE_INDEX{1};
 LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
 {
-
+    LOG_INFO("LLMEngineRunner(): Start");
     LOG_INFO("Loading config file %s", configPath.string().c_str());
 
     // Parse configuration from JSON file
@@ -116,9 +116,12 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         LOG_ERROR("Failed to open config file: %s", configPath.string().c_str());
         throw std::runtime_error("Failed to open config file: " + configPath.string());
     }
+    LOG_INFO("Config file opened successfully.");
     try
     {
+        LOG_INFO("Parsing config JSON...");
         configJson = Json::parse(configFileStream);
+        LOG_INFO("Config JSON parsed successfully.");
         configFileStream.close();
     }
     catch (Json::parse_error const& e)
@@ -127,11 +130,13 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         throw std::runtime_error("Failed to parse config file: " + configPath.string());
     }
 
+    LOG_INFO("Initializing config from JSON...");
     if (!this->initializeConfigFromJson(configJson))
     {
         LOG_ERROR("Failed to initialize LLMEngineRunner from config file: %s", configPath.string().c_str());
         throw std::runtime_error("Failed to initialize LLMEngineRunner from config file: " + configPath.string());
     }
+    LOG_INFO("Config initialized successfully.");
 
     // Load the engine after config loading succeeds
     LOG_INFO("Loading engine file: %s", enginePath.string().c_str());
@@ -484,6 +489,7 @@ bool LLMEngineRunner::validateKVCacheType() const
 
 bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
 {
+    printf("initializeConfigFromJson(): Start\n");
     try
     {
         // Check model version
@@ -504,7 +510,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
             }
         }
 
-        auto const& builderConfig = configJson["builder_config"];
+        auto const& builderConfig = configJson.at("builder_config");
 
         // Define required fields for builder_config
         std::vector<std::string> const requiredBuilderConfigFields
@@ -521,12 +527,18 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
         }
 
         // Extract values with proper type checking
-        mConfig.numDecoderLayers = configJson["num_hidden_layers"].get<int32_t>();
-        mConfig.numKVHeads = configJson["num_key_value_heads"].get<int32_t>();
-        mConfig.headDim = configJson["head_dim"].get<int32_t>();
+        printf("Extracting num_hidden_layers...\n");
+        mConfig.numDecoderLayers = configJson.at("num_hidden_layers").get<int32_t>();
+        printf("Extracting num_key_value_heads...\n");
+        mConfig.numKVHeads = configJson.at("num_key_value_heads").get<int32_t>();
+        printf("Extracting head_dim...\n");
+        mConfig.headDim = configJson.at("head_dim").get<int32_t>();
+        printf("Extracting partial_rotary_factor...\n");
         mConfig.rotaryDim = static_cast<int32_t>(mConfig.headDim * configJson.value("partial_rotary_factor", 1.0f));
-        mConfig.hiddenSize = configJson["hidden_size"].get<int32_t>();
-        mConfig.vocabSize = configJson["vocab_size"].get<int32_t>();
+        printf("Extracting hidden_size...\n");
+        mConfig.hiddenSize = configJson.at("hidden_size").get<int32_t>();
+        printf("Extracting vocab_size...\n");
+        mConfig.vocabSize = configJson.at("vocab_size").get<int32_t>();
         // Optional: reduced vocabulary size (0 if not present)
         mConfig.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
         // Set actual output vocab size: use reduced size if enabled, otherwise full size
@@ -548,11 +560,16 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
         mConfig.convKernel = configJson.value("conv_kernel", 0);
 
         // Extract builder_config values
-        mConfig.maxSupportedBatchSize = builderConfig["max_batch_size"].get<int32_t>();
-        mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
-        mConfig.maxKVCacheCapacity = builderConfig["max_kv_cache_capacity"].get<int32_t>();
-        mConfig.maxSupportedLoraRank = builderConfig["max_lora_rank"].get<int32_t>();
-        mConfig.enableEagleSpecDecode = builderConfig["eagle_base"].get<bool>();
+        LOG_INFO("Extracting max_batch_size...");
+        mConfig.maxSupportedBatchSize = builderConfig.at("max_batch_size").get<int32_t>();
+        LOG_INFO("Extracting max_input_len...");
+        mConfig.maxSupportedInputLength = builderConfig.at("max_input_len").get<int32_t>();
+        LOG_INFO("Extracting max_kv_cache_capacity...");
+        mConfig.maxKVCacheCapacity = builderConfig.at("max_kv_cache_capacity").get<int32_t>();
+        LOG_INFO("Extracting max_lora_rank...");
+        mConfig.maxSupportedLoraRank = builderConfig.at("max_lora_rank").get<int32_t>();
+        LOG_INFO("Extracting eagle_base...");
+        mConfig.enableEagleSpecDecode = builderConfig.at("eagle_base").get<bool>();
 
         // Collect RoPE configuration
         mConfig.ropeConfig = collectRopeConfig(configJson);
@@ -560,7 +577,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
         // Initialize useTrtNativeOps from builder_config
         if (builderConfig.contains("trt_native_ops"))
         {
-            mConfig.useTrtNativeOps = builderConfig["trt_native_ops"].get<bool>();
+            mConfig.useTrtNativeOps = builderConfig.at("trt_native_ops").get<bool>();
         }
 
         // Validate configuration values - all must be positive except max_lora_rank
@@ -583,7 +600,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
         // Hardcode output hidden_dim to 3 x model hidden_size which is default in eagle3.
         if (mConfig.enableEagleSpecDecode)
         {
-            mConfig.outputHiddenDim = configJson["hidden_size"].get<int32_t>() * 3;
+            mConfig.outputHiddenDim = configJson.at("hidden_size").get<int32_t>() * 3;
 
             // maxVerifyTreeSize is only required when eagle_base is true
             if (!builderConfig.contains("max_verify_tree_size"))
@@ -593,7 +610,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
                     "Eagle base model");
                 return false;
             }
-            mConfig.maxVerifyTreeSize = builderConfig["max_verify_tree_size"].get<int32_t>();
+            mConfig.maxVerifyTreeSize = builderConfig.at("max_verify_tree_size").get<int32_t>();
 
             // Validate maxVerifyTreeSize (must be positive)
             if (mConfig.maxVerifyTreeSize <= 0)

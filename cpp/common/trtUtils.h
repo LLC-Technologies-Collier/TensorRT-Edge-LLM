@@ -80,6 +80,8 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void) noexcept
     if (initPlugins)
     {
         initPlugins(static_cast<nvinfer1::ILogger*>(&gLogger), "");
+        // Force the global logger to the same level as what we just passed
+        gLogger.setLevel(gLogger.getLevel());
     }
 
     return handle;

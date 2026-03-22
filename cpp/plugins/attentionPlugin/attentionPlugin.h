@@ -174,7 +174,7 @@ protected:
     int32_t mEnableTreeAttention{};
 
     //! Datatype of QKV and KV cache. Only supports FP16 as of now.
-    nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
+    nvinfer1::DataType mDataType{nvinfer1::DataType::kHALF};
     int32_t mSMVersion; //!< CUDA SM version
 
     int32_t mEnableFp8KVCache{}; //!< Whether FP8 KV cache is enabled

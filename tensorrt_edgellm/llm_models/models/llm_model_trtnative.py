@@ -130,7 +130,7 @@ class EdgeLLMModelTRTNative(nn.Module):
         # Determine output configuration based on model type
         output_hidden_states = self.is_eagle_base
 
-        hidden_states = inputs_embeds
+        hidden_states = inputs_embeds.to(self.torch_dtype)
         present_k_caches = ()
         present_v_caches = ()
         all_hidden_states = () if output_hidden_states else None

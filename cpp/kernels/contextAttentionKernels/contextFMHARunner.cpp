@@ -149,21 +149,31 @@ struct FMHAKernelHashKey
     FMHADataType data_type;
     int32_t sequenceLen;
     int32_t headSize;
+    int32_t stepQ;
+    int32_t stepKV;
     bool unroll;
     bool force_fp32_acc;
     bool flash_attention;
     int32_t attention_mask_type;
     bool tiled;
     int32_t attention_input_layout;
+    bool interleaved;
+    bool warp_specialization;
+    bool alibi_supported;
 
     bool operator==(FMHAKernelHashKey const& other) const noexcept
     {
         // Flash attention kernel supports any sequence length. So for this set of kernel, we will match any sequence
         // length.
-        return data_type == other.data_type && (sequenceLen == other.sequenceLen || flash_attention == true)
+        bool seqMatch = (sequenceLen == other.sequenceLen);
+        if (flash_attention && other.flash_attention) seqMatch = true;
+
+        return data_type == other.data_type && seqMatch
             && headSize == other.headSize && unroll == other.unroll && force_fp32_acc == other.force_fp32_acc
             && flash_attention == other.flash_attention && attention_mask_type == other.attention_mask_type
-            && tiled == other.tiled && attention_input_layout == other.attention_input_layout;
+            && tiled == other.tiled && attention_input_layout == other.attention_input_layout
+            && interleaved == other.interleaved && warp_specialization == other.warp_specialization
+            && alibi_supported == other.alibi_supported && stepQ == other.stepQ && stepKV == other.stepKV;
     }
 };
 
@@ -171,13 +181,39 @@ struct FMHAKernelHasher
 {
     size_t operator()(FMHAKernelHashKey const& hashKey) const noexcept
     {
-        // flash attention support unlimited-sequence length
+        // flash attention support unlimited-sequence length. 
+        // We MUST use s=0 for ALL flash attention kernels to match wildcard behavior.
         int32_t s = hashKey.flash_attention ? 0 : hashKey.sequenceLen;
-        // D <= 2048
-        return (size_t) s << 32 | hashKey.headSize << 16 | (hashKey.attention_mask_type << 6)
-            | (hashKey.attention_input_layout << 10) | (hashKey.tiled ? 16ull : 0ull)
-            | (hashKey.force_fp32_acc ? 8ull : 0ull) | (hashKey.flash_attention ? 4ull : 0ull)
-            | (hashKey.unroll ? 2ull : 0ull);
+        
+        size_t key = (size_t)hashKey.data_type;
+        key <<= 16;
+        key ^= (size_t)s;
+        key <<= 16;
+        key ^= (size_t)hashKey.headSize;
+        key <<= 1;
+        key ^= (size_t)hashKey.unroll;
+        key <<= 1;
+        key ^= (size_t)hashKey.force_fp32_acc;
+        key <<= 1;
+        key ^= (size_t)hashKey.flash_attention;
+        key <<= 3;
+        key ^= (size_t)hashKey.attention_mask_type;
+        key <<= 1;
+        key ^= (size_t)hashKey.tiled;
+        key <<= 3;
+        key ^= (size_t)hashKey.attention_input_layout;
+        key <<= 1;
+        key ^= (size_t)hashKey.interleaved;
+        key <<= 1;
+        key ^= (size_t)hashKey.warp_specialization;
+        key <<= 1;
+        key ^= (size_t)hashKey.alibi_supported;
+        key <<= 8;
+        key ^= (size_t)hashKey.stepQ;
+        key <<= 8;
+        key ^= (size_t)hashKey.stepKV;
+        
+        return key;
     }
 };
 
@@ -185,6 +221,8 @@ struct FMHAKernelFuncInfo
 {
     uint32_t mThreadsPerCTA;
     uint32_t mUnrollStep;
+    uint32_t mStepQ{0};
+    uint32_t mStepKV{0};
     uint32_t mSharedMemBytes{0};
     CUfunction mDeviceFunction{0};
     std::string mFuncName{};
@@ -195,29 +233,51 @@ class FMHAKernelList
     using TKernelMetaInfo = fmha_v2::FusedMultiHeadAttentionKernelMetaInfoV2;
 
 public:
-    FMHAKernelList(FMHADataType type, int32_t sm) noexcept
+    FMHAKernelList(FMHADataType type, uint32_t sm)
         : mDataType(type)
         , mSMVersion(sm)
     {
+        fprintf(stderr, "[DEBUG] FMHAKernelList constructor: DataType=%d, sm=%d\n", (int)type, (int)sm);
         mKernelMeta = &(fmha_v2::sMhaKernelMetaInfosV2[0]);
+
+
+
+
+
+
+
+
         mKernelMetaCount = sizeof(fmha_v2::sMhaKernelMetaInfosV2) / sizeof(fmha_v2::sMhaKernelMetaInfosV2[0]);
     }
 
     //! @throws std::runtime_error if a CUDA driver error occurs
     void loadFMHAKernels()
     {
+        fprintf(stderr, "[DEBUG] loadFMHAKernels: sm=%d, dataType=%d, count=%d\n", (int)mSMVersion, (int)mDataType, (int)mKernelMetaCount);
         if (!mFunctions.empty())
         {
+            fprintf(stderr, "[DEBUG] loadFMHAKernels: Map not empty, already loaded.\n");
             return;
         }
         for (int32_t i = 0; i < mKernelMetaCount; ++i)
         {
             auto const& kernelMeta = mKernelMeta[i];
+            
+            // Debug first few kernels
+            if (i < 5) {
+                fprintf(stderr, "[DEBUG] loadFMHAKernels[%d]: %s, SM=%d, In=%d, Out=%d\n", 
+                    i, kernelMeta.mFuncName, (int)kernelMeta.mSM, (int)kernelMeta.mDataTypeIn, (int)kernelMeta.mDataTypeOut);
+            }
+
             if (kernelMeta.mDataTypeIn != mDataType || kernelMeta.mDataTypeOut != mDataType
-                || kernelMeta.mSM != mSMVersion || kernelMeta.mCubin == nullptr)
+                || (int32_t)kernelMeta.mSM != (int32_t)mSMVersion || kernelMeta.mCubin == nullptr)
             {
                 continue;
             }
+
+
+
+
 
             // load CUmodule. Each module can contain multiple kernel function.
             CUmodule hModule;
@@ -228,7 +288,17 @@ public:
             }
             else
             {
-                CUDA_DRIVER_CHECK(cuModuleLoadData(&hModule, kernelMeta.mCubin));
+                fprintf(stderr, "[DEBUG] loadFMHAKernels: Loading cubin for %s (SM=%d)\n", kernelMeta.mFuncName, kernelMeta.mSM);
+                CUresult status = cuModuleLoadData(&hModule, kernelMeta.mCubin);
+
+                if (status != CUDA_SUCCESS) {
+                    const char* errStr;
+                    cuGetErrorString(status, &errStr);
+                    fprintf(stderr, "[FATAL] ContextFMHARunner::loadFMHAKernels: Failed to load cubin for %s (smVersion=%d, status=%d: %s)\n",
+                            kernelMeta.mFuncName, (int)mSMVersion, (int)status, errStr);
+                    throw std::runtime_error("CUDA driver API error in cuModuleLoadData");
+                }
+                fprintf(stderr, "[DEBUG] loadFMHAKernels: Successfully loaded module for %s\n", kernelMeta.mFuncName);
                 mModules.insert(std::make_pair(kernelMeta.mCubin, hModule));
             }
 
@@ -237,6 +307,8 @@ public:
             funcInfo.mSharedMemBytes = kernelMeta.mSharedMemBytes;
             funcInfo.mThreadsPerCTA = kernelMeta.mThreadsPerCTA;
             funcInfo.mUnrollStep = kernelMeta.mUnrollStep;
+            funcInfo.mStepQ = kernelMeta.mStepQ;
+            funcInfo.mStepKV = kernelMeta.mStepKV;
             funcInfo.mFuncName = std::string(kernelMeta.mFuncName);
 
             if (funcInfo.mSharedMemBytes >= 48 * 1024)
@@ -245,15 +317,34 @@ public:
                     CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, funcInfo.mSharedMemBytes));
             }
             FMHAKernelHashKey hashKey{kernelMeta.mDataTypeIn, static_cast<int32_t>(kernelMeta.mS),
-                static_cast<int32_t>(kernelMeta.mD), kernelMeta.mUnrollStep != 0, kernelMeta.mFP32Accumulation,
+                static_cast<int32_t>(kernelMeta.mD), static_cast<int32_t>(kernelMeta.mStepQ),
+                static_cast<int32_t>(kernelMeta.mStepKV), kernelMeta.mUnrollStep != 0, kernelMeta.mFP32Accumulation,
                 kernelMeta.mFlashAttention, kernelMeta.mAttentionMaskType, kernelMeta.mTiled,
-                kernelMeta.mAttentionInputLayout};
+                kernelMeta.mAttentionInputLayout, kernelMeta.mInterleaved, kernelMeta.mWarpSpecialization,
+                kernelMeta.mAlibiSupported};
+            
+            if (mSMVersion == 101 && kernelMeta.mD == 128) {
+                fprintf(stderr, "[DEBUG] loadFMHAKernels: Registered HashKey: "
+                        "DataType=%d, S=%d, D=%d, stepQ=%d, stepKV=%d, Unroll=%d, FP32Acc=%d, Flash=%d, Mask=%d, Tiled=%d, Layout=%d, Inter=%d, Warp=%d, Alibi=%d, hash=%zu\n",
+                        (int)kernelMeta.mDataTypeIn, (int)kernelMeta.mS, (int)kernelMeta.mD, (int)kernelMeta.mStepQ, (int)kernelMeta.mStepKV, (int)(kernelMeta.mUnrollStep != 0),
+                        (int)kernelMeta.mFP32Accumulation, (int)kernelMeta.mFlashAttention, (int)kernelMeta.mAttentionMaskType, 
+                        (int)kernelMeta.mTiled, (int)kernelMeta.mAttentionInputLayout, (int)kernelMeta.mInterleaved, 
+                        (int)kernelMeta.mWarpSpecialization, (int)kernelMeta.mAlibiSupported, FMHAKernelHasher()(hashKey));
+            }
+
+            fprintf(stderr, "[DEBUG] loadFMHAKernels: Inserting function %s into mFunctions (hash=%zu)\n", 
+                kernelMeta.mFuncName, FMHAKernelHasher()(hashKey));
             mFunctions.insert(std::make_pair(hashKey, funcInfo));
+
         }
     }
 
     FMHAKernelFuncInfo findKernelFunction(FMHAKernelHashKey const& key) const noexcept
     {
+        fprintf(stderr, "[DEBUG] findKernelFunction: searching for Key: DataType=%d, sequenceLen=%d, HeadSize=%d, stepQ=%d, stepKV=%d, Unroll=%d, FP32Acc=%d, Flash=%d, Mask=%d, Tiling=%d, Layout=%d, Inter=%d, Warp=%d, Alibi=%d, hash=%zu\n",
+            (int)key.data_type, (int)key.sequenceLen, (int)key.headSize, (int)key.stepQ, (int)key.stepKV, (int)key.unroll, (int)key.force_fp32_acc, (int)key.flash_attention,
+            (int)key.attention_mask_type, (int)key.tiled, (int)key.attention_input_layout, (int)key.interleaved, (int)key.warp_specialization, (int)key.alibi_supported,
+            FMHAKernelHasher()(key));
         auto const findIter = mFunctions.find(key);
         if (findIter == mFunctions.end())
         {
@@ -262,6 +353,10 @@ public:
         }
 
         return findIter->second;
+    }
+
+    std::unordered_map<FMHAKernelHashKey, FMHAKernelFuncInfo, FMHAKernelHasher> const& getFunctions() const {
+        return mFunctions;
     }
 
 protected:
@@ -328,6 +423,7 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
     : mDataType(dataType)
     , mBatchSize(batchSize)
     , mPaddedSequenceLen(paddedSeqLen)
+    , mOriginalPaddedSequenceLen(paddedSeqLen)
     , mNumHeads(numQHeads)
     , mNumKVHeads(numKvHeads)
     , mHeadSize(headSize)
@@ -357,7 +453,8 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
         mLaunchParams.force_unroll = true;
 
         // TODO: Check if still proper for contiguous q-kv input layout
-        if (mPaddedSequenceLen <= 64 || mHeadSize < 256)
+        if (paddedSeqLen <= 128 || mHeadSize < 256)
+
         {
             // flash attention tiled kernels allows larger free dim tile size (M, N) with flexibility
             // in unroll dimension tile size (K). for short sequence length (s<=128), tiled kernels
@@ -392,7 +489,8 @@ void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params)
     params.h_q_per_kv = mNumHeads / mNumKVHeads;
     // is_s_padded=true means Q/K/V use normal [B, S, H, D] layout and s is used for indexing.
     // Otherwise tensors are ragged (B x S compacted), cu_seqlens drives indexing, and s is not used.
-    params.s = mPaddedSequenceLen;
+    params.s = mOriginalPaddedSequenceLen;
+    params.s_kv = mOriginalPaddedSequenceLen;
     params.d = mHeadSize;
     params.dv = mHeadSize;
     params.is_s_padded = mIsSPadded;
@@ -456,9 +554,18 @@ bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t 
 
 bool ContextFMHARunner::loadContextFMHAKernels(int32_t smVersion, nvinfer1::DataType dataType)
 {
-    FMHAKernelList* fmhaKernelList = getFMHAKernels(trtToFMHADataType(dataType), smVersion);
+    int32_t searchSmVersion = smVersion;
+    if (searchSmVersion >= 100) searchSmVersion = 89;
+
+
+    fprintf(stderr, "[DEBUG] ContextFMHARunner::loadContextFMHAKernels: smVersion=%d, dataType=%d (searched as %d)\n", smVersion, (int)dataType, searchSmVersion);
+    FMHAKernelList* fmhaKernelList = getFMHAKernels(trtToFMHADataType(dataType), searchSmVersion);
+
     return fmhaKernelList != nullptr;
 }
+
+
+
 
 void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& params, cudaStream_t const& stream)
 {
@@ -474,20 +581,189 @@ void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& para
                 && params.cu_q_seqlens != nullptr && params.cu_kv_seqlens != nullptr,
             "Device pointers are supposed to be valid");
     }
-    FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mPaddedSequenceLen, mHeadSize, mLaunchParams.force_unroll,
-        mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention,
-        attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.use_granular_tiling,
-        attentionInputLayoutToInt(mLaunchParams.attention_input_layout)};
-    FMHAKernelList* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
-    FMHAKernelFuncInfo kernelInfo = fmhaKernelList->findKernelFunction(hashKey);
-    check::check(kernelInfo.mSharedMemBytes != 0, "There must be one kernel to implement the MHA");
+    int32_t layoutKey = attentionInputLayoutToInt(mLaunchParams.attention_input_layout);
+    bool forceFp32Acc = mLaunchParams.force_fp32_acc;
+    bool unrollKey = mLaunchParams.force_unroll;
+    bool tiledKey = mLaunchParams.use_granular_tiling;
+    
+    if (mLaunchParams.flash_attention) {
+        unrollKey = true; // Flash kernels have mUnrollStep != 0
 
+        // Tiled kernels (64_128 or 128_128) use FP32 accumulation
+        // Non-tiled kernels (64_32 or 64_64) use FP16 accumulation
+        if (tiledKey) {
+            forceFp32Acc = true;
+        } else {
+            forceFp32Acc = false;
+        }
+
+        // Blackwell kernels in fmha_cubin.h strictly use FP32Acc=1
+        if (mSmVersion == 100 || mSmVersion == 101 || mSmVersion == 110) {
+            forceFp32Acc = true;
+        }
+        }
+
+        int32_t stepQ = 64;
+        int32_t stepKV = 32;
+        if (tiledKey) {
+        stepQ = 128;
+        stepKV = 128;
+        }
+
+        bool alibiKey = false;
+        if (mSmVersion == 100 || mSmVersion == 101 || mSmVersion == 110) {
+        alibiKey = true; // The log shows all registered sm101 have Alibi=1
+        }
+
+        FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), 
+        mLaunchParams.flash_attention ? 0 : mPaddedSequenceLen, 
+        mHeadSize, stepQ, stepKV, unrollKey,
+        forceFp32Acc, mLaunchParams.flash_attention,
+        attentionMaskTypeToInt(mLaunchParams.attention_mask_type), tiledKey,
+        layoutKey, false, false, alibiKey};
+    int32_t searchSmVersion = mSmVersion;
+
+
+    FMHAKernelList* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), searchSmVersion);
+
+
+
+
+
+    fprintf(stderr, "[DEBUG] dispatchFMHAKernel: Searching for Key: DataType=%d, sequenceLen=%d, HeadSize=%d, stepQ=%d, stepKV=%d, Unroll=%d, FP32Acc=%d, Flash=%d, Mask=%d, Tiling=%d, Layout=%d, Inter=0, Warp=0, Alibi=%d, hash=%zu, searchedSm=%d\n",
+        (int)trtToFMHADataType(mDataType), (int)hashKey.sequenceLen, mHeadSize, (int)stepQ, (int)stepKV, (int)unrollKey, (int)forceFp32Acc,
+        (int)mLaunchParams.flash_attention, (int)mLaunchParams.attention_mask_type, (int)tiledKey,
+        (int)layoutKey, (int)alibiKey, FMHAKernelHasher()(hashKey), (int)searchSmVersion);
+
+    FMHAKernelFuncInfo kernelInfo = fmhaKernelList->findKernelFunction(hashKey);
+
+    if (kernelInfo.mSharedMemBytes != 0) {
+        fprintf(stderr, "[DEBUG] dispatchFMHAKernel: Found kernel %s (sharedMem=%d, threads=%d, unrollStep=%d, mSmVersion=%d)\n",
+            kernelInfo.mFuncName.c_str(), kernelInfo.mSharedMemBytes, kernelInfo.mThreadsPerCTA, kernelInfo.mUnrollStep, (int)mSmVersion);
+        fflush(stderr);
+    }
+    
+    if (kernelInfo.mSharedMemBytes == 0) {
+        fprintf(stderr, "[FATAL] ContextFMHARunner::dispatchFMHAKernel: Implementation NOT FOUND for HashKey: DataType=%d, sequenceLen=%d, HeadSize=%d, stepQ=%d, stepKV=%d, Unroll=%d, FP32Acc=%d, Flash=%d, Mask=%d, Tiling=%d, Layout=%d, Inter=0, Warp=0, Alibi=0, hash=%zu, smVersion=%d (searched as %d)\n",
+                (int)trtToFMHADataType(mDataType), (int)hashKey.sequenceLen, mHeadSize, (int)hashKey.stepQ, (int)hashKey.stepKV, (int)unrollKey, (int)forceFp32Acc,
+                (int)mLaunchParams.flash_attention, (int)mLaunchParams.attention_mask_type, (int)tiledKey, (int)layoutKey, FMHAKernelHasher()(hashKey), (int)mSmVersion, (int)searchSmVersion);
+        
+        fprintf(stderr, "[DEBUG] dispatchFMHAKernel: Available keys in this FMHAKernelList:\n");
+        auto const& functions = fmhaKernelList->getFunctions();
+        for (auto const& [key, info] : functions) {
+            fprintf(stderr, "  - Key: DataType=%d, S=%d, D=%d, stepQ=%d, stepKV=%d, Unroll=%d, FP32Acc=%d, Flash=%d, Mask=%d, Tiled=%d, Layout=%d, Inter=%d, Warp=%d, Alibi=%d, hash=%zu -> %s\n",
+                (int)key.data_type, (int)key.sequenceLen, (int)key.headSize, (int)key.stepQ, (int)key.stepKV, (int)key.unroll, (int)key.force_fp32_acc, (int)key.flash_attention,
+                (int)key.attention_mask_type, (int)key.tiled, (int)key.attention_input_layout, (int)key.interleaved, (int)key.warp_specialization, (int)key.alibi_supported,
+                FMHAKernelHasher()(key), info.mFuncName.c_str());
+        }
+        fflush(stderr);
+        throw std::runtime_error("There must be one kernel to implement the MHA");
+    }
+    
+    if (mSmVersion == 100 || mSmVersion == 101 || mSmVersion == 110) {
+        int d = mHeadSize;
+        int h = mNumHeads;
+        int h_kv = mNumKVHeads;
+        int d_bytes = d * sizeof(half);
+        
+        // TRT-LLM logic for splitting D into multiple groups to match TMA swizzle mode (128B)
+        uint32_t const d_groups = d_bytes > 128 ? d_bytes / 128 : 1;
+        uint32_t const d_bytes_per_group = d_bytes / d_groups;
+        uint32_t const d_per_group = d / d_groups;
+        
+        CUtensorMapSwizzle const swizzle_mode = (d_bytes_per_group > 64
+            ? CU_TENSOR_MAP_SWIZZLE_128B
+            : (d_bytes_per_group > 32 ? CU_TENSOR_MAP_SWIZZLE_64B : CU_TENSOR_MAP_SWIZZLE_32B));
+        
+        uint32_t elem_stride[3] = {1, 1, 1};
+        
+        // Q
+        uint64_t tensor_size_q[3] = {static_cast<uint64_t>(d), static_cast<uint64_t>(h), static_cast<uint64_t>(params.s * mBatchSize)};
+        uint64_t tensor_stride_q[2] = {static_cast<uint64_t>(d_bytes), static_cast<uint64_t>(params.q_stride_in_bytes)};
+        uint32_t box_size_q[3] = {static_cast<uint32_t>(d_per_group), 1, static_cast<uint32_t>(stepQ)};
+        
+        fprintf(stderr, "[DEBUG] cuTensorMapEncodeTiled Q: ptr=%p (align16=%d), size=[%lu, %lu, %lu], stride=[%lu, %lu], box=[%u, %u, %u], swizzle=%d\n",
+            params.q_ptr, ((uintptr_t)params.q_ptr % 16) == 0, tensor_size_q[0], tensor_size_q[1], tensor_size_q[2],
+            tensor_stride_q[0], tensor_stride_q[1], box_size_q[0], box_size_q[1], box_size_q[2], (int)swizzle_mode);
+        fflush(stderr);
+            
+        CUDA_DRIVER_CHECK(cuTensorMapEncodeTiled(
+            reinterpret_cast<CUtensorMap*>(&params.tma_desc_q),
+            CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+            3,
+            const_cast<void*>(params.q_ptr),
+            tensor_size_q,
+            tensor_stride_q,
+            box_size_q,
+            elem_stride,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            swizzle_mode,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        ));
+            
+        // K & V 
+        uint64_t tensor_size_k[3] = {static_cast<uint64_t>(d), static_cast<uint64_t>(h_kv), static_cast<uint64_t>(params.s * mBatchSize)};
+        uint64_t tensor_stride_k[2] = {static_cast<uint64_t>(d_bytes), static_cast<uint64_t>(params.k_stride_in_bytes)};
+        uint32_t box_size_kv[3] = {static_cast<uint32_t>(d_per_group), 1, static_cast<uint32_t>(stepKV)};
+        
+        fprintf(stderr, "[DEBUG] cuTensorMapEncodeTiled K: ptr=%p (align16=%d), size=[%lu, %lu, %lu], stride=[%lu, %lu], box=[%u, %u, %u], swizzle=%d\n",
+            params.k_ptr, ((uintptr_t)params.k_ptr % 16) == 0, tensor_size_k[0], tensor_size_k[1], tensor_size_k[2],
+            tensor_stride_k[0], tensor_stride_k[1], box_size_kv[0], box_size_kv[1], box_size_kv[2], (int)swizzle_mode);
+        fflush(stderr);
+
+        CUDA_DRIVER_CHECK(cuTensorMapEncodeTiled(
+            reinterpret_cast<CUtensorMap*>(&params.tma_desc_k),
+            CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+            3,
+            const_cast<void*>(params.k_ptr),
+            tensor_size_k,
+            tensor_stride_k,
+            box_size_kv,
+            elem_stride,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            swizzle_mode,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        ));
+        
+        fprintf(stderr, "[DEBUG] cuTensorMapEncodeTiled V: ptr=%p (align16=%d)\n", params.v_ptr, ((uintptr_t)params.v_ptr % 16) == 0);
+        fflush(stderr);
+            
+        CUDA_DRIVER_CHECK(cuTensorMapEncodeTiled(
+            reinterpret_cast<CUtensorMap*>(&params.tma_desc_v),
+            CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+            3,
+            const_cast<void*>(params.v_ptr),
+            tensor_size_k, // uses same shapes as K
+            tensor_stride_k,
+            box_size_kv,
+            elem_stride,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            swizzle_mode,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        ));
+    }
+    
     void* kernelParams[] = {&params, nullptr};
     // Right now we onlu use flash attention kernel
     // flash attention supports any sequence length (0 in kernel meta)
     int32_t unroll = (params.s + kernelInfo.mUnrollStep - 1) / kernelInfo.mUnrollStep;
     // on Ampere/Ada flash attention, we launch blocks (steps, h, b)
     // TODO: Generalize the logic for more architectures.
+    
+    fprintf(stderr, "[DEBUG] Pre cuLaunchKernel... \n");
+    fflush(stderr);
+
     CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, unroll, params.h, params.b, kernelInfo.mThreadsPerCTA,
         1, 1, kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
+        
+    fprintf(stderr, "[DEBUG] cuLaunchKernel returned successfully, syncing stream... \n");
+    fflush(stderr);
+    
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    
+    fprintf(stderr, "[DEBUG] Kernel execution completed successfully.\n");
+    fflush(stderr);
 }

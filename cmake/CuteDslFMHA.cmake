@@ -70,6 +70,7 @@ function(cute_dsl_fmha_setup)
       OUTPUT ${_OBJ} ${_HDR}
       COMMAND ${CMAKE_COMMAND} -E remove -f ${_OBJ} ${_HDR}
       COMMAND
+        ${CMAKE_COMMAND} -E env PYTHONPATH=${CUTLASS_DSL_LIB_DIR}/../python_packages
         ${CUTE_DSL_PYTHON} ${CUTE_DSL_FMHA_SCRIPT} ${${BASE_FLAGS}} --q_shape
         ${Q_SHAPE} --k_shape ${K_SHAPE} --file_name ${NAME} --function_prefix
         ${NAME} ${_EXTRA_FLAGS}
@@ -156,6 +157,7 @@ function(_cute_dsl_fmha_ensure_dependencies)
   set(_python ${Python3_EXECUTABLE})
 
   string(REGEX MATCH "^([0-9]+)" _cuda_major_ver "${CUDA_CTK_VERSION}")
+  set(_cuda_major_ver 13) # Force 13 for robo
   if(_cuda_major_ver EQUAL 12)
     set(_cupy_package "cupy-cuda12x==12.3.0")
     set(_cupy_required_version "12.3.0")

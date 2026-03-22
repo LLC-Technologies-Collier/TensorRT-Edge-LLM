@@ -27,11 +27,9 @@ extern "C" bool initEdgellmPlugins(void* logger, char const* /*libNamespace*/)
 {
     if (logger)
     {
-        auto* appLogger = dynamic_cast<trt_edgellm::logger::EdgeLLMLogger*>(static_cast<nvinfer1::ILogger*>(logger));
-        if (appLogger)
-        {
-            trt_edgellm::gLogger.setLevel(appLogger->getLevel());
-        }
+        // Set to VERBOSE to ensure we see all debug logs during this troubleshooting phase
+        trt_edgellm::gLogger.setLevel(nvinfer1::ILogger::Severity::kVERBOSE);
+        fprintf(stderr, "[DEBUG] initEdgellmPlugins: Logger %p initialized and set to VERBOSE\n", logger);
     }
     return true;
 }
@@ -45,12 +43,19 @@ namespace plugins
 
 void applyThorSMRenumberWAR(int32_t& smVersion)
 {
-    // Workaround for CUDA12/13 Thor re-numbering. The kernels themselves have version compatibility.
-    if (smVersion == 110)
+    int32_t orig = smVersion;
+    // Workaround for CUDA12/13 Thor re-numbering.
+    // Unified to 89 for all Blackwell variants. 
+    // Loading SM 101 cubins on SM 110 silently corrupts the driver context and causes fatal CUDA errors.
+    if (smVersion >= 100)
     {
-        smVersion = 101;
+        smVersion = 89;
     }
+    fprintf(stderr, "[DEBUG] applyThorSMRenumberWAR: smVersion %d -> %d\n", orig, smVersion);
 }
+
+
+
 
 size_t alignTensorSize(size_t size)
 {

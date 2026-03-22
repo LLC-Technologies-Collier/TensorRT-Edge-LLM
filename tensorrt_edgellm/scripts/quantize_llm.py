@@ -36,6 +36,7 @@ from tensorrt_edgellm.quantization.llm_quantization import \
 
 
 def main() -> None:
+    print("DEBUG: quantize_llm.py VERSION 3 - sequential + try-catch")
     """
     Main function that parses command line arguments and quantizes the model.
     
@@ -61,7 +62,7 @@ def main() -> None:
         help="Quantization method to use")
     parser.add_argument("--dtype",
                         type=str,
-                        choices=["fp16"],
+                        choices=["fp16", "bf16"],
                         required=False,
                         default="fp16",
                         help="Model data type for loading")
@@ -93,6 +94,11 @@ def main() -> None:
         required=False,
         default="cuda",
         help="Device to use for model loading and quantization")
+    parser.add_argument("--calib_size",
+                        type=int,
+                        required=False,
+                        default=512,
+                        help="Number of samples for calibration")
 
     args = parser.parse_args()
 
@@ -104,7 +110,8 @@ def main() -> None:
                               dataset_dir=args.dataset_dir,
                               lm_head_quantization=args.lm_head_quantization,
                               kv_cache_quantization=args.kv_cache_quantization,
-                              device=args.device)
+                              device=args.device,
+                              calib_size=args.calib_size)
         print("Model quantization completed successfully!")
     except Exception as e:
         print(f"Error during model quantization: {e}")

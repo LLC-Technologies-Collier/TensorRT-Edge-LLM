@@ -111,8 +111,9 @@ rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<i
 namespace rt
 {
 LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
-    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
+    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream, bool enableCudaGraph)
 {
+    LOG_INFO("LLMInferenceRuntime(): Start");
     // Find the first .engine file in engineDir
     // For Qwen3-Omni: export ensures only thinker.engine exists in this directory
     std::filesystem::path enginePath;
@@ -128,6 +129,7 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     {
         throw std::runtime_error("No .engine file found in directory: " + engineDir);
     }
+    LOG_INFO("Found engine file: %s", enginePath.string().c_str());
     std::filesystem::path const configPath = std::filesystem::path(engineDir) / "config.json";
 
     // Load embedding table from embedding.safetensors
@@ -139,16 +141,19 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
         LOG_ERROR("Failed to load embedding table from: %s", embeddingPath.string().c_str());
         throw std::runtime_error("Failed to load embedding table from: " + embeddingPath.string());
     }
+    LOG_INFO("Embedding table loaded.");
     check::check(embeddingTensors.size() == 1, "embedding.safetensors should contain exactly one tensor");
     check::check(
         embeddingTensors[0].getShape().getNumDims() == 2, "embedding tensor should be 2D [vocabSize, hiddenSize]");
     mEmbeddingTable = std::move(embeddingTensors[0]);
-    LOG_INFO("Embedding table loaded successfully with shape [%d, %d]", mEmbeddingTable.getShape()[0],
+    LOG_INFO("Embedding table moved successfully with shape [%d, %d]", mEmbeddingTable.getShape()[0],
         mEmbeddingTable.getShape()[1]);
 
     try
     {
+        LOG_INFO("Initializing LLMEngineRunner...");
         mLLMEngineRunner = std::make_unique<LLMEngineRunner>(enginePath, configPath, loraWeightsMap, stream);
+        LOG_INFO("LLMEngineRunner initialized successfully.");
     }
     catch (std::exception const& e)
     {
@@ -158,6 +163,7 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     LOG_INFO("LLMEngineRunner successfully loaded and initialized llm engine.");
 
     mEngineConfig = mLLMEngineRunner->getEngineConfig();
+    LOG_INFO("Engine config retrieved.");
 
     // Use TopP sampling parameter to reserve max possible workspace size for sampling.
     int32_t const defaultTopK{0};
@@ -290,6 +296,11 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
         {
             throw std::runtime_error("No valid multimodal engine found in " + multimodalEngineDir);
         }
+    }
+
+    if (enableCudaGraph)
+    {
+        captureDecodingCUDAGraph(stream);
     }
 }
 
@@ -619,7 +630,8 @@ bool LLMInferenceRuntime::handleRequest(
     SamplingParams params(
         activeBatchSize, mEngineConfig.outputVocabSize, request.temperature, request.topK, request.topP);
     auto sampleTokens = [&]() {
-        trt_edgellm::topKtopPSamplingFromLogits(mOutputLogits, mSelectedIndices, params, mSamplingWorkspace, stream);
+        trt_edgellm::topKtopPSamplingFromLogits(
+            mOutputLogits, mSelectedIndices, params, mSamplingWorkspace, stream, request.randomSeed);
         // Apply vocabulary mapping if reduced vocabulary is used
         if (mEngineConfig.reducedVocabSize > 0)
         {
@@ -633,6 +645,10 @@ bool LLMInferenceRuntime::handleRequest(
             if (!finishedStates[i])
             {
                 outputIds[i].push_back(hostSelectedTokenIdsData[i]);
+                if (request.tokenCallback)
+                {
+                    request.tokenCallback(i, hostSelectedTokenIdsData[i]);
+                }
                 finishedStates[i] = hostSelectedTokenIdsData[i] == mTokenizer->getEosId();
                 if (finishedStates[i])
                 {
@@ -1040,6 +1056,36 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     LOG_DEBUG("LLMInferenceRuntime(): The KVCache is saved for the prompt: {%s}", prompt.c_str());
 
     return true;
+}
+
+std::vector<int32_t> LLMInferenceRuntime::tokenize(std::string const& text, bool applyChatTemplate) const
+{
+    if (applyChatTemplate)
+    {
+        LLMGenerationRequest::Request request;
+        Message msg;
+        msg.role = "user";
+        msg.contents.push_back({"text", text});
+        request.messages.push_back(msg);
+        return tokenize(request, true);
+    }
+    else
+    {
+        return mTokenizer->encode(text, true);
+    }
+}
+
+std::vector<int32_t> LLMInferenceRuntime::tokenize(
+    LLMGenerationRequest::Request const& request, bool applyChatTemplate) const
+{
+    LLMGenerationRequest::FormattedRequest formatted;
+    mTokenizer->applyChatTemplate(request, formatted, applyChatTemplate, true);
+    return mTokenizer->encode(formatted.formattedCompleteRequest, true);
+}
+
+std::string LLMInferenceRuntime::decode(std::vector<int32_t> const& ids, bool skipSpecialTokens) const
+{
+    return mTokenizer->decode(ids, skipSpecialTokens);
 }
 
 } // namespace rt

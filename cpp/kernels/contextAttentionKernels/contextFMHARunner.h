@@ -102,7 +102,8 @@ public:
 private:
     nvinfer1::DataType mDataType; //!< Data type
     int32_t mBatchSize;           //!< Batch size
-    int32_t mPaddedSequenceLen;   //!< Padded sequence length
+    int32_t mPaddedSequenceLen;   //!< Padded sequence length (wildcarded to 0 for flash attn)
+    int32_t mOriginalPaddedSequenceLen; //!< Original padded sequence length
     int32_t mNumHeads;            //!< Number of query heads
     int32_t mNumKVHeads;          //!< Number of key-value heads
     int32_t mHeadSize;            //!< Attention head dimension

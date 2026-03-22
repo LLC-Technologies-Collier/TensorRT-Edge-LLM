@@ -63,6 +63,18 @@ def main() -> None:
         help=
         "Device to load the model on (default: cuda, options: cpu, cuda, cuda:0, cuda:1, etc.)"
     )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        required=False,
+        default="fp16",
+        help="Data type to load the model (e.g. fp16, bf16)"
+    )
+    parser.add_argument(
+        "--dynamo",
+        action="store_true",
+        help="Whether to use torch.onnx.export with dynamo=True (required for large MoE models)"
+    )
     parser.add_argument("--is_eagle_base",
                         required=False,
                         action='store_true',
@@ -92,6 +104,10 @@ def main() -> None:
                         required=False,
                         action='store_true',
                         help="Whether to use TensorRT native operations")
+    parser.add_argument("--output_hidden_states",
+                        required=False,
+                        action='store_true',
+                        help="Whether to export hidden states")
     parser.add_argument(
         "--export_models",
         type=str,
@@ -108,12 +124,15 @@ def main() -> None:
         export_llm_model(model_dir=args.model_dir,
                          output_dir=args.output_dir,
                          device=args.device,
+                         dtype=args.dtype,
+                         dynamo=args.dynamo,
                          is_eagle_base=args.is_eagle_base,
                          reduced_vocab_dir=args.reduced_vocab_dir,
                          export_models=args.export_models,
                          chat_template_path=args.chat_template_path,
                          fp8_kv_cache=args.fp8_kv_cache,
-                         trt_native_ops=args.trt_native_ops)
+                         trt_native_ops=args.trt_native_ops,
+                         output_hidden_states=args.output_hidden_states)
 
         print("LLM model export completed successfully!")
 
