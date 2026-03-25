@@ -17,6 +17,10 @@
 
 #pragma once
 
+#include <iostream>
+#include <fstream>
+#include <chrono>
+#include "multimodal/modelTypes.h"
 #include <NvInfer.h>
 #include <filesystem>
 #include <nlohmann/json.hpp>
@@ -31,9 +35,88 @@ namespace trt_edgellm
 namespace builder
 {
 
+/*!
+ * @brief Custom Progress Monitor that periodically saves the timing cache
+ */
+class BuildProgressMonitor : public nvinfer1::IProgressMonitor
+{
+public:
+    BuildProgressMonitor(nvinfer1::ITimingCache* cache, std::filesystem::path const& cachePath,
+        std::chrono::seconds saveInterval = std::chrono::seconds(10))
+        : mCache(cache)
+        , mCachePath(cachePath)
+        , mSaveInterval(saveInterval)
+        , mLastSaveTime(std::chrono::steady_clock::now())
+    {
+    }
+
+    void phaseStart(char const* phaseName, char const* parentPhase, int32_t nbSteps) noexcept override
+    {
+        // No-op
+    }
+
+    void phaseFinish(char const* phaseName) noexcept override
+    {
+        checkAndSave();
+    }
+
+    bool stepComplete(char const* phaseName, int32_t step) noexcept override
+    {
+        checkAndSave();
+        return true;
+    }
+
+private:
+    void checkAndSave() noexcept
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (now - mLastSaveTime >= mSaveInterval)
+        {
+            saveCache();
+            mLastSaveTime = now;
+        }
+    }
+
+    void saveCache() noexcept
+    {
+        if (mCache && !mCachePath.empty())
+        {
+            try
+            {
+                auto blob = std::unique_ptr<nvinfer1::IHostMemory>(mCache->serialize());
+                if (blob)
+                {
+                    auto tmpPath = mCachePath;
+                    tmpPath += ".tmp";
+                    {
+                        std::ofstream cacheFile(tmpPath, std::ios::binary);
+                        if (cacheFile)
+                        {
+                            cacheFile.write(static_cast<char*>(blob->data()), blob->size());
+                            cacheFile.flush();
+                            cacheFile.close();
+                        }
+                    }
+                    std::filesystem::rename(tmpPath, mCachePath);
+                    std::cout << "[BuildProgressMonitor] Timing cache flushed to " << mCachePath << std::endl;
+                }
+            }
+            catch (...)
+            {
+                // Suppress exceptions in noexcept
+            }
+        }
+    }
+
+    nvinfer1::ITimingCache* mCache;
+    std::filesystem::path mCachePath;
+    std::chrono::seconds mSaveInterval;
+    std::chrono::steady_clock::time_point mLastSaveTime;
+};
+
 //! Configuration structure for LLM model building.
 //! Contains all parameters needed to configure the TensorRT engine building process
-//! for Large Language Models, including standard LLMs and Eagle models.
+//! for Large Language Models, including standard LLMs, Eagle models, and Vision-Language Models.
 struct LLMBuilderConfig
 {
     int64_t maxInputLen{1024};        //!< Maximum input sequence length for the model
@@ -45,6 +128,12 @@ struct LLMBuilderConfig
     int64_t maxVerifyTreeSize{60}; //!< Maximum length of input_ids passed into Eagle base model for tree verification
     int64_t maxDraftTreeSize{60};  //!< Maximum length of input_ids passed into Eagle draft model for draft generation
     bool useTrtNativeOps{false};   //!< Whether to use TensorRT native operations instead of custom plugin
+    
+    // VLM and Weight Streaming members
+    bool isVlm{false};                 //!< Whether this is a Vision-Language Model
+    int64_t weightStreamingBudget{-1}; //!< Budget for weight streaming (-1 = disabled)
+    int64_t minImageTokens{0};         //!< Minimum number of image tokens
+    int64_t maxImageTokens{0};         //!< Maximum number of image tokens
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -193,25 +282,28 @@ private:
     //! Configures context lengths, rotary embeddings, and KV cache profiles.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
+    //! @param network TensorRT network definition for input analysis
     //! @return true if setup was successful, false otherwise
-    bool setupCommonProfiles(
-        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+    bool setupCommonProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
     //! Set up optimization profiles for vanilla (non-Eagle) LLM models.
     //! Configures input IDs and last token IDs for standard transformer models.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
+    //! @param network TensorRT network definition for input analysis
     //! @return true if setup was successful, false otherwise
-    bool setupVanillaProfiles(
-        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+    bool setupVanillaProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
     //! Set up optimization profiles for Eagle models.
     //! Configures Eagle-specific inputs like hidden states and attention masks.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
+    //! @param network TensorRT network definition for input analysis
     //! @return true if setup was successful, false otherwise
-    bool setupEagleProfiles(
-        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+    bool setupEagleProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
     //! Set up optimization profiles for Deepstack embeddings (Qwen3VL).
     //! Configures deepstack embedding inputs with the same profile as inputs_embeds.
@@ -245,23 +337,26 @@ private:
     //! Configures dynamic shapes for key-value cache inputs across all layers.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
+    //! @param network TensorRT network definition for input analysis
     //! @return true if setup was successful, false otherwise
-    bool setupKVCacheProfiles(
-        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+    bool setupKVCacheProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
     //! Set up optimization profiles for SSM state tensors (Mamba layers).
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
+    //! @param network TensorRT network definition for input analysis
     //! @return true if setup was successful, false otherwise
-    bool setupSSMStateProfiles(
-        nvinfer1::IOptimizationProfile* contextProfile, nvinfer1::IOptimizationProfile* generationProfile);
+    bool setupSSMStateProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
     //! Set up optimization profiles for conv state tensors (Mamba causal conv1d layers).
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
+    //! @param network TensorRT network definition for input analysis
     //! @return true if setup was successful, false otherwise
-    bool setupConvStateProfiles(
-        nvinfer1::IOptimizationProfile* contextProfile, nvinfer1::IOptimizationProfile* generationProfile);
+    bool setupConvStateProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
     //! Copy and save the model configuration with builder config.
     //! Creates a config.json file in the engine directory with both original model config

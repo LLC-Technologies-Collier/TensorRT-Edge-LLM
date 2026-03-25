@@ -28,9 +28,18 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: Sanitized LLM configuration for Edge-LLM export.
     """
-    required_fields = [
+    llm_config = {}
+    # Support both 'intermediate_size' and 'moe_intermediate_size' (used by Qwen 3.5 MoE)
+    if "intermediate_size" in config_dict:
+        llm_config["intermediate_size"] = config_dict["intermediate_size"]
+    elif "moe_intermediate_size" in config_dict:
+        llm_config["intermediate_size"] = config_dict["moe_intermediate_size"]
+    else:
+        raise KeyError("Required field 'intermediate_size' or 'moe_intermediate_size' not found in config")
+
+    required_fields_remaining = [
         "vocab_size", "max_position_embeddings", "hidden_size",
-        "intermediate_size", "num_hidden_layers", "num_attention_heads",
+        "num_hidden_layers", "num_attention_heads",
         "num_key_value_heads"
     ]
     optional_fields_with_defaults = {
@@ -38,8 +47,7 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         "rope_scaling": None,
     }
 
-    llm_config = {}
-    for field in required_fields:
+    for field in required_fields_remaining:
         if field not in config_dict:
             raise KeyError(f"Required field '{field}' not found in config")
         llm_config[field] = config_dict[field]

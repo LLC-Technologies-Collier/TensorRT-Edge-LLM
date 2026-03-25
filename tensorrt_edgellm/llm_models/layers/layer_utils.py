@@ -150,30 +150,32 @@ class EdgeLLMQKNorm(nn.Module):
         self.qk_norm = getattr(attention_module, 'qk_norm', None)
 
     def forward(self, query_states: torch.Tensor, key_states: torch.Tensor,
-                norm_shape):
+                q_norm_shape, k_norm_shape):
         """Apply normalization to query and key states.
         
         Args:
             query_states: Query states to normalize.
             key_states: Key states to normalize.
-            norm_shape: Shape for normalization (states are reshaped then restored).
+            q_norm_shape: Shape for normalizing query states.
+            k_norm_shape: Shape for normalizing key states.
         
         Returns:
             Tuple of (normalized query_states, normalized key_states).
         """
         q_shape = query_states.shape
         k_shape = key_states.shape
+
         if self.q_norm is not None:
             query_states = self.q_norm(
-                query_states.view(norm_shape)).contiguous().view(q_shape)
+                query_states.view(q_norm_shape)).contiguous().view(q_shape)
         if self.k_norm is not None:
             key_states = self.k_norm(
-                key_states.view(norm_shape)).contiguous().view(k_shape)
+                key_states.view(k_norm_shape)).contiguous().view(k_shape)
 
         if self.qk_norm is not None:
             query_states = self.qk_norm(
-                query_states.view(norm_shape)).contiguous().view(q_shape)
+                query_states.view(q_norm_shape)).contiguous().view(q_shape)
             key_states = self.qk_norm(
-                key_states.view(norm_shape)).contiguous().view(k_shape)
+                key_states.view(k_norm_shape)).contiguous().view(k_shape)
 
         return query_states, key_states

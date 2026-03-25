@@ -406,6 +406,12 @@ class Int4GemmPluginModule(nn.Module):
             return None
 
         permute_idx = None
+        
+        # If we are on meta device (skeleton tracing), skip actual weight processing
+        if self.qweight.device.type == 'meta':
+            self._weights_processed = True
+            return None
+
         with torch.no_grad():
             # Process weights for Int4GroupwiseGemmPlugin format
             # First, unpack the packed GPTQ weights
@@ -495,7 +501,7 @@ class Int4GemmPluginModule(nn.Module):
             source.in_features // 32 * source.bits,
             source.out_features,
         )
-        if source.qweight.shape != expected_shape:
+        if source.qweight.device.type != 'meta' and source.qweight.shape != expected_shape:
             raise RuntimeError(
                 "Source module has already been transformed (e.g. TorchFusedQuantLinear after forward). "
                 "Call replace_quant_linear_with_plugin(model) before the first forward pass."
@@ -552,6 +558,14 @@ def replace_quant_linear_with_plugin(model: nn.Module) -> nn.Module:
             bias=module.bias is not None,
             pack_dtype=getattr(module, "pack_dtype", torch.int32),
         )
+        
+        # Determine device of original module and move new module to it
+        try:
+            device = next(module.parameters()).device
+            new_module.to(device)
+        except StopIteration:
+            pass
+            
         permute_idx = new_module.load_state_dict_from_quant_linear(module)
         final_module = new_module
         if module.desc_act:

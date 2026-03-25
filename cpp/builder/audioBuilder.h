@@ -133,8 +133,9 @@ private:
 
     //! Set up Qwen3-Omni audio encoder profile.
     //! @param profile Optimization profile to configure
+    //! @param network TensorRT network definition for input analysis
     //! @return true if setup was successful, false otherwise
-    bool setupQwen3OmniAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile);
+    bool setupQwen3OmniAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile, nvinfer1::INetworkDefinition const& network);
 
     //! Set up optimization profile for Code2Wav vocoder.
     //! Creates optimization profile with appropriate dynamic shapes for code inputs.

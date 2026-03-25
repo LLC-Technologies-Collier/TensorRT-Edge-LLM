@@ -116,6 +116,11 @@ def main() -> None:
         help=
         "Comma-separated list of models to export for Qwen3-Omni (e.g., 'thinker,talker' or 'code_predictor'). Default: export all models"
     )
+    parser.add_argument(
+        "--load_meta",
+        action="store_true",
+        help="Whether to load model on meta device for skeleton tracing (required for 100B+ models)"
+    )
 
     args = parser.parse_args()
 
@@ -132,7 +137,8 @@ def main() -> None:
                          chat_template_path=args.chat_template_path,
                          fp8_kv_cache=args.fp8_kv_cache,
                          trt_native_ops=args.trt_native_ops,
-                         output_hidden_states=args.output_hidden_states)
+                         output_hidden_states=args.output_hidden_states,
+                         load_meta=args.load_meta)
 
         print("LLM model export completed successfully!")
 

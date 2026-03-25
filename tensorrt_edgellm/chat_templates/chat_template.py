@@ -344,17 +344,53 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
 
     print("Extracting patterns from chat template...")
 
-    # Extract system role patterns (base case)
+    # Extract system and user role patterns (many models like Qwen 3.5 MoE require user message)
     system_prompt = SystemMessage()
-    system_formatted = _format_messages(tokenizer, [system_prompt])
-    system_prefix, system_suffix = _extract_prefix_suffix(
-        system_formatted, system_prompt.content)
-
-    # Extract user role patterns (compare with system base)
     user_prompt = UserMessage()
-    user_formatted = _format_messages(tokenizer, [system_prompt, user_prompt])
-    user_prefix, user_suffix = _extract_prefix_suffix(
-        user_formatted[len(system_formatted):], user_prompt.content)
+    
+    # Try system-only first (backward compatibility)
+    try:
+        system_formatted = _format_messages(tokenizer, [system_prompt])
+        system_prefix, system_suffix = _extract_prefix_suffix(
+            system_formatted, system_prompt.content)
+        
+        user_formatted = _format_messages(tokenizer, [system_prompt, user_prompt])
+        user_prefix, user_suffix = _extract_prefix_suffix(
+            user_formatted[len(system_formatted):], user_prompt.content)
+    except ValueError as e:
+        if "user query" in str(e).lower() or "user message" in str(e).lower():
+            print("Detected template requiring user message, adjusting extraction strategy...")
+            # Combined format: [system, user]
+            combined_formatted = _format_messages(tokenizer, [system_prompt, user_prompt])
+            
+            # Find the user content in the combined string to split it
+            user_content_idx = combined_formatted.find(user_prompt.content)
+            if user_content_idx == -1:
+                raise ValueError("Could not find user content in formatted message during template extraction")
+            
+            # Use a heuristic: system ends where user prefix begins
+            # We find the user content, then look backwards for the start of the user block
+            # Actually, _extract_prefix_suffix is better at this if we give it the whole thing.
+            # But we need both.
+            
+            # Let's try formatting user-only first to see if THAT works
+            try:
+                user_formatted = _format_messages(tokenizer, [user_prompt])
+                user_prefix, user_suffix = _extract_prefix_suffix(user_formatted, user_prompt.content)
+                
+                # Now we know what user looks like, we can find it in the combined string to find system
+                user_start_idx = combined_formatted.find(user_prefix)
+                if user_start_idx != -1:
+                    system_formatted = combined_formatted[:user_start_idx]
+                    system_prefix, system_suffix = _extract_prefix_suffix(system_formatted, system_prompt.content)
+                else:
+                    # Fallback if user-only is also different
+                    raise e
+            except Exception:
+                # If everything fails, re-raise original error
+                raise e
+        else:
+            raise e
 
     # Some models (e.g. Qwen3-ASR) inject extra role blocks into the
     # system-only output (an empty user turn).  This causes system_suffix

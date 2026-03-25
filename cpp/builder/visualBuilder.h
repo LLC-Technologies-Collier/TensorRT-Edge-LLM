@@ -141,8 +141,9 @@ private:
     //! Set up optimization profile for InternVL or Phi4-MM ViT models.
     //! Configures inputs for InternVL or Phi4-MM visual encoders.
     //! @param profile Optimization profile to configure
+    //! @param network TensorRT network definition for input analysis
     //! @return true if setup was successful, false otherwise
-    bool setupInternPhi4ViTProfile(nvinfer1::IOptimizationProfile& profile);
+    bool setupInternPhi4ViTProfile(nvinfer1::IOptimizationProfile& profile, nvinfer1::INetworkDefinition const& network);
 
     //! Copy and save the model configuration with builder config.
     //! Creates a config.json file in the engine directory with both original model config

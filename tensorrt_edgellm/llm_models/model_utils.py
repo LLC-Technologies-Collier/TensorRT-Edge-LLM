@@ -25,7 +25,7 @@ import os
 import sys
 import types
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -37,6 +37,15 @@ from transformers import (AutoConfig, AutoModelForCausalLM,
 
 from accelerate.hooks import remove_hook_from_module
 from .models.eagle3_draft import Eagle3DraftModel
+
+
+def get_config_attr(module: nn.Module, attr_name: str, default: Any = None) -> Any:
+    """Helper to get attribute from module or its config."""
+    if hasattr(module, attr_name):
+        return getattr(module, attr_name)
+    if hasattr(module, "config") and hasattr(module.config, attr_name):
+        return getattr(module.config, attr_name)
+    return default
 
 
 def is_nvfp4_linear(module: nn.Module) -> bool:
@@ -379,7 +388,7 @@ def _load_phi4mm_war(model_dir: str):
 
 
 def load_hf_model(
-    model_dir: str, dtype: str, device: str
+    model_dir: str, dtype: str, device: str, ignore_mismatched_sizes: bool = True, load_meta: bool = False
 ) -> Tuple[Union[AutoModelForCausalLM, AutoModelForImageTextToText],
            AutoTokenizer, Optional[AutoProcessor]]:
     """
@@ -416,7 +425,8 @@ def load_hf_model(
         _apply_nemotron_h_patch()
         model = AutoModelForCausalLM.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
-            trust_remote_code=True).to(device)
+            trust_remote_code=True,
+            ignore_mismatched_sizes=ignore_mismatched_sizes).to(device)
 
     # Due to a known loading issue with Phi4MM on recent transformers, special handling is required.
     # See: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/discussions/75.
@@ -429,12 +439,14 @@ def load_hf_model(
             model_dir,
             torch_dtype=torch_dtype,
             trust_remote_code=True,
-            attn_implementation="eager").to(device)
+            attn_implementation="eager",
+            ignore_mismatched_sizes=ignore_mismatched_sizes).to(device)
     elif _is_qwen3_asr_model(model_dir):
         from qwen_asr import Qwen3ASRModel
         model = Qwen3ASRModel.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
-            trust_remote_code=True).model.to(device)
+            trust_remote_code=True,
+            ignore_mismatched_sizes=ignore_mismatched_sizes).model.to(device)
     elif _is_qwen3_tts_model(model_dir):
         from qwen_tts.core.models import (Qwen3TTSConfig,
                                           Qwen3TTSForConditionalGeneration)
@@ -453,55 +465,75 @@ def load_hf_model(
         from transformers import Qwen3OmniForConditionalGeneration
         model = Qwen3OmniForConditionalGeneration.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
-            trust_remote_code=True).to(device)
+            trust_remote_code=True,
+            ignore_mismatched_sizes=ignore_mismatched_sizes).to(device)
     elif _is_gptq_moe_model(model_dir):
         print(
             f"Loading GPTQ MoE model from {model_dir}. You might see warnings saying 'Some weights of the model checkpoint at Qwen/Qwen3-30B-A3B-GPTQ-Int4 were not used when initializing Qwen3MoeForCausalLM', which is expected. The weights will be fixed automatically afterwards."
         )
         model = AutoModelForCausalLM.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
-            trust_remote_code=True).to(device)
+            trust_remote_code=True,
+            ignore_mismatched_sizes=ignore_mismatched_sizes).to(device)
         _fix_gptq_moe_gate_weights(model, model_dir)
     else:
-        # Try loading as AutoModelForCausalLM first
-        try:
-            # Use device_map="auto" for CUDA to support massive models (e.g. 122B MoE)
-            # which cannot fit in host RAM if loaded on CPU first.
-            model_kwargs = {
-                "torch_dtype": torch_dtype,
-                "low_cpu_mem_usage": True,
-                "trust_remote_code": True,
-            }
-            if device.type == "cuda":
-                print(f"Using device_map='sequential' for {device}")
-                model_kwargs["device_map"] = "sequential"
-                # MoE models require explicit offload folder when using device_map='auto'
-                offload_dir = "/tmp/qwen_offload"
-                print(f"DEBUG: Creating local offload folder at {offload_dir}...")
-                os.makedirs(offload_dir, exist_ok=True)
-                print(f"DEBUG: Offload folder created successfully.")
-                model_kwargs["offload_folder"] = offload_dir
-                model_kwargs["ignore_mismatched_sizes"] = True
-                
-                # Limit memory to avoid OOM on 128GB node
-                # Force almost everything to Disk by setting very small max_memory
-                model_kwargs["max_memory"] = {0: "10GiB", "cpu": "10GiB"}
-            else:
-                model_kwargs["device_map"] = "cpu"
-
-            model = AutoModelForCausalLM.from_pretrained(model_dir, **model_kwargs)
-        except Exception as e_causal:
-            print(f"AutoModelForCausalLM failed: {e_causal}")
-            # If that fails, try AutoModelForImageTextToText
+        if load_meta:
+            print(f"DEBUG: Initializing skeleton model from config on meta device...")
+            from transformers import AutoConfig
+            import accelerate
+            config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+            with accelerate.init_empty_weights():
+                try:
+                    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+                except Exception as e_causal:
+                    print(f"AutoModelForCausalLM.from_config failed: {e_causal}")
+                    model = AutoModelForImageTextToText.from_config(config, trust_remote_code=True)
+            print("DEBUG: Skeleton model initialized successfully.")
+        else:
+            # Try loading as AutoModelForCausalLM first
             try:
-                # TODO: Need a WAR to quantize only the language model.
-                # In VLMs, the model has both model.language_model and model.vision_model.
-                model = AutoModelForImageTextToText.from_pretrained(
-                    model_dir, torch_dtype=torch_dtype,
-                    trust_remote_code=True).to(device)
-            except Exception as e:
-                raise ValueError(
-                    f"Could not load model from {model_dir}. Error: {e}")
+                # Use device_map="auto" for CUDA to support massive models (e.g. 122B MoE)
+                # which cannot fit in host RAM if loaded on CPU first.
+                model_kwargs = {
+                    "torch_dtype": torch_dtype,
+                    "low_cpu_mem_usage": True,
+                    "trust_remote_code": True,
+                }
+                if device.type == "cuda":
+                    print(f"Using device_map='auto' for {device}")
+                    model_kwargs["device_map"] = "auto"
+                    # MoE models require explicit offload folder when using device_map='auto'
+                    offload_dir = "/srv/nfs/c9h-llm-data/tmp_qwen_offload"
+                    print(f"DEBUG: Creating local offload folder at {offload_dir}...")
+                    os.makedirs(offload_dir, exist_ok=True)
+                    print(f"DEBUG: Offload folder created successfully.")
+                    model_kwargs["offload_folder"] = offload_dir
+                    model_kwargs["ignore_mismatched_sizes"] = True
+                    model_kwargs["offload_buffers"] = True
+                    model_kwargs["offload_state_dict"] = True
+                    
+                    # Limit memory to avoid OOM on 128GB node
+                    # Auto map should prefer CPU/RAM over Disk. 
+                    # Give it 10GB of CPU RAM to work with to be safe from OOM.
+                    model_kwargs["max_memory"] = {0: "4GiB", "cpu": "10GiB"}
+                else:
+                    model_kwargs["device_map"] = "cpu"
+
+                model = AutoModelForCausalLM.from_pretrained(model_dir, **model_kwargs)
+                print("DEBUG: AutoModelForCausalLM.from_pretrained returned successfully.")
+            except Exception as e_causal:
+                print(f"AutoModelForCausalLM failed: {e_causal}")
+                # If that fails, try AutoModelForImageTextToText
+                try:
+                    # TODO: Need a WAR to quantize only the language model.
+                    # In VLMs, the model has both model.language_model and model.vision_model.
+                    model = AutoModelForImageTextToText.from_pretrained(
+                        model_dir, torch_dtype=torch_dtype,
+                        trust_remote_code=True,
+                        ignore_mismatched_sizes=ignore_mismatched_sizes).to(device)
+                except Exception as e:
+                    raise ValueError(
+                        f"Could not load model from {model_dir}. Error: {e}")
     if not is_gptq_model(model):
         # from_pretrained with device_map already handles the dtype and device.
         # Calling .to() on offloaded models will raise RuntimeError from accelerate.
@@ -513,14 +545,17 @@ def load_hf_model(
             print(f"DEBUG: model.to() skipped or failed: {e}")
 
     # Set tokenizer padding token if needed
+    print("DEBUG: Configuring tokenizer pad token...")
     if tokenizer.pad_token != "<unk>":
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    print("DEBUG: Tokenizer configured.")
 
     # Try to load processor if available
     processor = None
     try:
+        print("DEBUG: Attempting to load processor...")
         processor = AutoProcessor.from_pretrained(
             model_dir,
             trust_remote_code=True,
@@ -530,14 +565,16 @@ def load_hf_model(
         print(
             f"Warning: Loaded processor from {model_dir}. The processor will skip image processing for images smaller than 128x28x28 or bigger than 2048x32x32 due to excessive memory usage during image quntization."
         )
-    except Exception:
+    except Exception as e:
         # Processor not available for this model
-        pass
+        print(f"DEBUG: Processor not loaded: {e}")
 
     # Ensure model is in eval mode and no gradients
+    print("DEBUG: Setting model to eval mode...")
     model.eval()
     for param in model.parameters():
         param.requires_grad = False
+    print("DEBUG: Model eval mode set.")
 
     # 1. Strip accelerate hooks BEFORE moving any tensors.
     # This is critical as the hooks often block moves or call .data_ptr().
@@ -614,7 +651,9 @@ def load_llm_model(
     reduced_vocab_size: Optional[int] = None,
     vocab_map: Optional[torch.Tensor] = None,
     trt_native_ops: bool = False,
-    output_hidden_states: bool = False
+    output_hidden_states: bool = False,
+    ignore_mismatched_sizes: bool = True,
+    load_meta: bool = False
 ) -> tuple[nn.Module, AutoTokenizer, Optional[AutoProcessor]]:
     """
     Load a language model (standard or EAGLE base).
@@ -641,7 +680,7 @@ def load_llm_model(
     else:
         print(f"Loading standard model from {model_dir}")
 
-    model, tokenizer, processor = load_hf_model(model_dir, dtype, device)
+    model, tokenizer, processor = load_hf_model(model_dir, dtype, device, ignore_mismatched_sizes, load_meta)
 
     # Create EdgeLLMModel wrappers based on model type
     if _is_qwen3_tts_model(model_dir):
@@ -683,7 +722,41 @@ def load_llm_model(
         # Standard LLM / EAGLE
         hf_model = model
 
-        is_hybrid = hasattr(hf_model.config, 'layers_block_type')
+        # Qwen 3.5 weight preprocessing
+        if not load_meta and getattr(hf_model.config, 'model_type', '') in ['qwen3_5_moe', 'qwen3_5_moe_text']:
+            # Double check if any parameter is on meta device to be safe
+            is_meta = any(p.device.type == 'meta' for p in hf_model.parameters())
+            if is_meta:
+                print("DEBUG: Skeleton model on meta device detected, skipping weight reordering.")
+            else:
+                from .models.qwen3_5_mapper import preprocess_qwen3_5_weights
+                print("Applying Qwen 3.5 weight reordering and packing...")
+                
+                # Explicitly collect keys once to avoid repeated state_dict calls on massive models
+                current_state_dict = hf_model.state_dict()
+                orig_keys = set(current_state_dict.keys())
+                
+                new_state_dict = preprocess_qwen3_5_weights(current_state_dict, hf_model.config)
+                
+                # Manually update parameters to avoid NotImplementedError on meta/offload
+                print(f"DEBUG: Manually loading {len(new_state_dict)} preprocessed parameters to {device}...")
+                from accelerate.utils import set_module_tensor_to_device
+                for name, tensor in new_state_dict.items():
+                    if name in orig_keys:
+                        # Identify module and attribute
+                        module_path = name.split('.')
+                        attr_name = module_path.pop()
+                        target_module = hf_model
+                        for m_part in module_path:
+                            target_module = getattr(target_module, m_part)
+                        set_module_tensor_to_device(target_module, attr_name, device, tensor)
+                
+                # Free up memory
+                del current_state_dict
+                gc.collect()
+
+        is_hybrid = hasattr(hf_model.config, 'layers_block_type') or \
+                    getattr(hf_model.config, 'model_type', '') == 'qwen3_5_moe_text'
 
         if is_hybrid and not trt_native_ops:
             print("Detected hybrid (Mamba+Attention) architecture")
@@ -845,10 +918,13 @@ def prepare_language_model_and_config(hf_model: nn.Module):
     # Use language_model if available, otherwise use model.model.
     if hasattr(hf_model, 'language_model'):
         language_model = hf_model.language_model
-        config = hf_model.config.text_config
+        config = getattr(hf_model.config, 'text_config', hf_model.config)
     elif getattr(hf_model.config, 'model_type', '') == 'qwen3_omni_thinker':
         language_model = hf_model.model
         config = hf_model.config.text_config
+    elif hasattr(hf_model, 'model') and hasattr(hf_model.model, 'language_model'):
+        language_model = hf_model.model.language_model
+        config = getattr(hf_model.config, 'text_config', hf_model.config)
     elif hasattr(hf_model, 'backbone'):
         language_model = hf_model.backbone
         config = hf_model.config

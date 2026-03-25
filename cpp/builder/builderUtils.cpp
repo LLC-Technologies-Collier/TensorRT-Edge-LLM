@@ -16,6 +16,7 @@
  */
 
 #include "builderUtils.h"
+#include "llmBuilder.h"
 #include "common/logger.h"
 
 #include <NvOnnxParser.h>
@@ -81,17 +82,53 @@ bool checkOptimizationProfileDims(
 //! @param optDims Optimal dimensions for the input
 //! @param maxDims Maximum dimensions for the input
 //! @return true if setting was successful, false otherwise
-bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, char const* inputName,
-    nvinfer1::Dims const& minDims, nvinfer1::Dims const& optDims, nvinfer1::Dims const& maxDims) noexcept
+nvinfer1::Dims sanitizeDims(nvinfer1::Dims const& dims)
 {
-    if (!checkOptimizationProfileDims(minDims, optDims, maxDims))
+    nvinfer1::Dims sanitized = dims;
+    for (int i = 0; i < sanitized.nbDims; ++i)
     {
-        LOG_INFO("setOptimizationProfile: %s is not valid", inputName);
+        if (sanitized.d[i] < 0)
+        {
+            sanitized.d[i] = 1; // Default dynamic dimension to 1 for static profiles
+        }
+    }
+    return sanitized;
+}
+
+bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, nvinfer1::INetworkDefinition const& network,
+    char const* inputName, nvinfer1::Dims const& minDims, nvinfer1::Dims const& optDims, nvinfer1::Dims const& maxDims) noexcept
+{
+    // Check if the input exists in the network
+    bool inputExists = false;
+    for (int32_t i = 0; i < network.getNbInputs(); ++i)
+    {
+        if (std::string(network.getInput(i)->getName()) == inputName)
+        {
+            inputExists = true;
+            break;
+        }
+    }
+
+    if (!inputExists)
+    {
+        LOG_DEBUG("setOptimizationProfile: %s not found in network, skipping", inputName);
+        return true; // Return true as it's not a fatal error, just a missing input
+    }
+
+    // Sanitize dimensions to ensure no -1 wildcards are passed to setDimensions
+    auto sMin = sanitizeDims(minDims);
+    auto sOpt = sanitizeDims(optDims);
+    auto sMax = sanitizeDims(maxDims);
+
+    if (!checkOptimizationProfileDims(sMin, sOpt, sMax))
+    {
+        LOG_INFO("setOptimizationProfile: %s dimensions are not valid", inputName);
         return false;
     }
-    return profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMIN, minDims)
-        && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kOPT, optDims)
-        && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMAX, maxDims);
+
+    return profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMIN, sMin)
+        && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kOPT, sOpt)
+        && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMAX, sMax);
 }
 //! Print detailed information about the TensorRT network.
 //! Shows input and output tensor names and shapes for debugging purposes.
@@ -229,6 +266,35 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
 #if (NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 6) || NV_TENSORRT_MAJOR >= 11
     config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
 #endif
+
+    return config;
+}
+
+std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder* builder, LLMBuilderConfig const& builderConfig)
+{
+    auto config = createBuilderConfig(builder);
+    if (!config)
+    {
+        return nullptr;
+    }
+
+    // Enable weight streaming flag if budget is requested
+    // Note: The actual budget is applied at runtime on the ICudaEngine
+    if (builderConfig.weightStreamingBudget > 0)
+    {
+        LOG_INFO("Enabling weight streaming flag for build.");
+        config->setFlag(nvinfer1::BuilderFlag::kWEIGHT_STREAMING);
+        
+        // For massive models on constrained hardware, also disable timing cache,
+        // use fastest optimization level, and DISABLE all external tactic sources 
+        // to avoid internal tactic selection errors (like Error Code 10).
+        LOG_INFO("Using aggressive memory-saving build settings (Optimization Level 0, No Timing Cache, No External Tactics).");
+        config->setFlag(nvinfer1::BuilderFlag::kDISABLE_TIMING_CACHE);
+        config->setBuilderOptimizationLevel(0);
+        
+        // Clear all tactic sources
+        config->setTacticSources(0);
+    }
 
     return config;
 }

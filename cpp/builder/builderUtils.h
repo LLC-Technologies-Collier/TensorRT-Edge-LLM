@@ -31,6 +31,9 @@ namespace trt_edgellm
 namespace builder
 {
 
+//! Forward declaration
+struct LLMBuilderConfig;
+
 //! JSON key names used in model configs
 constexpr char kVisionConfigKey[] = "vision_config";
 constexpr char kModelTypeKey[] = "model_type";
@@ -55,13 +58,14 @@ bool checkOptimizationProfileDims(
 //! Set optimization profile dimensions for a specific input.
 //! Validates the dimensions and sets them on the optimization profile.
 //! @param profile Optimization profile to configure
+//! @param network TensorRT network definition for validation
 //! @param inputName Name of the input tensor
 //! @param minDims Minimum dimensions for the input
 //! @param optDims Optimal dimensions for the input
 //! @param maxDims Maximum dimensions for the input
 //! @return true if setting was successful, false otherwise
-bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, char const* inputName,
-    nvinfer1::Dims const& minDims, nvinfer1::Dims const& optDims, nvinfer1::Dims const& maxDims) noexcept;
+bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, nvinfer1::INetworkDefinition const& network,
+    char const* inputName, nvinfer1::Dims const& minDims, nvinfer1::Dims const& optDims, nvinfer1::Dims const& maxDims) noexcept;
 
 //! Print detailed information about the TensorRT network.
 //! Shows input and output tensor names and shapes for debugging purposes.
@@ -87,6 +91,12 @@ std::pair<std::unique_ptr<nvinfer1::IBuilder>, std::unique_ptr<nvinfer1::INetwor
 //! @param builder TensorRT builder object
 //! @return Builder config with monitor memory flag enabled (TRT >= 10.6)
 std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder* builder);
+
+//! Create TensorRT builder config with weight streaming support.
+//! @param builder TensorRT builder object
+//! @param builderConfig LLM-specific builder configuration containing streaming budget
+//! @return Builder config with weight streaming enabled if configured
+std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder* builder, LLMBuilderConfig const& builderConfig);
 
 //! Parse ONNX model and create parser.
 //! @param network TensorRT network definition to populate

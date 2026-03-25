@@ -686,9 +686,15 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
         if attn_module is None:
             raise AttributeError(f"Could not find attention module in {type(decoder_layer)}")
 
-        from .attention_trt import EdgeLLMAttentionTRTNative
-        self.self_attn = EdgeLLMAttentionTRTNative(
-            attn_module, eagle3_draft=self.eagle3_draft)
+        # Qwen 3.5 Gated Delta Attention requires specialized TRTNative implementation
+        if "GatedDeltaNet" in type(attn_module).__name__:
+            from ..models.qwen3_5_moe_trtnative import Qwen3_5MoeGatedDeltaNetTRTNative
+            self.self_attn = Qwen3_5MoeGatedDeltaNetTRTNative(
+                attn_module, eagle3_draft=self.eagle3_draft)
+        else:
+            from .attention_trt import EdgeLLMAttentionTRTNative
+            self.self_attn = EdgeLLMAttentionTRTNative(
+                attn_module, eagle3_draft=self.eagle3_draft)
 
     def _init_with_config(self, config: Any):
         # Construct new components from config (for draft models)
@@ -723,13 +729,11 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
-        k_cache: Optional[torch.Tensor] = None,
-        v_cache: Optional[torch.Tensor] = None,
+        kv_cache: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[
-            torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through the decoder layer for ONNX export.
         
@@ -738,14 +742,13 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
             rope_rotary_cos_sin: RoPE rotary embeddings of shape (batch, seq_len, head_dim)
             context_lengths: Context length tensor of shape (batch,)
             kvcache_start_index: Start index of KV cache of shape (kv_cache_start_batch_size,), required
-            k_cache: Key cache (batch, num_heads, capacity, head_dim)
-            v_cache: Value cache (batch, num_heads, capacity, head_dim)
+            kv_cache: Fused Key/Value cache (batch, 2, num_heads, capacity, head_dim)
             attention_mask: Attention mask of shape (batch, seq_len, seq_len + past_len), optional
             position_ids: Position IDs of shape (batch, seq_len), optional
             inputs_embeds: Input embeddings for EAGLE3 draft (batch, seq_len, hidden_size), optional
             
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (hidden_states, present_k_cache, present_v_cache)
+            Tuple[torch.Tensor, torch.Tensor]: (hidden_states, present_kv_cache)
         """
         residual = hidden_states
 
@@ -765,10 +768,9 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
         if self.laurel is not None:
             laurel_output = self.laurel(hidden_states)
 
-        hidden_states, present_k_cache, present_v_cache = self.self_attn(
+        hidden_states, present_kv_cache = self.self_attn(
             hidden_states=hidden_states,
-            k_cache=k_cache,
-            v_cache=v_cache,
+            kv_cache=kv_cache,
             rope_rotary_cos_sin=rope_rotary_cos_sin,
             context_lengths=context_lengths,
             kvcache_start_index=kvcache_start_index,
@@ -795,7 +797,7 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
             hidden_states = self.mlp(hidden_states)
             hidden_states = residual + hidden_states
 
-        return hidden_states, present_k_cache, present_v_cache
+        return hidden_states, present_kv_cache
 
 
 class EdgeLLMMambaLayer(nn.Module):

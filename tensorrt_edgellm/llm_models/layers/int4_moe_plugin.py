@@ -24,6 +24,11 @@ from torch.onnx import register_custom_op_symbolic, symbolic_helper
 from torch.onnx.symbolic_helper import _get_tensor_sizes
 from transformers.models.qwen3_moe.modeling_qwen3_moe import \
     Qwen3MoeSparseMoeBlock
+try:
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import \
+        Qwen3_5MoeSparseMoeBlock
+except ImportError:
+    Qwen3_5MoeSparseMoeBlock = type("DummyQwen3_5MoeSparseMoeBlock", (), {})
 
 from ...common import ONNX_OPSET_VERSION
 from .int4_gemm_plugin import unpack_int4_weights_gptq
@@ -255,6 +260,23 @@ def int4_moe_plugin(
                          device=hidden_states.device)
     return output
 
+@int4_moe_plugin.register_fake
+def int4_moe_plugin_fake(
+    router_logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc_gate_up_qweights: torch.Tensor,
+    fc_gate_up_scales: torch.Tensor,
+    fc_down_qweights: torch.Tensor,
+    fc_down_scales: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    quantization_group_size: int,
+) -> torch.Tensor:
+    batch_size, seq_len, _ = hidden_states.shape
+    return torch.empty((batch_size, seq_len, hidden_size), dtype=hidden_states.dtype, device=hidden_states.device)
 
 def _is_gptq_quant_linear(module: nn.Module) -> bool:
     """Detect if a module uses GPTQ format (qweight packed along K dimension)."""
@@ -373,6 +395,13 @@ def pack_int4_awq_marlin(
         f"scales shape {scales.shape} must be [{num_experts}, {N}, {num_groups}]"
 
     device = weights_q.device
+    
+    if weights_q.is_meta:
+        # For meta device, return empty tensors with correct shapes for tracing
+        weights_marlin = torch.empty((num_experts, K // 16, N * 2), dtype=torch.int32, device=device)
+        scales_marlin = scales.transpose(1, 2).contiguous()
+        return weights_marlin, scales_marlin
+
     weights_marlin_list = []
 
     for expert_id in range(num_experts):
@@ -422,9 +451,43 @@ class Int4MoePluginModule(nn.Module):
     """
 
     def __init__(self,
-                 moe_block: Qwen3MoeSparseMoeBlock,
+                 moe_block: nn.Module,
                  group_size: int = 128):
         super().__init__()
+
+        is_qwen3_5 = type(moe_block).__name__ == "Qwen3_5MoeSparseMoeBlock"
+
+        if is_qwen3_5:
+            self.num_experts = moe_block.experts.num_experts
+            self.top_k = moe_block.gate.top_k
+            self.hidden_size = moe_block.experts.hidden_dim
+            self.moe_inter_size = moe_block.experts.intermediate_dim
+            self.group_size = group_size
+            self.activation_type = 0
+            
+            # Gate as nn.Linear so it traces to FP16 GEMM
+            # Qwen3_5MoeTopKRouter uses 'weight' parameter directly, not an nn.Linear
+            self.gate = nn.Linear(
+                self.hidden_size,
+                self.num_experts,
+                bias=False,
+                dtype=torch.float16,
+            )
+            if moe_block.gate.weight.device.type != 'meta':
+                self.gate.weight.data = moe_block.gate.weight.data.clone().to(torch.float16)
+
+            # For Qwen 3.5, weights are fused and handled by qwen3_5_mapper.py.
+            # Create dummy buffers for ONNX export to satisfy the plugin signature.
+            E = self.num_experts
+            I = self.moe_inter_size * 2
+            D = self.hidden_size
+            G = I // group_size if group_size != -1 else 1
+
+            self.register_buffer("fc_gate_up_qweights", torch.empty((E, I//16, D*2), dtype=torch.int8, device='meta'))
+            self.register_buffer("fc_gate_up_scales", torch.empty((E, G, D), dtype=torch.float16, device='meta'))
+            self.register_buffer("fc_down_qweights", torch.empty((E, D//16, I), dtype=torch.int8, device='meta'))
+            self.register_buffer("fc_down_scales", torch.empty((E, D//group_size if group_size != -1 else 1, I//2), dtype=torch.float16, device='meta'))
+            return
 
         self.num_experts = moe_block.num_experts
         self.top_k = moe_block.top_k
@@ -507,6 +570,19 @@ class Int4MoePluginModule(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, hidden_dim)
+        
+        # Ensure hidden_flat matches self.gate.in_features exactly.
+        # Hybrid models like Qwen 3.5 MoE might have varying head counts.
+        target_features = self.gate.in_features
+        current_features = hidden_flat.shape[-1]
+        
+        if current_features != target_features:
+            if current_features < target_features:
+                ratio = target_features // current_features
+                hidden_flat = hidden_flat.repeat_interleave(ratio, dim=-1)
+            else:
+                hidden_flat = hidden_flat[..., :target_features]
+
         router_logits = self.gate(hidden_flat).float()
         return int4_moe_plugin(
             router_logits,
@@ -539,13 +615,25 @@ def replace_moe_blocks_with_plugin(model: nn.Module,
     qweight is still in GPTQ format. Use _fix_gptq_moe_gate_weights() first
     to replace quantized gate with nn.Linear.
     """
-    for name, module in list(model.named_modules()):
-        if isinstance(module, Qwen3MoeSparseMoeBlock):
-            new_module = Int4MoePluginModule(module, group_size)
+    replacements = {}
+    for name, module in list(model.named_modules(remove_duplicate=False)):
+        if type(module).__name__ in ["Qwen3MoeSparseMoeBlock", "Qwen3_5MoeSparseMoeBlock"]:
+            print(f"DEBUG: Found MoE block to replace: {name}")
+            if id(module) not in replacements:
+                new_module = Int4MoePluginModule(module, group_size)
+                # Determine device of original module and move new module to it
+                try:
+                    device = next(module.parameters()).device
+                    new_module.to(device)
+                except StopIteration:
+                    pass
+                replacements[id(module)] = new_module
+            new_module = replacements[id(module)]
+            
             parent = model
             if "." in name:
                 parent_name, module_name = name.rsplit(".", 1)
-                parent = dict(model.named_modules())[parent_name]
+                parent = dict(model.named_modules(remove_duplicate=False))[parent_name]
             else:
                 module_name = name
             setattr(parent, module_name, new_module)

@@ -204,7 +204,7 @@ bool VisualBuilder::setupVisualOptimizationProfile(
     case multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER: result = setupQwenViTProfile(*visualProfile, network); break;
 
     case multimodal::ModelType::INTERNVL:
-    case multimodal::ModelType::PHI4MM: result = setupInternPhi4ViTProfile(*visualProfile); break;
+    case multimodal::ModelType::PHI4MM: result = setupInternPhi4ViTProfile(*visualProfile, network); break;
 
     default: LOG_ERROR("Unsupported model type for visual encoder: %d", static_cast<int>(mModelType)); return false;
     }
@@ -261,34 +261,34 @@ bool VisualBuilder::setupQwenViTProfile(
     }
 
     // Base inputs
-    result &= setOptimizationProfile(&profile, binding_names::kVisualInput, createDims({minHW, inputDim}),
+    result &= setOptimizationProfile(&profile, network, binding_names::kVisualInput, createDims({minHW, inputDim}),
         createDims({optHW, inputDim}), createDims({maxHW, inputDim}));
-    result &= setOptimizationProfile(&profile, binding_names::kRotaryPosEmb, createDims({minHW, ropeEmbedSize}),
+    result &= setOptimizationProfile(&profile, network, binding_names::kRotaryPosEmb, createDims({minHW, ropeEmbedSize}),
         createDims({optHW, ropeEmbedSize}), createDims({maxHW, ropeEmbedSize}));
     int64_t maxNumImages = std::max<int64_t>(1, mBuilderConfig.maxImageTokens / mBuilderConfig.minImageTokens);
-    result &= setOptimizationProfile(&profile, binding_names::kCuSeqlens, createDims({2}),
+    result &= setOptimizationProfile(&profile, network, binding_names::kCuSeqlens, createDims({2}),
         createDims({maxNumImages + 1}), createDims({maxNumImages + 1}));
     int32_t maxSeqLen = static_cast<int32_t>(mBuilderConfig.maxImageTokensPerImage * 4);
-    result &= setOptimizationProfile(&profile, binding_names::kMaxSeqLenCarrier, createDims({1}),
+    result &= setOptimizationProfile(&profile, network, binding_names::kMaxSeqLenCarrier, createDims({1}),
         createDims({maxSeqLen / 2}), createDims({maxSeqLen}));
 
     // Additional inputs
     if (mModelType == multimodal::ModelType::QWEN2_5_VL)
     {
         // Use maxImageTokens as a safe upper bound for cumulative window sequence lengths.
-        result &= setOptimizationProfile(&profile, binding_names::kCuWindowSeqlens, createDims({2}),
+        result &= setOptimizationProfile(&profile, network, binding_names::kCuWindowSeqlens, createDims({2}),
             createDims({mBuilderConfig.maxImageTokens}), createDims({mBuilderConfig.maxImageTokens}));
-        result &= setOptimizationProfile(&profile, binding_names::kWindowIndex, createDims({minHW / 4}),
+        result &= setOptimizationProfile(&profile, network, binding_names::kWindowIndex, createDims({minHW / 4}),
             createDims({optHW / 4}), createDims({maxHW / 4}));
-        result &= setOptimizationProfile(&profile, binding_names::kReverseWindowIndex, createDims({minHW / 4}),
+        result &= setOptimizationProfile(&profile, network, binding_names::kReverseWindowIndex, createDims({minHW / 4}),
             createDims({optHW / 4}), createDims({maxHW / 4}));
     }
     else if (mModelType == multimodal::ModelType::QWEN3_VL
         || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
-        result &= setOptimizationProfile(&profile, binding_names::kFastPosEmbIdx, createDims({4, minHW}),
+        result &= setOptimizationProfile(&profile, network, binding_names::kFastPosEmbIdx, createDims({4, minHW}),
             createDims({4, optHW}), createDims({4, maxHW}));
-        result &= setOptimizationProfile(&profile, binding_names::kFastPosEmbWeight, createDims({4, minHW}),
+        result &= setOptimizationProfile(&profile, network, binding_names::kFastPosEmbWeight, createDims({4, minHW}),
             createDims({4, optHW}), createDims({4, maxHW}));
     }
 
@@ -300,7 +300,8 @@ bool VisualBuilder::setupQwenViTProfile(
     return result;
 }
 
-bool VisualBuilder::setupInternPhi4ViTProfile(nvinfer1::IOptimizationProfile& profile)
+bool VisualBuilder::setupInternPhi4ViTProfile(
+    nvinfer1::IOptimizationProfile& profile, nvinfer1::INetworkDefinition const& network)
 {
     bool result = true;
 
@@ -319,7 +320,7 @@ bool VisualBuilder::setupInternPhi4ViTProfile(nvinfer1::IOptimizationProfile& pr
     int64_t maxNumBlocks = mBuilderConfig.maxImageTokens / kBlockLength;
     int64_t optNumBlocks = (minNumBlocks + maxNumBlocks) / 2;
 
-    result &= setOptimizationProfile(&profile, binding_names::kVisualInput,
+    result &= setOptimizationProfile(&profile, network, binding_names::kVisualInput,
         createDims({minNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
         createDims({optNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
         createDims({maxNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}));

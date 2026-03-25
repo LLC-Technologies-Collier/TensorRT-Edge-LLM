@@ -42,7 +42,8 @@ enum LLMBuildOptionId : int
     EAGLE_DRAFT = 709,
     EAGLE_BASE = 710,
     MAX_VERIFY_TREE_SIZE = 711,
-    MAX_DRAFT_TREE_SIZE = 712
+    MAX_DRAFT_TREE_SIZE = 712,
+    WEIGHT_STREAMING_BUDGET = 713
 };
 
 struct LLMBuildArgs
@@ -59,6 +60,7 @@ struct LLMBuildArgs
     bool eagleBase{false};
     int64_t maxVerifyTreeSize{60};
     int64_t maxDraftTreeSize{60};
+    int64_t weightStreamingBudget{-1};
 };
 
 void printUsage(char const* programName)
@@ -67,7 +69,7 @@ void printUsage(char const* programName)
               << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
                  "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
                  "[--eagleDraft] [--eagleBase] [--maxVerifyTreeSize <int>] "
-                 "[--maxDraftTreeSize <int>]"
+                 "[--maxDraftTreeSize <int>] [--weightStreamingBudget <long>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
@@ -90,6 +92,8 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --maxDraftTreeSize        Maximum input_ids tokens passed into Eagle draft model for draft "
                  "generation. Default = 60"
+              << std::endl;
+    std::cerr << "  --weightStreamingBudget   Budget for weight streaming in bytes. Default = -1 (disabled)"
               << std::endl
               << std::endl;
 }
@@ -107,7 +111,8 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"eagleDraft", no_argument, 0, LLMBuildOptionId::EAGLE_DRAFT},
         {"eagleBase", no_argument, 0, LLMBuildOptionId::EAGLE_BASE},
         {"maxVerifyTreeSize", required_argument, 0, LLMBuildOptionId::MAX_VERIFY_TREE_SIZE},
-        {"maxDraftTreeSize", required_argument, 0, LLMBuildOptionId::MAX_DRAFT_TREE_SIZE}, {0, 0, 0, 0}};
+        {"maxDraftTreeSize", required_argument, 0, LLMBuildOptionId::MAX_DRAFT_TREE_SIZE},
+        {"weightStreamingBudget", required_argument, 0, LLMBuildOptionId::WEIGHT_STREAMING_BUDGET}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", buildOptions, nullptr)) != -1)
@@ -140,26 +145,26 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         case LLMBuildOptionId::MAX_INPUT_LEN:
             if (optarg)
             {
-                args.maxInputLen = std::stoi(optarg);
+                args.maxInputLen = std::stol(optarg);
             }
             break;
         case LLMBuildOptionId::MAX_KV_CACHE_CAPACITY:
             if (optarg)
             {
-                args.maxKVCacheCapacity = std::stoi(optarg);
+                args.maxKVCacheCapacity = std::stol(optarg);
             }
             break;
         case LLMBuildOptionId::DEBUG: args.debug = true; break;
         case LLMBuildOptionId::MAX_BATCH_SIZE:
             if (optarg)
             {
-                args.maxBatchSize = std::stoi(optarg);
+                args.maxBatchSize = std::stol(optarg);
             }
             break;
         case LLMBuildOptionId::MAX_LORA_RANK:
             if (optarg)
             {
-                args.maxLoraRank = std::stoi(optarg);
+                args.maxLoraRank = std::stol(optarg);
             }
             break;
         case LLMBuildOptionId::EAGLE_DRAFT: args.eagleDraft = true; break;
@@ -167,13 +172,19 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         case LLMBuildOptionId::MAX_VERIFY_TREE_SIZE:
             if (optarg)
             {
-                args.maxVerifyTreeSize = std::stoi(optarg);
+                args.maxVerifyTreeSize = std::stol(optarg);
             }
             break;
         case LLMBuildOptionId::MAX_DRAFT_TREE_SIZE:
             if (optarg)
             {
-                args.maxDraftTreeSize = std::stoi(optarg);
+                args.maxDraftTreeSize = std::stol(optarg);
+            }
+            break;
+        case LLMBuildOptionId::WEIGHT_STREAMING_BUDGET:
+            if (optarg)
+            {
+                args.weightStreamingBudget = std::stol(optarg);
             }
             break;
         default: LOG_ERROR("Invalid Argument %c is %s.", opt, optarg); return false;
@@ -226,6 +237,7 @@ int main(int argc, char** argv)
     config.eagleBase = args.eagleBase;
     config.maxVerifyTreeSize = args.maxVerifyTreeSize;
     config.maxDraftTreeSize = args.maxDraftTreeSize;
+    config.weightStreamingBudget = args.weightStreamingBudget;
 
     // Create and run the builder
     builder::LLMBuilder llmBuilder(args.onnxDir, args.engineDir, config);

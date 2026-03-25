@@ -100,8 +100,7 @@ class EdgeLLMModelTRTNative(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         last_token_ids: torch.Tensor,
-        k_caches: Tuple[torch.Tensor, ...],
-        v_caches: Tuple[torch.Tensor, ...],
+        kv_caches: Tuple[torch.Tensor, ...],
         kvcache_start_index: torch.Tensor,
         position_ids: Union[torch.Tensor, None],
         attention_mask: Union[torch.Tensor, None],
@@ -109,44 +108,25 @@ class EdgeLLMModelTRTNative(nn.Module):
     ):
         """
         Forward pass of the model.
-        
-        Args:
-            inputs_embeds: Input embeddings, shape (batch_size, seq_len, hidden_size)
-            rope_rotary_cos_sin: RoPE rotary embeddings, shape (batch_size, seq_len, rotary_dim)
-            context_lengths: Context length tensor indicating current position in cache, shape (batch_size,)
-            last_token_ids: Indices of the last tokens to extract, shape (batch_size,)
-            k_caches: Key caches for TensorRT native mode (batch, num_heads, capacity, head_dim)
-            v_caches: Value caches for TensorRT native mode (batch, num_heads, capacity, head_dim)
-            kvcache_start_index: Start index of KV cache of shape (batch_size)
-            position_ids: Position IDs for positional encoding, shape (batch_size, seq_len), optional
-            attention_mask: Attention mask, shape (batch_size, seq_len, seq_len + past_len), optional
-            deepstack_visual_embeds: List of deepstack visual embeddings tensors, each with shape (visual_seqlen, hidden_size), optional (used with deepstack processing)
-        Returns:
-            Union[Tuple[torch.Tensor, Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...]], Tuple[torch.Tensor, Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...], torch.Tensor]]: Model outputs
-                - For standard models: (logits, k_caches, v_caches)
-                - For EAGLE3 base: (logits, k_caches, v_caches, hidden_states)
         """
 
         # Determine output configuration based on model type
         output_hidden_states = self.is_eagle_base
 
         hidden_states = inputs_embeds.to(self.torch_dtype)
-        present_k_caches = ()
-        present_v_caches = ()
+        present_kv_caches = ()
         all_hidden_states = () if output_hidden_states else None
 
         # Process through decoder layers
         for idx, decoder_layer in enumerate(self.layers):
-            k_cache = k_caches[idx]
-            v_cache = v_caches[idx]
+            kv_cache = kv_caches[idx]
 
             if output_hidden_states:
                 all_hidden_states += (hidden_states, )
 
-            hidden_states, present_k_cache, present_v_cache = decoder_layer(
+            hidden_states, present_kv_cache = decoder_layer(
                 hidden_states=hidden_states,
-                k_cache=k_cache,
-                v_cache=v_cache,
+                kv_cache=kv_cache,
                 rope_rotary_cos_sin=rope_rotary_cos_sin,
                 context_lengths=context_lengths,
                 kvcache_start_index=kvcache_start_index,
@@ -154,8 +134,7 @@ class EdgeLLMModelTRTNative(nn.Module):
                 position_ids=position_ids,
             )
 
-            present_k_caches += (present_k_cache, )
-            present_v_caches += (present_v_cache, )
+            present_kv_caches += (present_kv_cache, )
 
             # Apply deepstack processing for Qwen3VL and Qwen3OmniThinker
             if deepstack_visual_embeds is not None and idx in range(
@@ -192,11 +171,10 @@ class EdgeLLMModelTRTNative(nn.Module):
             hidden_states_output = torch.cat(
                 [hidden_states_0, hidden_states_1, hidden_states_2],
                 dim=-1).to(self.torch_dtype)
-            return logits, tuple(present_k_caches), tuple(
-                present_v_caches), hidden_states_output
+            return logits, tuple(present_kv_caches), hidden_states_output
 
         # Standard model: return logits and caches
-        return logits, tuple(present_k_caches), tuple(present_v_caches)
+        return logits, tuple(present_kv_caches)
 
     def prepare_onnx_required_arguments(
         self, model_config, device
@@ -287,35 +265,28 @@ class EdgeLLMModelTRTNative(nn.Module):
         else:
             dynamic_axes['last_token_ids'] = {0: 'batch_size'}
 
-        # k_caches
-        shape = (dummy_batch_size, num_kv_heads, max_kv_cache_capacity,
-                 head_dim)
-        k_caches = [torch.zeros(shape, dtype=torch.float16, device=device)
-                    ] * num_layers
-        dummy_inputs.append(tuple(k_caches))
-        k_caches_names = [f'k_cache_{i}' for i in range(num_layers)]
-        input_names.extend(k_caches_names)
-        dynamic_axes.update({
-            k_caches_names[i]: {
-                0: 'batch_size',
-            }
-            for i in range(num_layers)
-        })
+        # kv_caches
+        kv_caches = []
+        kv_caches_names = []
+        
+        # Radical Unification: Force a "Super-Super-Shape" for ALL layers to eliminate profile mismatches.
+        # Blackwell-optimized FMHA and hybrid models (Qwen 3.5 MoE) require consistent shapes.
+        # Max heads across all layers is 64, max dim is 256.
+        unified_heads = 64
+        unified_dim = 256
+        
+        # Match max_kv_cache from the build pipeline (32K context)
+        max_kv_cache_capacity = 32768
 
-        # v_caches
-        shape = (dummy_batch_size, num_kv_heads, max_kv_cache_capacity,
-                 head_dim)
-        v_caches = [torch.zeros(shape, dtype=torch.float16, device=device)
-                    ] * num_layers
-        dummy_inputs.append(v_caches)
-        v_caches_names = [f'v_cache_{i}' for i in range(num_layers)]
-        input_names.extend(v_caches_names)
-        dynamic_axes.update({
-            v_caches_names[i]: {
-                0: 'batch_size',
-            }
-            for i in range(num_layers)
-        })
+        for i in range(num_layers):
+            kv_shape = (dummy_batch_size, 2, unified_heads, max_kv_cache_capacity, unified_dim)
+            
+            kv_caches.append(torch.zeros(kv_shape, dtype=torch.float16, device=device))
+            kv_caches_names.append(f'kv_cache_{i}')
+            dynamic_axes[f'kv_cache_{i}'] = {0: 'batch_size'}
+
+        dummy_inputs.append(tuple(kv_caches))
+        input_names.extend(kv_caches_names)
 
         # kvcache_start_index
         shape = (dummy_batch_size, )
@@ -377,11 +348,10 @@ class EdgeLLMModelTRTNative(nn.Module):
             dummy_inputs.append(None)
 
         # prepare output names
-        output_names.append('logits')
+        output_names = ['logits']
         output_names.extend(
-            [f'present_k_cache_{i}' for i in range(num_layers)])
-        output_names.extend(
-            [f'present_v_cache_{i}' for i in range(num_layers)])
+            [f'present_kv_cache_{i}' for i in range(num_layers)])
+
 
         # Add hidden_states output for eagle_base
         if self.is_eagle_base:
@@ -698,35 +668,28 @@ class Eagle3DraftModelTRTNative(nn.Module):
             1: 'num_selected_tokens'
         }
 
-        # k_caches
-        shape = (dummy_batch_size, num_kv_heads, max_kv_cache_capacity,
-                 head_dim)
-        k_caches = [torch.zeros(shape, dtype=torch.float16, device=device)
-                    ] * num_layers
-        dummy_inputs.append(tuple(k_caches))
-        k_caches_names = [f'k_cache_{i}' for i in range(num_layers)]
-        input_names.extend(k_caches_names)
-        dynamic_axes.update({
-            k_caches_names[i]: {
-                0: 'batch_size',
-            }
-            for i in range(num_layers)
-        })
+        # kv_caches
+        kv_caches = []
+        kv_caches_names = []
+        
+        # Radical Unification: Force a "Super-Super-Shape" for ALL layers to eliminate profile mismatches.
+        # Blackwell-optimized FMHA and hybrid models (Qwen 3.5 MoE) require consistent shapes.
+        # Max heads across all layers is 64, max dim is 256.
+        unified_heads = 64
+        unified_dim = 256
+        
+        # Match max_kv_cache from the build pipeline (32K context)
+        max_kv_cache_capacity = 32768
 
-        # v_caches
-        shape = (dummy_batch_size, num_kv_heads, max_kv_cache_capacity,
-                 head_dim)
-        v_caches = [torch.zeros(shape, dtype=torch.float16, device=device)
-                    ] * num_layers
-        dummy_inputs.append(v_caches)
-        v_caches_names = [f'v_cache_{i}' for i in range(num_layers)]
-        input_names.extend(v_caches_names)
-        dynamic_axes.update({
-            v_caches_names[i]: {
-                0: 'batch_size',
-            }
-            for i in range(num_layers)
-        })
+        for i in range(num_layers):
+            kv_shape = (dummy_batch_size, 2, unified_heads, max_kv_cache_capacity, unified_dim)
+            
+            kv_caches.append(torch.zeros(kv_shape, dtype=torch.float16, device=device))
+            kv_caches_names.append(f'kv_cache_{i}')
+            dynamic_axes[f'kv_cache_{i}'] = {0: 'batch_size'}
+
+        dummy_inputs.append(tuple(kv_caches))
+        input_names.extend(kv_caches_names)
 
         # kvcache_start_index
         shape = (dummy_batch_size, )
@@ -779,10 +742,9 @@ class Eagle3DraftModelTRTNative(nn.Module):
 
         # prepare output names
         output_names.append('logits')
-        output_names.append('hidden_states')
+        output_names = ['logits']
         output_names.extend(
-            [f'present_k_cache_{i}' for i in range(num_layers)])
-        output_names.extend(
-            [f'present_v_cache_{i}' for i in range(num_layers)])
+            [f'present_kv_cache_{i}' for i in range(num_layers)])
+
 
         return dummy_inputs, input_names, dynamic_axes, output_names

@@ -87,6 +87,10 @@ def save_d2t_for_eagle3_draft(draft_model: nn.Module, output_dir: str) -> None:
     from safetensors.torch import save_file
 
     d2t_tensor = draft_model.d2t
+    if d2t_tensor.device.type == 'meta':
+        print("Skipping d2t.safetensors save: model is on meta device")
+        return
+
     # Convert to int32 and move to CPU if needed
     d2t_tensor_int32 = d2t_tensor.cpu().to(torch.int32)
 
@@ -105,6 +109,10 @@ def save_embedding_table(base_model: nn.Module, output_dir: str) -> None:
 
     # Get the embedding layer from the model
     embed_tokens = base_model.embed_tokens
+    if embed_tokens.weight.device.type == 'meta':
+        print("Skipping embedding.safetensors save: model is on meta device")
+        return
+
     embedding_weight = embed_tokens.weight.data.cpu()
 
     # Save as safetensors with key 'embedding'
@@ -602,7 +610,7 @@ def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
     register_mamba_plugin_onnx_symbolic_functions()
     register_gather_nd_onnx_symbolic_functions()
 
-    custom_opsets = {"trt_edgellm": ONNX_OPSET_VERSION}
+    custom_opsets = {"trt_edgellm": ONNX_OPSET_VERSION, "trt": ONNX_OPSET_VERSION}
     export_onnx(model,
                 inputs,
                 output_dir,
@@ -632,8 +640,9 @@ def export_model_to_onnx_with_trt_native_ops(model, output_dir: str) -> None:
         register_trt_native_attention_onnx_symbolic_functions()
 
         # Export to ONNX
+        custom_opsets = {"trt": ONNX_OPSET_VERSION}
         export_onnx(model, tuple(dummy_inputs), output_dir, input_names,
-                    output_names, dynamic_axes)
+                    output_names, dynamic_axes, custom_opsets=custom_opsets)
 
     except Exception as e:
         raise RuntimeError(f"Failed to export model to ONNX: {str(e)}")
@@ -848,7 +857,8 @@ def export_llm_model(model_dir: str,
                      fp8_kv_cache: bool = False,
                      trt_native_ops: bool = False,
                      export_models: Optional[str] = None,
-                     output_hidden_states: bool = False) -> None:
+                     output_hidden_states: bool = False,
+                     load_meta: bool = False) -> None:
     """
     Export a language model to ONNX format with custom attention plugin.
     
@@ -865,6 +875,7 @@ def export_llm_model(model_dir: str,
         fp8_kv_cache: Whether to use FP8 KV cache
         trt_native_ops: Whether to use TensorRT native operations instead of plugin
         export_models: Comma-separated list of models to export for Qwen3-Omni (e.g., "thinker,talker"). Default: export all models
+        load_meta: Whether to load model on meta device for skeleton tracing
     """
     start_time = time.time()
 
@@ -909,7 +920,8 @@ def export_llm_model(model_dir: str,
         reduced_vocab_size=reduced_vocab_size,
         vocab_map=vocab_map,
         trt_native_ops=trt_native_ops,
-        output_hidden_states=output_hidden_states)
+        output_hidden_states=output_hidden_states,
+        load_meta=load_meta)
     print("DEBUG: LLM model loaded successfully.")
 
     # Normalize to dict (single model wrapped as {"model": model})

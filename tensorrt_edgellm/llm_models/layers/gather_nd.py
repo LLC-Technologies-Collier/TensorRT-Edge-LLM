@@ -109,6 +109,12 @@ def custom_gather_nd(
 
     return gathered_output
 
+@custom_gather_nd.register_fake
+def custom_gather_nd_fake(value, indices, batch_dims=1):
+    batch_size, seq_len, hidden_size = value.shape
+    indices_batch_size, num_tokens = indices.shape
+    return torch.empty((indices_batch_size, num_tokens, hidden_size), dtype=value.dtype, device=value.device)
+
 
 def register_gather_nd_onnx_symbolic_functions() -> None:
     """Register symbolic functions for ONNX export."""

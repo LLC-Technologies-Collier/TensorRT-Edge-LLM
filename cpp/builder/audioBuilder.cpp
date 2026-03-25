@@ -364,7 +364,7 @@ bool AudioBuilder::setupAudioEncoderProfile(
     // Dispatch to model-specific setup based on model type
     switch (mModelType)
     {
-    case multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER: result = setupQwen3OmniAudioEncoderProfile(*profile); break;
+    case multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER: result = setupQwen3OmniAudioEncoderProfile(*profile, network); break;
     default: LOG_ERROR("Unsupported model type for audio encoder: %d", static_cast<int>(mModelType)); return false;
     }
 
@@ -378,7 +378,7 @@ bool AudioBuilder::setupAudioEncoderProfile(
     return true;
 }
 
-bool AudioBuilder::setupQwen3OmniAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile)
+bool AudioBuilder::setupQwen3OmniAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile, nvinfer1::INetworkDefinition const& network)
 {
     bool result = true;
 
@@ -401,13 +401,13 @@ bool AudioBuilder::setupQwen3OmniAudioEncoderProfile(nvinfer1::IOptimizationProf
     //   padded_feature: [num_chunks, mel_bins, n_window_dim]
     //   padded_mask_after_cnn_indices: [num_attention_elems, 2]
     //   attention_mask: [num_attention_elems, num_attention_elems]
-    result &= setOptimizationProfile(&profile, "padded_feature", createDims({minChunks, mMelBins, mNWindowDim}),
+    result &= setOptimizationProfile(&profile, network, "padded_feature", createDims({minChunks, mMelBins, mNWindowDim}),
         createDims({optChunks, mMelBins, mNWindowDim}), createDims({maxChunks, mMelBins, mNWindowDim}));
 
-    result &= setOptimizationProfile(&profile, "padded_mask_after_cnn_indices", createDims({minElems, 2}),
+    result &= setOptimizationProfile(&profile, network, "padded_mask_after_cnn_indices", createDims({minElems, 2}),
         createDims({optElems, 2}), createDims({maxElems, 2}));
 
-    result &= setOptimizationProfile(&profile, "attention_mask", createDims({minElems, minElems}),
+    result &= setOptimizationProfile(&profile, network, "attention_mask", createDims({minElems, minElems}),
         createDims({optElems, optElems}), createDims({maxElems, maxElems}));
 
     if (!result)
@@ -481,7 +481,7 @@ bool AudioBuilder::setupQwen3OmniCode2WavProfile(
     constexpr int64_t kBatch = 1;
     int64_t const numQuantizers = static_cast<int64_t>(mNumQuantizers);
 
-    result &= setOptimizationProfile(&profile, "codes", createDims({kBatch, numQuantizers, mBuilderConfig.minCodeLen}),
+    result &= setOptimizationProfile(&profile, network, "codes", createDims({kBatch, numQuantizers, mBuilderConfig.minCodeLen}),
         createDims({kBatch, numQuantizers, mBuilderConfig.optCodeLen}),
         createDims({kBatch, numQuantizers, mBuilderConfig.maxCodeLen}));
 

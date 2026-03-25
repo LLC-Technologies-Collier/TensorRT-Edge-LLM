@@ -84,8 +84,8 @@ bool LLMBuilder::build()
 
     LOG_DEBUG("ONNX parsing complete. mNbKVCacheInputs=%d, mNumMambaLayers=%d", mNbKVCacheInputs, mNumMambaLayers);
 
-    // Create builder config
-    auto config = createBuilderConfig(builder.get());
+    // Create builder config with weight streaming support
+    auto config = createBuilderConfig(builder.get(), mBuilderConfig);
     if (!config)
     {
         return false;
@@ -246,17 +246,18 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     bool result = true;
 
     // Setup common profiles
-    result &= setupCommonProfiles(*contextProfile, *generationProfile);
+    result &= setupCommonProfiles(*contextProfile, *generationProfile, network);
 
     // Setup model-specific profiles
     if (mBuilderConfig.eagleBase || mBuilderConfig.eagleDraft)
     {
-        result &= setupEagleProfiles(*contextProfile, *generationProfile);
+        result &= setupEagleProfiles(*contextProfile, *generationProfile, network);
     }
     else
     {
-        result &= setupVanillaProfiles(*contextProfile, *generationProfile);
+        result &= setupVanillaProfiles(*contextProfile, *generationProfile, network);
     }
+
 
     // Setup Deepstack profiles for Qwen3VL models
     result &= setupDeepstackProfiles(*contextProfile, *generationProfile, network);
@@ -284,74 +285,91 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     return true;
 }
 
-bool LLMBuilder::setupCommonProfiles(
-    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
+bool LLMBuilder::setupCommonProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
 {
     bool result = true;
 
     // Context lengths
-    result &= setOptimizationProfile(&contextProfile, binding_names::kContextLengths, createDims({1}),
+    result &= setOptimizationProfile(&contextProfile, network, binding_names::kContextLengths, createDims({1}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
-    result &= setOptimizationProfile(&generationProfile, binding_names::kContextLengths, createDims({1}),
+    result &= setOptimizationProfile(&generationProfile, network, binding_names::kContextLengths, createDims({1}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
     // Rope rotary cos sin
-    result &= setOptimizationProfile(&contextProfile, binding_names::kRopeCosSin,
+    result &= setOptimizationProfile(&contextProfile, network, binding_names::kRopeCosSin,
         createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}));
-    result &= setOptimizationProfile(&generationProfile, binding_names::kRopeCosSin,
+    result &= setOptimizationProfile(&generationProfile, network, binding_names::kRopeCosSin,
         createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}));
 
     // For KVCacheStartIndex, we use zero shape to indicate the kvcache is empty for all sequences in the batch.
     // This can help distinguish the normal prefill and chunked prefill execution.
-    result &= setOptimizationProfile(&contextProfile, binding_names::kKVCacheStartIndex, createDims({0}),
+    result &= setOptimizationProfile(&contextProfile, network, binding_names::kKVCacheStartIndex, createDims({0}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
-    result &= setOptimizationProfile(&generationProfile, binding_names::kKVCacheStartIndex, createDims({1}),
+    result &= setOptimizationProfile(&generationProfile, network, binding_names::kKVCacheStartIndex, createDims({1}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
     // KV cache profiles
     LOG_DEBUG("Setting up KV cache profiles for %d layers...", mNbKVCacheInputs);
-    result &= setupKVCacheProfiles(contextProfile, generationProfile);
+    result &= setupKVCacheProfiles(contextProfile, generationProfile, network);
     LOG_DEBUG("KV cache profiles done. Setting up SSM state profiles for %d Mamba layers...", mNumMambaLayers);
 
     // SSM state profiles for Mamba layers
-    result &= setupSSMStateProfiles(&contextProfile, &generationProfile);
+    result &= setupSSMStateProfiles(contextProfile, generationProfile, network);
 
     LOG_DEBUG("SSM state profiles done. Setting up Conv state profiles...");
     // Conv state profiles for Mamba causal conv1d layers
-    result &= setupConvStateProfiles(&contextProfile, &generationProfile);
+    result &= setupConvStateProfiles(contextProfile, generationProfile, network);
     LOG_DEBUG("Conv state profiles done.");
+
+    // Final catch-all: Ensure EVERY network input has a profile.
+    // This handles weights that the ONNX parser incorrectly identified as inputs.
+    for (int32_t i = 0; i < network.getNbInputs(); ++i)
+    {
+        auto* input = network.getInput(i);
+        char const* name = input->getName();
+        nvinfer1::Dims dims = input->getDimensions();
+
+        // Check if this input is already in the profile
+        if (contextProfile.getDimensions(name, nvinfer1::OptProfileSelector::kMIN).nbDims == -1)
+        {
+            LOG_DEBUG("Adding catch-all static profile for input: %s", name);
+            result &= setOptimizationProfile(&contextProfile, network, name, dims, dims, dims);
+            result &= setOptimizationProfile(&generationProfile, network, name, dims, dims, dims);
+        }
+    }
 
     return result;
 }
 
-bool LLMBuilder::setupVanillaProfiles(
-    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
+bool LLMBuilder::setupVanillaProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
 {
     bool result = true;
 
     // Input embeddings - always dynamic
-    result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+    result &= setOptimizationProfile(&contextProfile, network, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
-    result &= setOptimizationProfile(&generationProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+    result &= setOptimizationProfile(&generationProfile, network, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}));
 
     // Last token IDs
-    result &= setOptimizationProfile(&contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
+    result &= setOptimizationProfile(&contextProfile, network, binding_names::kLastTokenIds, createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
-    result &= setOptimizationProfile(&generationProfile, binding_names::kLastTokenIds, createDims({1, 1}),
+    result &= setOptimizationProfile(&generationProfile, network, binding_names::kLastTokenIds, createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
 
     return result;
 }
 
-bool LLMBuilder::setupEagleProfiles(
-    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
+bool LLMBuilder::setupEagleProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
 {
     bool result = true;
 
@@ -359,36 +377,36 @@ bool LLMBuilder::setupEagleProfiles(
         = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
 
     // Input embeddings
-    result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+    result &= setOptimizationProfile(&contextProfile, network, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
-    result &= setOptimizationProfile(&generationProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+    result &= setOptimizationProfile(&generationProfile, network, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
 
     // Last token IDs - 2D shape [batch_size, num_selected_tokens]
-    result &= setOptimizationProfile(&contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
+    result &= setOptimizationProfile(&contextProfile, network, binding_names::kLastTokenIds, createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
-    result &= setOptimizationProfile(&generationProfile, binding_names::kLastTokenIds, createDims({1, 1}),
+    result &= setOptimizationProfile(&generationProfile, network, binding_names::kLastTokenIds, createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
 
     if (mBuilderConfig.eagleDraft)
     {
         // Hidden states from draft
-        result &= setOptimizationProfile(&contextProfile, binding_names::kDraftModelHiddenStates,
+        result &= setOptimizationProfile(&contextProfile, network, binding_names::kDraftModelHiddenStates,
             createDims({1, 1, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
-        result &= setOptimizationProfile(&generationProfile, binding_names::kDraftModelHiddenStates,
+        result &= setOptimizationProfile(&generationProfile, network, binding_names::kDraftModelHiddenStates,
             createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
 
         // Hidden states input
-        result &= setOptimizationProfile(&contextProfile, binding_names::kBaseModelHiddenStates,
+        result &= setOptimizationProfile(&contextProfile, network, binding_names::kBaseModelHiddenStates,
             createDims({1, 1, mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mTargetModelOutputHiddenDim}));
-        result &= setOptimizationProfile(&generationProfile, binding_names::kBaseModelHiddenStates,
+        result &= setOptimizationProfile(&generationProfile, network, binding_names::kBaseModelHiddenStates,
             createDims({1, 1, mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens, mTargetModelOutputHiddenDim}));
@@ -398,17 +416,17 @@ bool LLMBuilder::setupEagleProfiles(
     if (mBuilderConfig.eagleDraft || mBuilderConfig.eagleBase)
     {
         int32_t const attnMaskAlignSize = 32;
-        result &= setOptimizationProfile(&contextProfile, binding_names::kAttentionMask, createDims({1, 1, 1}),
+        result &= setOptimizationProfile(&contextProfile, network, binding_names::kAttentionMask, createDims({1, 1, 1}),
             createDims({mBuilderConfig.maxBatchSize, 1, 1}), createDims({mBuilderConfig.maxBatchSize, 1, 1}));
-        result &= setOptimizationProfile(&generationProfile, binding_names::kAttentionMask, createDims({1, 1, 1}),
+        result &= setOptimizationProfile(&generationProfile, network, binding_names::kAttentionMask, createDims({1, 1, 1}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens / 2,
                 static_cast<int64_t>(divUp(maxTokens / 2, attnMaskAlignSize) * attnMaskAlignSize)}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens,
                 static_cast<int64_t>(divUp(maxTokens, attnMaskAlignSize) * attnMaskAlignSize)}));
 
-        result &= setOptimizationProfile(&contextProfile, binding_names::kAttentionPosId, createDims({1, 1}),
+        result &= setOptimizationProfile(&contextProfile, network, binding_names::kAttentionPosId, createDims({1, 1}),
             createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
-        result &= setOptimizationProfile(&generationProfile, binding_names::kAttentionPosId, createDims({1, 1}),
+        result &= setOptimizationProfile(&generationProfile, network, binding_names::kAttentionPosId, createDims({1, 1}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens}));
     }
@@ -447,7 +465,7 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
         LOG_INFO("Setting up optimization profile for %s", deepstackInputName.c_str());
 
         // Same profile as inputs_embeds
-        result &= setOptimizationProfile(&contextProfile, deepstackInputName.c_str(), createDims({1, 1, mHiddenSize}),
+        result &= setOptimizationProfile(&contextProfile, network, deepstackInputName.c_str(), createDims({1, 1, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
 
@@ -455,13 +473,13 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
         {
             int const maxTokens
                 = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
-            result &= setOptimizationProfile(&generationProfile, deepstackInputName.c_str(),
+            result &= setOptimizationProfile(&generationProfile, network, deepstackInputName.c_str(),
                 createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
         }
         else
         {
-            result &= setOptimizationProfile(&generationProfile, deepstackInputName.c_str(),
+            result &= setOptimizationProfile(&generationProfile, network, deepstackInputName.c_str(),
                 createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}));
         }
@@ -507,9 +525,9 @@ bool LLMBuilder::setupLmHeadWeightProfiles(nvinfer1::IOptimizationProfile& conte
     int64_t const hiddenSize = mHiddenSize;
 
     // Both context and generation profiles use the same shape since this is a weight tensor
-    result &= setOptimizationProfile(&contextProfile, binding_names::kLmHeadWeight, createDims({vocabSize, hiddenSize}),
+    result &= setOptimizationProfile(&contextProfile, network, binding_names::kLmHeadWeight, createDims({vocabSize, hiddenSize}),
         createDims({vocabSize, hiddenSize}), createDims({vocabSize, hiddenSize}));
-    result &= setOptimizationProfile(&generationProfile, binding_names::kLmHeadWeight,
+    result &= setOptimizationProfile(&generationProfile, network, binding_names::kLmHeadWeight,
         createDims({vocabSize, hiddenSize}), createDims({vocabSize, hiddenSize}), createDims({vocabSize, hiddenSize}));
 
     if (!result)
@@ -551,10 +569,10 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile& contextProfil
             {
                 int64_t gemm_k = dims.d[0];
                 result
-                    &= setOptimizationProfile(&contextProfile, inputName.c_str(), createDims({gemm_k, 0}), // min shape
+                    &= setOptimizationProfile(&contextProfile, network, inputName.c_str(), createDims({gemm_k, 0}), // min shape
                         createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}),                              // opt shape
                         createDims({gemm_k, mBuilderConfig.maxLoraRank}));                                 // max shape
-                result &= setOptimizationProfile(&generationProfile, inputName.c_str(),
+                result &= setOptimizationProfile(&generationProfile, network, inputName.c_str(),
                     createDims({gemm_k, 0}),                              // min shape
                     createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}), // opt shape
                     createDims({gemm_k, mBuilderConfig.maxLoraRank}));    // max shape
@@ -572,10 +590,10 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile& contextProfil
             {
                 int64_t gemm_n = dims.d[1];
                 result
-                    &= setOptimizationProfile(&contextProfile, inputName.c_str(), createDims({0, gemm_n}), // min shape
+                    &= setOptimizationProfile(&contextProfile, network, inputName.c_str(), createDims({0, gemm_n}), // min shape
                         createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}),                              // opt shape
                         createDims({mBuilderConfig.maxLoraRank, gemm_n}));                                 // max shape
-                result &= setOptimizationProfile(&generationProfile, inputName.c_str(),
+                result &= setOptimizationProfile(&generationProfile, network, inputName.c_str(),
                     createDims({0, gemm_n}),                              // min shape
                     createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}), // opt shape
                     createDims({mBuilderConfig.maxLoraRank, gemm_n}));    // max shape
@@ -599,50 +617,107 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile& contextProfil
     return result;
 }
 
-bool LLMBuilder::setupKVCacheProfiles(
-    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
+bool LLMBuilder::setupKVCacheProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
 {
     bool result = true;
-    if (mBuilderConfig.useTrtNativeOps)
+    for (int i = 0; i < mNbKVCacheInputs; ++i)
     {
-        // TRT attention: separate K and V caches without the "2" dimension
-        // Shape: [batch, num_kv_heads, seq_len, head_dim]
-        nvinfer1::Dims minKVCacheShape = createDims({1, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
-        nvinfer1::Dims optKVCacheShape
-            = createDims({mBuilderConfig.maxBatchSize, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
-        nvinfer1::Dims maxKVCacheShape
-            = createDims({mBuilderConfig.maxBatchSize, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
+        std::string kName = binding_names::formatKCacheName(i, true);
+        std::string vName = binding_names::formatVCacheName(i, true);
 
-        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        // Find input in network to get its actual dimensions
+        int32_t kInputIdx = -1;
+        int32_t vInputIdx = -1;
+        for (int32_t j = 0; j < network.getNbInputs(); ++j)
         {
-            // K cache bindings
-            result &= setOptimizationProfile(&contextProfile, binding_names::formatKCacheName(i, true).c_str(),
-                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-            result &= setOptimizationProfile(&generationProfile, binding_names::formatKCacheName(i, true).c_str(),
-                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-
-            // V cache bindings
-            result &= setOptimizationProfile(&contextProfile, binding_names::formatVCacheName(i, true).c_str(),
-                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-            result &= setOptimizationProfile(&generationProfile, binding_names::formatVCacheName(i, true).c_str(),
-                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            if (network.getInput(j)->getName() == kName)
+            {
+                kInputIdx = j;
+            }
+            if (network.getInput(j)->getName() == vName)
+            {
+                vInputIdx = j;
+            }
         }
-    }
-    else
-    {
-        // Plugin path: combined KV cache with "2" dimension
-        // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
-        nvinfer1::Dims minKVCacheShape = createDims({1, 2, mNumKVHeads, 0, mHeadSize});
-        nvinfer1::Dims optKVCacheShape
-            = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
-        nvinfer1::Dims maxKVCacheShape
-            = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
 
-        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        if (mBuilderConfig.useTrtNativeOps)
         {
-            result &= setOptimizationProfile(&contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
+            // TRT attention: separate K and V caches
+            // Shape: [batch, num_kv_heads, seq_len, head_dim]
+            int32_t kHeads = mNumKVHeads;
+            int32_t kHeadSize = mHeadSize;
+            if (kInputIdx != -1)
+            {
+                auto dims = network.getInput(kInputIdx)->getDimensions();
+                kHeads = dims.d[1];
+                kHeadSize = dims.d[3];
+            }
+
+            int32_t vHeads = mNumKVHeads;
+            int32_t vHeadSize = mHeadSize;
+            if (vInputIdx != -1)
+            {
+                auto dims = network.getInput(vInputIdx)->getDimensions();
+                vHeads = dims.d[1];
+                vHeadSize = dims.d[3];
+            }
+
+            nvinfer1::Dims minKCacheShape = createDims({1, kHeads, mBuilderConfig.maxKVCacheCapacity, kHeadSize});
+            nvinfer1::Dims optKCacheShape = createDims({mBuilderConfig.maxBatchSize, kHeads, mBuilderConfig.maxKVCacheCapacity, kHeadSize});
+            nvinfer1::Dims maxKCacheShape = createDims({mBuilderConfig.maxBatchSize, kHeads, mBuilderConfig.maxKVCacheCapacity, kHeadSize});
+
+            result &= setOptimizationProfile(&contextProfile, network, kName.c_str(),
+                minKCacheShape, optKCacheShape, maxKCacheShape);
+            result &= setOptimizationProfile(&generationProfile, network, kName.c_str(),
+                minKCacheShape, optKCacheShape, maxKCacheShape);
+
+            nvinfer1::Dims minVCacheShape = createDims({1, vHeads, mBuilderConfig.maxKVCacheCapacity, vHeadSize});
+            nvinfer1::Dims optVCacheShape = createDims({mBuilderConfig.maxBatchSize, vHeads, mBuilderConfig.maxKVCacheCapacity, vHeadSize});
+            nvinfer1::Dims maxVCacheShape = createDims({mBuilderConfig.maxBatchSize, vHeads, mBuilderConfig.maxKVCacheCapacity, vHeadSize});
+
+            result &= setOptimizationProfile(&contextProfile, network, vName.c_str(),
+                minVCacheShape, optVCacheShape, maxVCacheShape);
+            result &= setOptimizationProfile(&generationProfile, network, vName.c_str(),
+                minVCacheShape, optVCacheShape, maxVCacheShape);
+        }
+        else
+        {
+            // Plugin path: combined KV cache with "2" dimension
+            // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
+            
+            // Forced Super-Super-Shape Unification
+            int32_t heads = 64;
+            int32_t headSize = 256;
+            
+            // Use the consistent kv_cache_ naming convention from ONNX export
+            std::string kvName = "kv_cache_" + std::to_string(i);
+
+            bool inputExists = false;
+            for (int32_t j = 0; j < network.getNbInputs(); ++j)
+            {
+                if (std::string(network.getInput(j)->getName()) == kvName)
+                {
+                    inputExists = true;
+                    break;
+                }
+            }
+
+            if (!inputExists)
+            {
+                LOG_DEBUG("Skipping KV cache profile for %s (not found in network)", kvName.c_str());
+                continue;
+            }
+
+            nvinfer1::Dims minKVCacheShape = createDims({1, 2, heads, 0, headSize});
+            nvinfer1::Dims optKVCacheShape
+                = createDims({mBuilderConfig.maxBatchSize, 2, heads, mBuilderConfig.maxKVCacheCapacity, headSize});
+            nvinfer1::Dims maxKVCacheShape
+                = createDims({mBuilderConfig.maxBatchSize, 2, heads, mBuilderConfig.maxKVCacheCapacity, headSize});
+
+            result &= setOptimizationProfile(&contextProfile, network, kvName.c_str(),
                 minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-            result &= setOptimizationProfile(&generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
+            result &= setOptimizationProfile(&generationProfile, network, kvName.c_str(),
                 minKVCacheShape, optKVCacheShape, maxKVCacheShape);
         }
     }
@@ -650,8 +725,8 @@ bool LLMBuilder::setupKVCacheProfiles(
     return result;
 }
 
-bool LLMBuilder::setupSSMStateProfiles(
-    nvinfer1::IOptimizationProfile* const contextProfile, nvinfer1::IOptimizationProfile* const generationProfile)
+bool LLMBuilder::setupSSMStateProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
 {
     if (mNumMambaLayers == 0)
     {
@@ -670,17 +745,17 @@ bool LLMBuilder::setupSSMStateProfiles(
     for (int32_t i = 0; i < mNumMambaLayers; ++i)
     {
         std::string const ssmStateName = binding_names::formatSSMStateName(i, /*isPast=*/true);
-        result &= setOptimizationProfile(contextProfile, ssmStateName.c_str(), minSSMShape, optSSMShape, maxSSMShape);
+        result &= setOptimizationProfile(&contextProfile, network, ssmStateName.c_str(), minSSMShape, optSSMShape, maxSSMShape);
         result
-            &= setOptimizationProfile(generationProfile, ssmStateName.c_str(), minSSMShape, optSSMShape, maxSSMShape);
+            &= setOptimizationProfile(&generationProfile, network, ssmStateName.c_str(), minSSMShape, optSSMShape, maxSSMShape);
     }
 
     LOG_DEBUG("Set up SSM state optimization profiles for %d Mamba layers", mNumMambaLayers);
     return result;
 }
 
-bool LLMBuilder::setupConvStateProfiles(
-    nvinfer1::IOptimizationProfile* const contextProfile, nvinfer1::IOptimizationProfile* const generationProfile)
+bool LLMBuilder::setupConvStateProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
 {
     if (mNumMambaLayers == 0 || mConvDim == 0 || mConvKernel == 0)
     {
@@ -698,9 +773,9 @@ bool LLMBuilder::setupConvStateProfiles(
     {
         std::string const convStateName = binding_names::formatConvStateName(i, /*isPast=*/true);
         result
-            &= setOptimizationProfile(contextProfile, convStateName.c_str(), minConvShape, optConvShape, maxConvShape);
+            &= setOptimizationProfile(&contextProfile, network, convStateName.c_str(), minConvShape, optConvShape, maxConvShape);
         result &= setOptimizationProfile(
-            generationProfile, convStateName.c_str(), minConvShape, optConvShape, maxConvShape);
+            &generationProfile, network, convStateName.c_str(), minConvShape, optConvShape, maxConvShape);
     }
 
     LOG_DEBUG("Set up conv state optimization profiles for %d Mamba layers", mNumMambaLayers);

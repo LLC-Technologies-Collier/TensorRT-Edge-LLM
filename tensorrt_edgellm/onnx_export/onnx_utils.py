@@ -23,8 +23,54 @@ import onnx
 import onnx_graphsurgeon as gs
 import torch
 import torch.nn as nn
+from ..common import ONNX_OPSET_VERSION
 
-ONNX_OPSET_VERSION = 17
+@torch.library.custom_op("trt::kv_cache_update_onnx", mutates_args=())
+def kv_cache_update_onnx(
+    past_key_value: torch.Tensor,
+    new_key_value: torch.Tensor,
+    kvcache_start_index: torch.Tensor,
+) -> torch.Tensor:
+    return past_key_value.clone()
+
+@kv_cache_update_onnx.register_fake
+def kv_cache_update_onnx_fake(past_key_value, new_key_value, kvcache_start_index):
+    return torch.empty_like(past_key_value)
+
+@torch.library.custom_op("trt::rope_onnx", mutates_args=())
+def rope_onnx(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return query.clone(), key.clone()
+
+@rope_onnx.register_fake
+def rope_onnx_fake(query, key, cos, sin):
+    return torch.empty_like(query), torch.empty_like(key)
+
+@torch.library.custom_op("trt::attention_onnx", mutates_args=())
+def attention_onnx(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    context_lengths: torch.Tensor,
+    rope_rotary_cos_sin: torch.Tensor,
+    kvcache_start_index: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    attn_mask: Optional[torch.Tensor] = None,
+    is_causal: bool = True,
+    scale: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return query.clone(), kv_cache.clone()
+
+@attention_onnx.register_fake
+def attention_onnx_fake(query, key, value, kv_cache, context_lengths, rope_rotary_cos_sin, kvcache_start_index, num_q_heads, num_kv_heads, head_size, attn_mask=None, is_causal=True, scale=1.0):
+    return torch.empty_like(query), torch.empty_like(kv_cache)
 
 def _is_nvfp4_quantized(model: nn.Module) -> bool:
     for m in model.modules():
@@ -72,17 +118,29 @@ def export_onnx(model,
     onnx_path = f'{output_dir}/model.onnx'
 
     print(f"DEBUG: Starting standard torch.onnx.export (jit.trace) to {onnx_path}...")
+    
+    # Check if model is on meta device (skeleton tracing)
+    is_meta = False
+    try:
+        is_meta = next(model.parameters()).is_meta
+    except StopIteration:
+        pass
+    
+    if is_meta:
+        print(f"DEBUG: Meta device detected, setting export_params=False for skeleton tracing. ONNX_OPSET_VERSION is {ONNX_OPSET_VERSION}")
+
     with torch.inference_mode():
         # Force dynamo=False to use legacy jit.trace, which is more robust for complex MoE
+        print(f"DEBUG: Calling torch.onnx.export with opset_version={ONNX_OPSET_VERSION}")
         torch.onnx.export(model,
                           inputs,
                           onnx_path,
-                          export_params=True,
+                          export_params=not is_meta,
                           dynamic_axes=dynamic_axes,
                           input_names=input_names,
                           output_names=output_names,
                           opset_version=ONNX_OPSET_VERSION,
-                          do_constant_folding=True,
+                          do_constant_folding=not is_meta, # Constant folding also fails on meta
                           custom_opsets=custom_opsets,
                           dynamo=False)
 
@@ -91,7 +149,15 @@ def export_onnx(model,
     # Post-processing
     onnx.shape_inference.infer_shapes_path(onnx_path)
     onnx_model = onnx.load(onnx_path)
-    graph = None
+    
+    # Always use graph surgeon for custom op mapping
+    from .surgeon import fuse_attention_nodes, broadcast_heterogeneous_heads, fix_flatten_reshapes, barrier_plugins, cleanup_graph
+    graph = gs.import_onnx(onnx_model)
+    print("Applying AttentionPlugin transformation, broadcasting heads, fixing reshapes, and isolating plugins...")
+    graph = fuse_attention_nodes(graph)
+    graph = broadcast_heterogeneous_heads(graph)
+    graph = fix_flatten_reshapes(graph)
+    graph = barrier_plugins(graph)
 
     if _is_int4_awq_quantized(model):
         from .int4_awq_utils import fix_model_int4_output_dtypes, int4_dq_gemm_to_plugin
@@ -132,16 +198,8 @@ def export_onnx(model,
         graph = mxfp8_to_plugin(graph)
 
     if graph is not None:
-        from .int4_moe_utils import int4_moe_to_plugin
-        # Check if model is MoE
-        is_moe = "moe" in str(type(model)).lower()
-        if is_moe:
-            print("MoE detected, applying Int4MoePlugin transformation")
-            graph = int4_moe_to_plugin(graph)
-
         # Standard post-processing for custom plugins
-        graph.cleanup().toposort()
-        onnx_model = gs.export_onnx(graph)
+        onnx_model = gs.export_onnx(cleanup_graph(graph))
         
         # Large models need to be saved with external data
         onnx.save_model(onnx_model,
