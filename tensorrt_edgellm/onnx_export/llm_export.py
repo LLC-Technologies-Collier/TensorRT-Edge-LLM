@@ -169,6 +169,13 @@ def get_model_save_weights_hook(model_name: str):
 
         return save_code_predictor_weights
 
+    if "Qwen3_5" in model_name:
+        def save_qwen3_5_weights(model, output_dir):
+            save_embedding_table(model, output_dir)
+            # Future: add logic to save extra hybrid layer weights if needed
+            print(f"Saved Qwen 3.5 weights to {output_dir}")
+        return save_qwen3_5_weights
+
     # Standard LLM / Thinker / EAGLE: only need embedding table
     def save_default_weights(model, output_dir):
         save_embedding_table(model, output_dir)
@@ -534,7 +541,8 @@ def create_hybrid_dummy_inputs(
 
 
 def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
-                                output_dir: str) -> None:
+                                output_dir: str,
+                                config: Optional[Dict] = None) -> None:
     """Export a hybrid Mamba+Attention model to ONNX."""
     print(f"Exporting hybrid model to ONNX format: {output_dir}")
 
@@ -617,7 +625,8 @@ def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
                 input_names,
                 output_names,
                 dynamic_axes,
-                custom_opsets=custom_opsets)
+                custom_opsets=custom_opsets,
+                config=config)
 
 
 def export_model_to_onnx_with_trt_native_ops(model, output_dir: str) -> None:
@@ -641,8 +650,10 @@ def export_model_to_onnx_with_trt_native_ops(model, output_dir: str) -> None:
 
         # Export to ONNX
         custom_opsets = {"trt": ONNX_OPSET_VERSION}
+        
+        config_dict = model.config.to_dict() if hasattr(model.config, "to_dict") else {}
         export_onnx(model, tuple(dummy_inputs), output_dir, input_names,
-                    output_names, dynamic_axes, custom_opsets=custom_opsets)
+                    output_names, dynamic_axes, custom_opsets=custom_opsets, config=config_dict)
 
     except Exception as e:
         raise RuntimeError(f"Failed to export model to ONNX: {str(e)}")
@@ -654,7 +665,9 @@ def export_model_to_onnx(model: nn.Module,
                          output_hidden_states: bool,
                          fp8_kv_cache: bool,
                          is_eagle_draft: bool = False,
-                         dynamo: bool = False) -> None:
+                         dynamo: bool = False,
+                         qwen35_interleaving: bool = False,
+                         config: Optional[Dict] = None) -> None:
     print(f"export_model_to_onnx: is_eagle_base={is_eagle_base}, is_eagle_draft={is_eagle_draft}, dynamo={dynamo}")
 
     """
@@ -752,20 +765,6 @@ def export_model_to_onnx(model: nn.Module,
 
         # Create dynamic axes
         dynamic_axes = {
-            **{
-                f"past_key_values_{i}": {
-                    0: "batch_size",
-                    3: "q_len"
-                }
-                for i in range(num_layers)
-            },
-            **{
-                f"present_key_values_{i}": {
-                    0: "batch_size",
-                    3: "q_len_total"
-                }
-                for i in range(num_layers)
-            },
             "inputs_embeds": {
                 0: "batch_size",
                 1: "seq_len"
@@ -788,20 +787,25 @@ def export_model_to_onnx(model: nn.Module,
             },
             "logits": {
                 0: "batch_size",
-                1: "q_len",
+                1: "seq_len",
                 2: "vocab_size"
             },
         }
+
+        # Comprehensive KV Cache dynamic axes for 122B
+        for i in range(num_layers):
+            dynamic_axes[f"past_key_values_{i}"] = {0: "batch_size", 3: "kv_seq_len"}
+            dynamic_axes[f"present_key_values_{i}"] = {0: "batch_size", 3: "present_kv_seq_len"}
 
         if is_eagle_draft:
             dynamic_axes.update({
                 "hidden_states_input": {
                     0: "batch_size",
-                    1: "q_len"
+                    1: "seq_len"
                 },
                 "hidden_states_from_draft": {
                     0: "batch_size",
-                    1: "q_len"
+                    1: "seq_len"
                 },
             })
 
@@ -810,7 +814,7 @@ def export_model_to_onnx(model: nn.Module,
             dynamic_axes.update({
                 "hidden_states": {
                     0: "batch_size",
-                    1: "q_len",
+                    1: "seq_len",
                     2: "hidden_size"
                 },
             })
@@ -819,7 +823,7 @@ def export_model_to_onnx(model: nn.Module,
             dynamic_axes.update({
                 "attention_pos_id": {
                     0: "batch_size",
-                    1: "q_len"
+                    1: "seq_len"
                 },
             })
 
@@ -835,12 +839,16 @@ def export_model_to_onnx(model: nn.Module,
             })
 
         # Register ONNX symbolic functions
+        from tensorrt_edgellm.llm_models.layers.attention_trt import register_trt_native_attention_onnx_symbolic_functions
+        register_trt_native_attention_onnx_symbolic_functions()
+
         register_attention_plugin_onnx_symbolic_functions()
+
         register_gather_nd_onnx_symbolic_functions()
 
         # Export to ONNX
         export_onnx(model, inputs, output_dir, input_names, output_names,
-                    dynamic_axes, dynamo=dynamo)
+                    dynamic_axes, dynamo=dynamo, qwen35_interleaving=qwen35_interleaving, config=config)
 
     except Exception as e:
         raise RuntimeError(f"Failed to export model to ONNX: {str(e)}")
@@ -858,7 +866,11 @@ def export_llm_model(model_dir: str,
                      trt_native_ops: bool = False,
                      export_models: Optional[str] = None,
                      output_hidden_states: bool = False,
-                     load_meta: bool = False) -> None:
+                     load_meta: bool = False,
+                     qwen35_interleaving: bool = False) -> None:
+    import sys
+    import os
+    print(f"DEBUG: Entering export_llm_model with model_dir={model_dir}")
     """
     Export a language model to ONNX format with custom attention plugin.
     
@@ -957,10 +969,12 @@ def export_llm_model(model_dir: str,
 
         # Step 2: Export ONNX
         print(f"DEBUG: Starting ONNX export for {model_name}...")
+        model_config_dict = model.config.to_dict() if hasattr(model.config, 'to_dict') else vars(model.config)
+        
         if trt_native_ops:
             export_model_to_onnx_with_trt_native_ops(model, model_output_dir)
         elif isinstance(model, EdgeLLMHybridModelForCausalLM):
-            export_hybrid_model_to_onnx(model, model_output_dir)
+            export_hybrid_model_to_onnx(model, model_output_dir, config=model_config_dict)
         elif is_qwen3_omni_submodel(model_name):
             dummy_inputs = create_qwen3_omni_dummy_inputs(
                 model, model_name, fp8_kv_cache)
@@ -969,7 +983,9 @@ def export_llm_model(model_dir: str,
         else:
             export_model_to_onnx(model, model_output_dir, is_eagle_base,
                                  output_hidden_states, fp8_kv_cache,
-                                 dynamo=dynamo)
+                                 dynamo=dynamo,
+                                 qwen35_interleaving=qwen35_interleaving,
+                                 config=model_config_dict)
 
         # Step 3: Export config
         if isinstance(model, EdgeLLMHybridModelForCausalLM):
@@ -981,8 +997,15 @@ def export_llm_model(model_dir: str,
                                                        trt_native_ops)
             model_config = config_hook(model.config)
 
-        if reduced_vocab_size is not None:
-            model_config['reduced_vocab_size'] = reduced_vocab_size
+        try:
+            from tensorrt_edgellm.version import __version__ as kRUNTIME_VERSION
+            model_config['edgellm_version'] = kRUNTIME_VERSION
+        except ImportError:
+            # Fallback if the package structure is not fully recognized
+            sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
+            from tensorrt_edgellm.version import __version__ as kRUNTIME_VERSION
+            model_config['edgellm_version'] = kRUNTIME_VERSION
+
 
         with open(os.path.join(model_output_dir, "config.json"), 'w') as f:
             json.dump(model_config, f, indent=2)

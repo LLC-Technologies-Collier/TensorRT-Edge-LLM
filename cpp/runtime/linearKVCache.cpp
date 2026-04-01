@@ -34,7 +34,9 @@ LinearKVCache::LinearKVCache(CacheConfig const& config, cudaStream_t stream)
     : mConfig(config)
 {
     check::check(
-        mConfig.kvCacheTypeTRT == nvinfer1::DataType::kHALF || mConfig.kvCacheTypeTRT == nvinfer1::DataType::kFP8,
+        mConfig.kvCacheTypeTRT == nvinfer1::DataType::kHALF || 
+        mConfig.kvCacheTypeTRT == nvinfer1::DataType::kFP8 ||
+        mConfig.kvCacheTypeTRT == nvinfer1::DataType::kBF16,
         "Unsupported KV cache dtype.");
     mDeviceKVCache = rt::Tensor({mConfig.numAttentionLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads,
                                     mConfig.maxSequenceLength, mConfig.headDim},
@@ -42,7 +44,11 @@ LinearKVCache::LinearKVCache(CacheConfig const& config, cudaStream_t stream)
     int64_t const kvCacheVolume = mConfig.numAttentionLayers * mConfig.maxBatchSize * 2 * mConfig.numKVHeads
         * mConfig.maxSequenceLength * mConfig.headDim;
     size_t const kvCacheElemSize = rt::utils::getTypeSize(mConfig.kvCacheTypeTRT);
-    char const* kvCacheTypeStr = (mConfig.kvCacheTypeTRT == nvinfer1::DataType::kHALF) ? "kHALF" : "kFP8";
+    
+    const char* kvCacheTypeStr = "UNKNOWN";
+    if (mConfig.kvCacheTypeTRT == nvinfer1::DataType::kHALF) kvCacheTypeStr = "kHALF";
+    else if (mConfig.kvCacheTypeTRT == nvinfer1::DataType::kFP8) kvCacheTypeStr = "kFP8";
+    else if (mConfig.kvCacheTypeTRT == nvinfer1::DataType::kBF16) kvCacheTypeStr = "kBF16";
     LOG_DEBUG(
         "KVCache(dtype=%s) of shape [%ld, %ld, %ld, %ld, %ld, %ld] allocated on GPU with size: %ld bytes (%.2f MB)",
         kvCacheTypeStr, mConfig.numAttentionLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads,

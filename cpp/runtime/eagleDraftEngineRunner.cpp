@@ -164,13 +164,13 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     }
 
     // Detect KV cache storage dtype from engine bindings.
-    std::string const kvBindingName0 = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+    std::string const kvBindingName0 = binding_names::formatKVCacheName(mEngine.get(), /*layerIdx=*/0, /*isPast=*/true);
     DataType const kvCacheType = mEngine->getTensorDataType(kvBindingName0.c_str());
 
     // Sanity check: ensure KV-cache precision (dtype) is consistent across all layers (and both past/present).
     // We rely on a single dtype when allocating/owning the KV cache buffers.
     auto const checkKVCacheDType = [&](int32_t layerIdx, bool isPast) {
-        std::string const kvBindingName = binding_names::formatKVCacheName(layerIdx, isPast);
+        std::string const kvBindingName = binding_names::formatKVCacheName(mEngine.get(), layerIdx, isPast);
         DataType const dt = mEngine->getTensorDataType(kvBindingName.c_str());
         if (dt != kvCacheType)
         {
@@ -1303,8 +1303,9 @@ bool EagleDraftEngineRunner::bindPluginKVCacheToEngine(int32_t activeBatchSize)
     bool status{true};
     for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)
     {
-        std::string const pastKeyValuesName = binding_names::formatKVCacheName(i, true);
-        std::string const presentKeyValuesName = binding_names::formatKVCacheName(i, false);
+        std::string const pastKeyValuesName = binding_names::formatKVCacheName(mEngine.get(), i, true);
+        std::string const presentKeyValuesName = binding_names::formatKVCacheName(mEngine.get(), i, false);
+
 
         rt::Tensor kvCacheBlock = mLinearKVCache.getCombinedKVCacheForDecoderLayer(i);
         status &= mTRTExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());

@@ -415,12 +415,21 @@ def load_hf_model(
         raise ValueError(f"Unsupported dtype: {dtype}")
     device = torch.device(device)
 
+    print(f"DEBUG: Normalized model_dir: {model_dir}")
+    if not os.path.isdir(model_dir):
+        raise ValueError(f"model_dir {model_dir} is not a directory")
+
+    # Load config once to determine model type
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    model_type = str(getattr(config, "model_type", "")).lower()
+    archs = [str(a).lower() for a in getattr(config, "architectures", []) or []]
+
     tokenizer = AutoTokenizer.from_pretrained(model_dir,
                                               trust_remote_code=True)
 
-    # NemotronH: apply mamba_ssm stub before import to avoid ABI-broken CUDA extension errors.
-    # The model runs on the pure-PyTorch slow path for ONNX export.
-    if _is_nemotron_h_model(model_dir):
+    # NemotronH
+    if "nemotron_h" in model_type or any("nemotron_h" in a for a in archs):
         from .models.nemotron_h_patch import apply as _apply_nemotron_h_patch
         _apply_nemotron_h_patch()
         model = AutoModelForCausalLM.from_pretrained(
@@ -428,12 +437,8 @@ def load_hf_model(
             trust_remote_code=True,
             ignore_mismatched_sizes=ignore_mismatched_sizes).to(device)
 
-    # Due to a known loading issue with Phi4MM on recent transformers, special handling is required.
-    # See: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/discussions/75.
-    elif _is_phi4mm_model(model_dir):
-        # Avoid converting the model into a PEFT-wrapped model, which ModelOpt and
-        # Transformers cannot currently handle correctly. LoRA weights will instead
-        # be merged directly into the base model.
+    # Phi4MM
+    elif "phi4mm" in model_type or any("phi4mm" in a for a in archs):
         module = _load_phi4mm_war(model_dir)
         model = module.Phi4MMForCausalLM.from_pretrained(
             model_dir,
@@ -441,7 +446,8 @@ def load_hf_model(
             trust_remote_code=True,
             attn_implementation="eager",
             ignore_mismatched_sizes=ignore_mismatched_sizes).to(device)
-    elif _is_qwen3_asr_model(model_dir):
+    # Qwen3-ASR
+    elif "qwen3-asr" in model_type or any("qwen3-asr" in a for a in archs) or "qwen3-asr" in model_dir:
         from qwen_asr import Qwen3ASRModel
         model = Qwen3ASRModel.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
@@ -479,10 +485,9 @@ def load_hf_model(
     else:
         if load_meta:
             print(f"DEBUG: Initializing skeleton model from config on meta device...")
-            from transformers import AutoConfig
             import accelerate
-            config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
             with accelerate.init_empty_weights():
+                print(f"DEBUG: Default device inside init_empty_weights: {torch.empty(1).device}")
                 try:
                     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
                 except Exception as e_causal:
@@ -512,10 +517,8 @@ def load_hf_model(
                     model_kwargs["offload_buffers"] = True
                     model_kwargs["offload_state_dict"] = True
                     
-                    # Limit memory to avoid OOM on 128GB node
-                    # Auto map should prefer CPU/RAM over Disk. 
-                    # Give it 10GB of CPU RAM to work with to be safe from OOM.
-                    model_kwargs["max_memory"] = {0: "4GiB", "cpu": "10GiB"}
+                    # Use extremely conservative limits to fit in 128GB RAM
+                    model_kwargs["max_memory"] = {0: "2GiB", "cpu": "8GiB"}
                 else:
                     model_kwargs["device_map"] = "cpu"
 
@@ -582,26 +585,38 @@ def load_hf_model(
     remove_hook_from_module(model, recurse=True)
 
     # 2. Targeted move of non-meta tensors to target device and dtype.
+    # We also forcefully materialize any remaining meta-tensors to CPU.
     # We do this manually because model.to() fails on offloaded/meta models.
-    print(f"DEBUG: Exhaustive targeted move of non-meta tensors to {device} ({torch_dtype})...")
+    print(f"DEBUG: Exhaustive targeted move and CPU materialization of tensors to {device} ({torch_dtype})...")
     for m_name, m in model.named_modules():
-        # Move registered buffers
+        # Move or materialize registered buffers
         for b_name, b in m.named_buffers(recurse=False):
-            if b.device.type != 'meta' and b.device.type != device:
+            if b.device.type != device:
                 try:
-                    m._buffers[b_name] = b.to(device=device, dtype=torch_dtype)
+                    if b.device.type == 'meta':
+                        # Materialize to empty on CPU
+                        new_b = torch.empty(b.shape, dtype=torch_dtype, device='cpu')
+                        m.register_buffer(b_name, new_b, persistent=True)
+                    else:
+                        m._buffers[b_name] = b.to(device=device, dtype=torch_dtype)
                 except Exception as e:
-                    print(f"DEBUG: Failed to move buffer {m_name}.{b_name}: {e}")
+                    print(f"DEBUG: Failed to move/materialize buffer {m_name}.{b_name}: {e}")
         
-        # Move registered parameters
+        # Move or materialize registered parameters
         for p_name, p in m.named_parameters(recurse=False):
-            if p.device.type != 'meta' and p.device.type != device:
+            if p.device.type != device:
                 try:
-                    # We must preserve the Parameter wrapper
-                    new_p = nn.Parameter(p.to(device=device, dtype=torch_dtype), requires_grad=False)
-                    setattr(m, p_name, new_p)
+                    if p.device.type == 'meta':
+                        # Materialize to empty on CPU
+                        new_data = torch.empty(p.shape, dtype=torch_dtype, device='cpu')
+                        new_p = nn.Parameter(new_data, requires_grad=False)
+                        setattr(m, p_name, new_p)
+                    else:
+                        # We must preserve the Parameter wrapper
+                        new_p = nn.Parameter(p.to(device=device, dtype=torch_dtype), requires_grad=False)
+                        setattr(m, p_name, new_p)
                 except Exception as e:
-                    print(f"DEBUG: Failed to move parameter {m_name}.{p_name}: {e}")
+                    print(f"DEBUG: Failed to move/materialize parameter {m_name}.{p_name}: {e}")
         
         # Move ModelOpt specific hidden/scalar attributes
         for obj in [m] + ([m.input_quantizer] if hasattr(m, "input_quantizer") else []) \
@@ -612,8 +627,11 @@ def load_hf_model(
                 try:
                     attr_val = getattr(obj, attr_name)
                     if torch.is_tensor(attr_val):
-                        if attr_val.device.type != 'meta' and attr_val.device.type != device:
-                            setattr(obj, attr_name, attr_val.to(device=device, dtype=torch_dtype))
+                        if attr_val.device.type != device:
+                            if attr_val.device.type == 'meta':
+                                setattr(obj, attr_name, torch.empty(attr_val.shape, dtype=torch_dtype, device='cpu'))
+                            else:
+                                setattr(obj, attr_name, attr_val.to(device=device, dtype=torch_dtype))
                 except Exception:
                     pass
             # Explicitly check for ModelOpt specific names if dir() missed them
@@ -621,8 +639,11 @@ def load_hf_model(
                 if hasattr(obj, hidden_attr):
                     try:
                         val = getattr(obj, hidden_attr)
-                        if torch.is_tensor(val) and val.device.type != 'meta' and val.device.type != device:
-                            setattr(obj, hidden_attr, val.to(device=device, dtype=torch_dtype))
+                        if torch.is_tensor(val) and val.device.type != device:
+                            if val.device.type == 'meta':
+                                setattr(obj, hidden_attr, torch.empty(val.shape, dtype=torch_dtype, device='cpu'))
+                            else:
+                                setattr(obj, hidden_attr, val.to(device=device, dtype=torch_dtype))
                     except Exception:
                         pass
 

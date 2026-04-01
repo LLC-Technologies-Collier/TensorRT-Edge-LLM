@@ -91,7 +91,8 @@ AudioBuilder::AudioBuilder(
 bool AudioBuilder::build()
 {
     // Load plugin library
-    auto pluginHandles = loadEdgellmPluginLib();
+    void* pluginHandles = loadEdgellmPluginLib();
+    (void)pluginHandles;
 
     // Parse model config
     if (!parseConfig())

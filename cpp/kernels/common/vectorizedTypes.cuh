@@ -20,6 +20,7 @@
 #include "common/cudaMacros.h"
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 namespace trt_edgellm
@@ -145,6 +146,51 @@ struct DVec<half>
     //! @brief Store 8 halves to global memory
     //! @param ptr Destination pointer (must be 16-byte aligned)
     __device__ __forceinline__ void store(half* ptr) const
+    {
+        *(reinterpret_cast<uint4*>(ptr)) = data;
+    }
+};
+//! \endcond
+
+//! \cond INTERNAL
+/*!
+ * @brief Vectorization specialization for bfloat16[8]
+ *
+ * Vectorization for BFLOAT16 precision data.
+ * Uses uint4 (16 bytes) for optimal memory coalescing.
+ */
+template <>
+struct DVec<__nv_bfloat16>
+{
+    uint4 data;                             //!< Storage for 8 bfloat16 as uint4 (16 bytes)
+    static constexpr uint32_t vec_size = 8; //!< Vector size
+
+    //! @brief Access element at index
+    //! @param idx Element index (0-7)
+    //! @return Reference to bfloat16 element
+    __device__ __forceinline__ __nv_bfloat16& operator[](uint32_t idx)
+    {
+        return reinterpret_cast<__nv_bfloat16*>(&data)[idx];
+    }
+
+    //! @brief Access element at index (const)
+    //! @param idx Element index (0-7)
+    //! @return Const reference to bfloat16 element
+    __device__ __forceinline__ __nv_bfloat16 const& operator[](uint32_t idx) const
+    {
+        return reinterpret_cast<__nv_bfloat16 const*>(&data)[idx];
+    }
+
+    //! @brief Load 8 bfloat16 from global memory
+    //! @param ptr Source pointer (must be 16-byte aligned)
+    __device__ __forceinline__ void load(__nv_bfloat16 const* ptr)
+    {
+        data = *(reinterpret_cast<uint4 const*>(ptr));
+    }
+
+    //! @brief Store 8 bfloat16 to global memory
+    //! @param ptr Destination pointer (must be 16-byte aligned)
+    __device__ __forceinline__ void store(__nv_bfloat16* ptr) const
     {
         *(reinterpret_cast<uint4*>(ptr)) = data;
     }

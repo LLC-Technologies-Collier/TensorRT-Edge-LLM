@@ -28,6 +28,10 @@
 #include "common/trtUtils.h"
 #include "common/version.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "kernels/speculative/eagleUtilKernels.h"
@@ -151,6 +155,55 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
+    LOG_INFO("Engine loaded. IO Tensors:");
+    bool hasHiddenStates = false;
+    for (int i = 0; i < mEngine->getNbIOTensors(); ++i) {
+        char const* name = mEngine->getIOTensorName(i);
+        nvinfer1::TensorIOMode mode = mEngine->getTensorIOMode(name);
+        LOG_INFO("  [%d] Name: %s, Mode: %d", i, name, static_cast<int>(mode));
+        if (std::string(name).find(binding_names::kOutputHiddenStates) != std::string::npos) {
+            hasHiddenStates = true;
+        }
+    }
+
+    // Allocate dummy output tensor for hidden_states if engine has it or if speculative decoding is enabled.
+    if (hasHiddenStates || mConfig.enableEagleSpecDecode || mConfig.outputHiddenDim > 0)
+    {
+        int64_t const hiddenDim = mConfig.outputHiddenDim > 0 ? mConfig.outputHiddenDim : mConfig.hiddenSize;
+        int64_t const maxSeqLen = std::max(mConfig.maxSupportedInputLength, mConfig.maxVerifyTreeSize);
+        int64_t const dummyOutputSize = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * maxSeqLen * hiddenDim;
+        LOG_INFO("Allocating mDummyOutputTensor: %ld bytes (batch=%d, seq=%d, dim=%ld)", 
+                 dummyOutputSize * sizeof(half), mConfig.maxSupportedBatchSize, maxSeqLen, hiddenDim);
+        // Allocate a large enough dummy output buffer to avoid overflow in fragmented engines
+        // Some fragmented layer outputs can be hiddenSize * seqLen * 4 (e.g. gate_proj output)
+        int64_t const largeDummySize = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * maxSeqLen * mConfig.hiddenSize * 4;
+        mDummyOutputTensor = rt::Tensor(
+            {largeDummySize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "LLMEngineRunner::mDummyOutputTensor");
+        LOG_INFO("Allocating mDummyOutputTensor: %zu bytes", mDummyOutputTensor.getMemoryCapacity());
+        CUDA_CHECK(cudaMemsetAsync(mDummyOutputTensor.rawPointer(), 0, mDummyOutputTensor.getMemoryCapacity(), stream));
+    }
+
+    // Allocate dedicated logits dummy buffer to prevent overflow (vocab size >> hidden dim)
+    if (mConfig.vocabSize > 0) {
+        int64_t const maxSeqLen = std::max(mConfig.maxSupportedInputLength, mConfig.maxVerifyTreeSize);
+        int64_t const logitsDummySize = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * maxSeqLen * mConfig.vocabSize;
+        // MUST be kFLOAT to match engine output
+        mLogitsDummyBuffer = rt::Tensor(
+            {logitsDummySize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "LLMEngineRunner::mLogitsDummyBuffer");
+        LOG_INFO("Allocating mLogitsDummyBuffer: %zu bytes (vocab=%d)", 
+                 mLogitsDummyBuffer.getMemoryCapacity(), mConfig.vocabSize);
+        CUDA_CHECK(cudaMemsetAsync(mLogitsDummyBuffer.rawPointer(), 0, mLogitsDummyBuffer.getMemoryCapacity(), stream));
+    }
+
+    // Check for RoPE binding existence
+    mHasRopeBinding = false;
+    for (int32_t i_rope = 0; i_rope < mEngine->getNbIOTensors(); ++i_rope) {
+        if (std::string(mEngine->getIOTensorName(i_rope)) == binding_names::kRopeCosSin) {
+            mHasRopeBinding = true;
+            break;
+        }
+    }
+
     int64_t const execContextMemoryInBytes = mEngine->getDeviceMemorySizeV2();
     // Allocate device memory for the execution contexts. UINT8 is used to represent raw bytes.
     mExecContextMemory = rt::Tensor({execContextMemoryInBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
@@ -169,6 +222,10 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     LOG_INFO(
         "Allocated a device memory of %zu bytes for the prefill and generation context.", execContextMemoryInBytes);
 
+    // Pre-bind all outputs to unique dummy buffers to avoid aliasing issues in fragmented engines
+    // and satisfy CUDA Graph capture requirements.
+    this->bindAllOutputsToDummy();
+
     if (!this->validateConfigFromEngine())
     {
         LOG_ERROR("Failed to match config file %s with engine file: %s", configPath.string().c_str(),
@@ -177,85 +234,88 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
             "Failed to match config file " + configPath.string() + " with engine file: " + enginePath.string());
     }
 
-    RopeConfig const& ropeConfig = mConfig.ropeConfig;
-    switch (ropeConfig.type)
+    if (mHasRopeBinding)
     {
-    case RopeType::kLongRope:
-    {
-        LOG_DEBUG("Initialize long Rope CosSinCache.");
-        check::check(ropeConfig.longRope.has_value() && ropeConfig.longRope.value().originalMaxPositionEmbeddings != -1,
-            "longRope is not set correctly");
+        RopeConfig const& ropeConfig = mConfig.ropeConfig;
+        switch (ropeConfig.type)
+        {
+        case RopeType::kLongRope:
+        {
+            LOG_DEBUG("Initialize long Rope CosSinCache.");
+            check::check(ropeConfig.longRope.has_value() && ropeConfig.longRope.value().originalMaxPositionEmbeddings != -1,
+                "longRope is not set correctly");
 
-        rt::Tensor shortCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
-            rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::shortCosSinCache");
-        rt::Tensor longCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
-            rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::longCosSinCache");
-        bool const initRopeStatus
-            = initializeLongRopeCosSinCache(shortCosSinCache, longCosSinCache, ropeConfig, stream);
-        if (!initRopeStatus)
-        {
-            LOG_ERROR("Failed to initialize long Rope CosSinCache.");
-            throw std::runtime_error("Failed to initialize long Rope CosSinCache.");
+            rt::Tensor shortCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
+                rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::shortCosSinCache");
+            rt::Tensor longCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
+                rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::longCosSinCache");
+            bool const initRopeStatus
+                = initializeLongRopeCosSinCache(shortCosSinCache, longCosSinCache, ropeConfig, stream);
+            if (!initRopeStatus)
+            {
+                LOG_ERROR("Failed to initialize long Rope CosSinCache.");
+                throw std::runtime_error("Failed to initialize long Rope CosSinCache.");
+            }
+            if (mConfig.maxKVCacheCapacity <= ropeConfig.longRope.value().originalMaxPositionEmbeddings)
+            {
+                mPosEncCosSinCache = std::move(shortCosSinCache);
+            }
+            else
+            {
+                mPosEncCosSinCache = std::move(longCosSinCache);
+            }
+            break;
         }
-        if (mConfig.maxKVCacheCapacity <= ropeConfig.longRope.value().originalMaxPositionEmbeddings)
+        case RopeType::kMRope:
         {
-            mPosEncCosSinCache = std::move(shortCosSinCache);
-        }
-        else
-        {
-            mPosEncCosSinCache = std::move(longCosSinCache);
-        }
-        break;
-    }
-    case RopeType::kMRope:
-    {
-        this->mPosEncCosSinCache
-            = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
-                rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
+            this->mPosEncCosSinCache
+                = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
+                    rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
 
-        // Initialize the MRope into form to support text-only and audio-only modes.
-        // The initialization is important for Qwen3-TTS model where we support text-only modes.
-        check::check(
-            mPosEncCosSinCache.reshape({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}), "Tensor reshape failed");
-        kernel::initializeTextOnlyMRopeCosSin(mPosEncCosSinCache.dataPointer<float>(), ropeConfig.rotaryTheta,
-            mConfig.rotaryDim, mConfig.maxKVCacheCapacity, stream);
-        break;
-    }
-    case RopeType::kNoRope:
-    {
-        LOG_DEBUG("No RoPE: initializing identity CosSinCache (cos=1, sin=0).");
-        this->mPosEncCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU,
-            DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
-        bool const initStatus = initializeNopeCosSinCache(mPosEncCosSinCache, stream);
-        if (!initStatus)
-        {
-            LOG_ERROR("Failed to initialize identity CosSinCache.");
-            throw std::runtime_error("Failed to initialize identity CosSinCache.");
+            // Initialize the MRope into form to support text-only and audio-only modes.
+            // The initialization is important for Qwen3-TTS model where we support text-only modes.
+            check::check(
+                mPosEncCosSinCache.reshape({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}), "Tensor reshape failed");
+            kernel::initializeTextOnlyMRopeCosSin(mPosEncCosSinCache.dataPointer<float>(), ropeConfig.rotaryTheta,
+                mConfig.rotaryDim, mConfig.maxKVCacheCapacity, stream);
+            break;
         }
-        break;
-    }
-    default:
-    {
-        LOG_DEBUG("Initialize persistent Rope CosSinCache.");
-        this->mPosEncCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU,
-            DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
-        bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, stream);
-        if (!initRopeStatus)
+        case RopeType::kNoRope:
         {
-            LOG_ERROR("Failed to initialize persistent Rope CosSinCache.");
-            throw std::runtime_error("Failed to initialize persistent Rope CosSinCache.");
+            LOG_DEBUG("No RoPE: initializing identity CosSinCache (cos=1, sin=0).");
+            this->mPosEncCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU,
+                DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
+            bool const initStatus = initializeNopeCosSinCache(mPosEncCosSinCache, stream);
+            if (!initStatus)
+            {
+                LOG_ERROR("Failed to initialize identity CosSinCache.");
+                throw std::runtime_error("Failed to initialize identity CosSinCache.");
+            }
+            break;
         }
-        break;
-    }
-    }
-    // Bind RopeCosSin cache
-    bool setRopeCosSinCacheStatus{true};
-    setRopeCosSinCacheStatus
-        &= mTRTExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
-    if (!setRopeCosSinCacheStatus)
-    {
-        LOG_ERROR("Failed to set rope cos sin cache to the engine");
-        throw std::runtime_error("Failed to set rope cos sin cache to the engine");
+        default:
+        {
+            LOG_DEBUG("Initialize persistent Rope CosSinCache.");
+            this->mPosEncCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU,
+                DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
+            bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, stream);
+            if (!initRopeStatus)
+            {
+                LOG_ERROR("Failed to initialize persistent Rope CosSinCache.");
+                throw std::runtime_error("Failed to initialize persistent Rope CosSinCache.");
+            }
+            break;
+        }
+        }
+        // Bind RopeCosSin cache
+        bool setRopeCosSinCacheStatus{true};
+        setRopeCosSinCacheStatus
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
+        if (!setRopeCosSinCacheStatus)
+        {
+            LOG_ERROR("Failed to set rope cos sin cache to the engine");
+            throw std::runtime_error("Failed to set rope cos sin cache to the engine");
+        }
     }
 
     if (!validateKVCacheType())
@@ -363,18 +423,9 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // Initialize dummy tensor memory to zero
     CUDA_CHECK(cudaMemsetAsync(mDummyInputTensor.rawPointer(), 0, mDummyInputTensor.getMemoryCapacity(), stream));
 
-    // Allocate dummy output tensor for hidden_states for Eagle speculative decoding.
-    // TRT engine under this mode will produce output hidden states. we reserve this buffer to hold the data when
-    // conduct vanilla decoding. This will make runtime design cleaner.
-    if (mConfig.enableEagleSpecDecode)
-    {
-        int64_t const dummyOutputSize = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * mConfig.outputHiddenDim;
-        mDummyOutputTensor = rt::Tensor(
-            {dummyOutputSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "LLMEngineRunner::mDummyOutputTensor");
-    }
-
     // Initialize kKVCacheStartIndex to dummy tensor for both profiles to avoid "address not set" error
     // when switching optimization profiles. The actual address will be set during runtime execution.
+    if (mEngine->getTensorIOMode(binding_names::kKVCacheStartIndex) != nvinfer1::TensorIOMode::kNONE)
     {
         bool setKVCacheStartIndexStatus{true};
         setKVCacheStartIndexStatus &= mTRTExecutionContext->setTensorAddress(
@@ -394,22 +445,197 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         throw std::runtime_error("Failed to initialize LoRA weights to zero tensors");
     }
 
+    if (!this->initializeDynamicWeights(enginePath))
+    {
+        LOG_ERROR("Failed to initialize dynamic weight streaming from disk");
+        throw std::runtime_error("Failed to initialize dynamic weight streaming from disk");
+    }
+
     // Synchronize the stream to ensure all the operations have completed.
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+bool LLMEngineRunner::initializeDynamicWeights(std::filesystem::path const& enginePath)
+{
+    // Check if there are compiled binaries
+    std::filesystem::path weightsDir = enginePath.parent_path() / ".." / "compiled_weights_bin";
+    if (!std::filesystem::exists(weightsDir))
+    {
+        LOG_DEBUG("No dynamic weights directory found at %s. Assuming weights are built-in or mapped via other means.", weightsDir.c_str());
+        return true;
+    }
+
+    LOG_INFO("Initializing dynamic weight streaming from %s", weightsDir.c_str());
+
+    for (int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
+    {
+        char const* name = mEngine->getIOTensorName(i);
+        std::string nameStr(name);
+        
+        // Skip standard activation IO
+        if (nameStr.find("weight") == std::string::npos && 
+            nameStr.find("qweights") == std::string::npos &&
+            nameStr.find("scales") == std::string::npos &&
+            nameStr.find("bias") == std::string::npos)
+        {
+            continue;
+        }
+
+        std::filesystem::path binPath = weightsDir / (nameStr + ".bin");
+        if (!std::filesystem::exists(binPath))
+        {
+            LOG_WARNING("Engine expects dynamic weight input %s but file %s not found.", name, binPath.c_str());
+            continue;
+        }
+
+        int fd = open(binPath.c_str(), O_RDONLY);
+        if (fd == -1)
+        {
+            LOG_ERROR("Failed to open weight file: %s", binPath.c_str());
+            return false;
+        }
+
+        struct stat sb;
+        if (fstat(fd, &sb) == -1)
+        {
+            close(fd);
+            LOG_ERROR("Failed to stat weight file: %s", binPath.c_str());
+            return false;
+        }
+
+        void* mapped = mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        
+        if (mapped == MAP_FAILED)
+        {
+            LOG_ERROR("Failed to mmap weight file: %s", binPath.c_str());
+            return false;
+        }
+
+        // Register the mapped host memory with CUDA so it can be accessed by the GPU (Unified Memory paging)
+        cudaError_t err = cudaHostRegister(mapped, sb.st_size, cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+        void* finalHostPtr = mapped;
+        bool usingMallocFallback = false;
+
+        if (err != cudaSuccess)
+        {
+            LOG_WARNING("cudaHostRegister failed for %s (%s). Falling back to cudaMallocHost copy.", 
+                        binPath.c_str(), cudaGetErrorString(err));
+            
+            // Fallback: Allocate pinned memory and copy. 
+            // This is needed for file systems like NFS that don't support HostRegister on mmapped files.
+            void* pinned = nullptr;
+            err = cudaMallocHost(&pinned, sb.st_size);
+            if (err != cudaSuccess) {
+                LOG_ERROR("cudaMallocHost fallback failed for %s: %s", binPath.c_str(), cudaGetErrorString(err));
+                munmap(mapped, sb.st_size);
+                return false;
+            }
+            
+            memcpy(pinned, mapped, sb.st_size);
+            munmap(mapped, sb.st_size); // Don't need the mmap anymore
+            finalHostPtr = pinned;
+            usingMallocFallback = true;
+        }
+
+        // Get the device pointer (for Jetson Thor unified memory, it might be the same, but we get it properly)
+        void* devicePtr = nullptr;
+        err = cudaHostGetDevicePointer(&devicePtr, finalHostPtr, 0);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("cudaHostGetDevicePointer failed for %s: %s", binPath.c_str(), cudaGetErrorString(err));
+            if (usingMallocFallback) {
+                cudaFreeHost(finalHostPtr);
+            } else {
+                cudaHostUnregister(mapped);
+                munmap(mapped, sb.st_size);
+            }
+            return false;
+        }
+
+        if (usingMallocFallback) {
+            mMallocWeights.push_back({finalHostPtr, sb.st_size});
+        } else {
+            mMmappedWeights.push_back({mapped, sb.st_size});
+        }
+        mDynamicWeightPointers[nameStr] = devicePtr;
+        
+        // Immediately bind it to the context
+        if (!mTRTExecutionContext->setTensorAddress(name, devicePtr))
+        {
+            LOG_ERROR("Failed to set tensor address for dynamic weight: %s", name);
+            return false;
+        }
+        
+        // Dynamic weight sizes must match engine exactly, so we also provide the max dimension shape
+        // For static shapes, setTensorAddress is enough. If dynamic, we must setInputShape.
+        // Assuming weights are static in the engine.
+    }
+
+    LOG_INFO("Successfully memory-mapped %zu dynamic weight tensors.", mDynamicWeightPointers.size());
+    return true;
+}
+
+bool LLMEngineRunner::bindDynamicWeights()
+{
+    std::cerr << "bindDynamicWeights(): Start. NbIOTensors: " << mEngine->getNbIOTensors() << std::endl;
+    for (auto const& [name, ptr] : mDynamicWeightPointers)
+    {
+        if (!mTRTExecutionContext->setTensorAddress(name.c_str(), ptr))
+        {
+            LOG_ERROR("Failed to re-bind tensor address for dynamic weight: %s", name.c_str());
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void LLMEngineRunner::bindAllOutputsToDummy()
+{
+    LOG_DEBUG("bindAllOutputsToDummy(): Start");
+    for (int i = 0; i < mEngine->getNbIOTensors(); ++i)
+    {
+        char const* name = mEngine->getIOTensorName(i);
+        if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kOUTPUT)
+        {
+            // Skip KV cache outputs as they are managed by the specialized binder
+            if (binding_names::isKVCacheBinding(name)) continue;
+            
+            // Default to mDummyOutputTensor
+            void* ptr = mDummyOutputTensor.rawPointer();
+            
+            // Use specialized buffers for known large outputs
+            if (std::string(name).find(binding_names::kLogits) != std::string::npos) {
+                ptr = mLogitsDummyBuffer.rawPointer();
+            }
+            
+            mTRTExecutionContext->setTensorAddress(name, ptr);
+        }
+    }
+}
+
+
 nvinfer1::DataType LLMEngineRunner::getKVCacheType() const
 {
-    if (mConfig.useTrtNativeOps)
+    // For fragmented engines, we often use unified 5D `kv_cache_` inputs.
+    std::string cacheName = "kv_cache_0";
+    if (mEngine->getTensorIOMode(cacheName.c_str()) == nvinfer1::TensorIOMode::kNONE)
     {
-        std::string const trtNativeKVBindingName0 = binding_names::formatKCacheName(/*layerIdx=*/0, /*isPast=*/true);
-        return mEngine->getTensorDataType(trtNativeKVBindingName0.c_str());
+        cacheName = "k_cache_0";
     }
-    else
+
+    if (mEngine->getTensorIOMode(cacheName.c_str()) == nvinfer1::TensorIOMode::kNONE)
     {
-        std::string const pluginKVBindingName0 = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
-        return mEngine->getTensorDataType(pluginKVBindingName0.c_str());
+        // One final fallback to binding name formatters
+        if (mConfig.useTrtNativeOps) {
+            cacheName = binding_names::formatKCacheName(mEngine.get(), 0, true);
+        } else {
+            cacheName = binding_names::formatKVCacheName(mEngine.get(), 0, true);
+        }
     }
+
+    return mEngine->getTensorDataType(cacheName.c_str());
 }
 
 nvinfer1::DataType LLMEngineRunner::getSSMStateType() const
@@ -427,60 +653,67 @@ nvinfer1::DataType LLMEngineRunner::getConvStateType() const
 bool LLMEngineRunner::validateKVCacheType() const
 {
     // Sanity check: ensure KV-cache precision (dtype) is consistent across all layers (and both past/present).
-    // We rely on a single dtype when allocating/owning the KV cache buffers.
-    if (mConfig.useTrtNativeOps)
+    // Supported naming conventions:
+    // 1. past_key_values_N / present_key_values_N (Unified 5D KV)
+    // 2. kv_cache_N / present_kv_cache_N (Unified 5D KV)
+    // 3. k_cache_N / v_cache_N (Separate K/V)
+    
+    std::string baseCacheName = "";
+    if (binding_names::hasTensor(mEngine.get(), "past_key_values_0"))
     {
-        auto kBindingName0 = binding_names::formatKCacheName(/*layerIdx=*/0, /*isPast=*/true);
-        DataType const kCacheType0 = mEngine->getTensorDataType(kBindingName0.c_str());
-        auto vBindingName0 = binding_names::formatVCacheName(/*layerIdx=*/0, /*isPast=*/true);
-        auto const checkKVCacheDType = [&](int32_t layerIdx, bool isPast) {
-            std::string const kBindingName = binding_names::formatKCacheName(layerIdx, isPast);
-            DataType const kCacheType = mEngine->getTensorDataType(kBindingName.c_str());
-            std::string const vBindingName = binding_names::formatVCacheName(layerIdx, isPast);
-            DataType const vCacheType = mEngine->getTensorDataType(vBindingName.c_str());
-            if (kCacheType != kCacheType0 || vCacheType != kCacheType0)
-            {
-                LOG_ERROR(
-                    "KV cache dtype mismatch detected. Expected all layers to use the same dtype as '%s' (dtype=%d), "
-                    "but "
-                    "binding '%s' has dtype=%d and '%s' has dtype=%d.",
-                    kBindingName0.c_str(), static_cast<int32_t>(kCacheType0), kBindingName.c_str(),
-                    static_cast<int32_t>(kCacheType), vBindingName.c_str(), static_cast<int32_t>(vCacheType));
-                throw std::runtime_error("KV cache dtype mismatch across layers");
-            }
-        };
-        int32_t const kvLayers
-            = (mConfig.numAttentionLayers > 0) ? mConfig.numAttentionLayers : mConfig.numDecoderLayers;
-        for (int32_t layerIdx = 0; layerIdx < kvLayers; ++layerIdx)
-        {
-            checkKVCacheDType(layerIdx, /*isPast=*/true);
-            checkKVCacheDType(layerIdx, /*isPast=*/false);
-        }
+        baseCacheName = "past_key_values_0";
+        mKVCacheType = KVCacheType::kUNIFIED;
     }
-    else
+    else if (binding_names::hasTensor(mEngine.get(), "kv_cache_0"))
     {
-        auto kvBindingName0 = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
-        DataType const kvCacheType = mEngine->getTensorDataType(kvBindingName0.c_str());
-        auto const checkKVCacheDType = [&](int32_t layerIdx, bool isPast) {
-            std::string const kvBindingName = binding_names::formatKVCacheName(layerIdx, isPast);
-            DataType const dt = mEngine->getTensorDataType(kvBindingName.c_str());
-            if (dt != kvCacheType)
-            {
-                LOG_ERROR(
-                    "KV cache dtype mismatch detected. Expected all layers to use the same dtype as '%s' (dtype=%d), "
-                    "but "
-                    "binding '%s' has dtype=%d.",
-                    kvBindingName0.c_str(), static_cast<int32_t>(kvCacheType), kvBindingName.c_str(),
-                    static_cast<int32_t>(dt));
-                throw std::runtime_error("KV cache dtype mismatch across layers");
-            }
-        };
-        int32_t const kvLayers
-            = (mConfig.numAttentionLayers > 0) ? mConfig.numAttentionLayers : mConfig.numDecoderLayers;
-        for (int32_t layerIdx = 0; layerIdx < kvLayers; ++layerIdx)
+        baseCacheName = "kv_cache_0";
+        mKVCacheType = KVCacheType::kUNIFIED;
+    }
+    else if (binding_names::hasTensor(mEngine.get(), "k_cache_0"))
+    {
+        baseCacheName = "k_cache_0";
+        mKVCacheType = KVCacheType::kSEPARATE;
+    }
+
+    if (baseCacheName.empty())
+    {
+        LOG_ERROR("Could not find any KV cache bindings (tried 'past_key_values_0', 'kv_cache_0' and 'k_cache_0')");
+        return false;
+    }
+
+    DataType const baseType = mEngine->getTensorDataType(baseCacheName.c_str());
+    if (baseType != DataType::kHALF && baseType != DataType::kFP8 && baseType != DataType::kBF16)
+    {
+        LOG_ERROR("Unsupported KV cache dtype: %d", static_cast<int32_t>(baseType));
+        return false;
+    }
+
+    // Verify consistency across all layers
+    int32_t const kvLayers
+        = (mConfig.numAttentionLayers > 0) ? mConfig.numAttentionLayers : mConfig.numDecoderLayers;
+    
+    for (int32_t layerIdx = 0; layerIdx < kvLayers; ++layerIdx)
+    {
+        // Check K (or Unified KV)
+        std::string const kName = binding_names::formatKCacheName(mEngine.get(), layerIdx, /*isPast=*/true);
+        if (!kName.empty() && binding_names::hasTensor(mEngine.get(), kName.c_str()))
         {
-            checkKVCacheDType(layerIdx, /*isPast=*/true);
-            checkKVCacheDType(layerIdx, /*isPast=*/false);
+            if (mEngine->getTensorDataType(kName.c_str()) != baseType)
+            {
+                LOG_ERROR("KV cache dtype mismatch at layer %d (K)", layerIdx);
+                return false;
+            }
+        }
+
+        // Check V (only if using separate K/V)
+        std::string const vName = binding_names::formatVCacheName(mEngine.get(), layerIdx, /*isPast=*/true);
+        if (!vName.empty() && binding_names::hasTensor(mEngine.get(), vName.c_str()))
+        {
+            if (mEngine->getTensorDataType(vName.c_str()) != baseType)
+            {
+                LOG_ERROR("KV cache dtype mismatch at layer %d (V)", layerIdx);
+                return false;
+            }
         }
     }
 
@@ -646,12 +879,13 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
     LOG_INFO("initializeConfigFromJson(): Loaded LLMEngineRunner with config: %s", formatEngineConfig(mConfig).c_str());
     return true;
 }
-
 bool LLMEngineRunner::validateConfigFromEngine()
 {
     // Plugin path: combined KV cache [batch, 2, num_kv_heads, seq_len, head_dim]
     auto identifyKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
-        return tensorDim.nbDims == 5 && bindingName.find(binding_names::kPastKeyValuesTemplate) != std::string::npos;
+        return (bindingName.find(binding_names::kPastKeyValuesTemplate) != std::string::npos ||
+                bindingName.find("kv_cache_") != std::string::npos ||
+                bindingName.find("present_kv_cache_") != std::string::npos);
     };
 
     // TRT native: separate K cache [batch, num_kv_heads, seq_len, head_dim]
@@ -690,12 +924,20 @@ bool LLMEngineRunner::validateConfigFromEngine()
 
     // Lambda to validate KV cache dimensions against profile shape
     auto validateKVCacheProfile = [&](Dims const& maxKVCacheShape, std::string const& profileName) -> bool {
+        if (maxKVCacheShape.nbDims == 0) return true; 
         bool status{true};
-        status
-            &= validate_eq_engine_with_config(mConfig.numKVHeads, maxKVCacheShape.d[2], profileName + ": numKVHeads");
-        status &= validate_eq_engine_with_config(
-            mConfig.maxKVCacheCapacity, maxKVCacheShape.d[3], profileName + ": maxKVCacheCapacity");
-        status &= validate_eq_engine_with_config(mConfig.headDim, maxKVCacheShape.d[4], profileName + ": headDim");
+        if (maxKVCacheShape.d[2] < mConfig.numKVHeads) {
+            LOG_ERROR("%s: numKVHeads (%d) is less than config (%d)", profileName.c_str(), maxKVCacheShape.d[2], mConfig.numKVHeads);
+            status = false;
+        }
+        if (maxKVCacheShape.d[3] < mConfig.maxKVCacheCapacity) {
+            LOG_ERROR("%s: maxKVCacheCapacity (%d) is less than config (%d)", profileName.c_str(), maxKVCacheShape.d[3], mConfig.maxKVCacheCapacity);
+            status = false;
+        }
+        if (mConfig.headDim != maxKVCacheShape.d[4]) {
+            LOG_ERROR("%s: headDim (%d) does not match config (%d)", profileName.c_str(), maxKVCacheShape.d[4], mConfig.headDim);
+            status = false;
+        }
         return status;
     };
 
@@ -707,16 +949,19 @@ bool LLMEngineRunner::validateConfigFromEngine()
 
         if (identifyKVCacheBinding(bindingName, tensorDim))
         {
-            // Get max profile shapes for both prefill and generation profiles
-            Dims const maxKVCacheShapePrefill
-                = mEngine->getProfileShape(bindingName.c_str(), kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
-            Dims const maxKVCacheShapeGen
-                = mEngine->getProfileShape(bindingName.c_str(), kGENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
+            if (mEngine->getTensorIOMode(bindingName.c_str()) == nvinfer1::TensorIOMode::kINPUT)
+            {
+                // Get max profile shapes for both prefill and generation profiles
+                Dims const maxKVCacheShapePrefill
+                    = mEngine->getProfileShape(bindingName.c_str(), kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
+                Dims const maxKVCacheShapeGen
+                    = mEngine->getProfileShape(bindingName.c_str(), kGENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
 
-            // Validate both profiles
-            isOk &= validateKVCacheProfile(maxKVCacheShapePrefill, "prefill");
-            isOk &= validateKVCacheProfile(maxKVCacheShapeGen, "generation");
-            ++nbKVCacheInputs;
+                // Validate both profiles
+                isOk &= validateKVCacheProfile(maxKVCacheShapePrefill, "prefill");
+                isOk &= validateKVCacheProfile(maxKVCacheShapeGen, "generation");
+                ++nbKVCacheInputs;
+            }
         }
         if (identifyDeepstackEmbedsBinding(bindingName, tensorDim))
         {
@@ -765,22 +1010,13 @@ bool LLMEngineRunner::validateConfigFromEngine()
         = (mConfig.numAttentionLayers > 0) ? mConfig.numAttentionLayers : mConfig.numDecoderLayers;
     if (mConfig.useTrtNativeOps)
     {
-        // TRT native mode: expect separate K and V caches
-        if (nbTRTNativeKCacheInputs != expectedKVLayers)
+        // We use a custom ONNX tracing pipeline that unifies K/V into a 5D `kv_cache_` input 
+        // even when useTrtNativeOps is true. 
+        if (nbTRTNativeKCacheInputs != expectedKVLayers && nbKVCacheInputs != expectedKVLayers)
         {
-            LOG_ERROR("KV cache layer count mismatch (TRT native K cache). From engine: %d, expected: %d",
-                nbTRTNativeKCacheInputs, expectedKVLayers);
-            return false;
-        }
-        if (nbTRTNativeVCacheInputs != expectedKVLayers)
-        {
-            LOG_ERROR("KV cache layer count mismatch (TRT native V cache). From engine: %d, expected: %d",
-                nbTRTNativeVCacheInputs, expectedKVLayers);
-            return false;
-        }
-        if (nbKVCacheInputs > 0)
-        {
-            LOG_ERROR("Found plugin-style KV cache bindings but config specifies TRT native mode");
+            LOG_ERROR("KV cache layer count mismatch. Neither separate K/V nor unified KV matched expected layers. "
+                      "nbTRTNativeKCacheInputs: %d, nbKVCacheInputs: %d, expectedKVLayers: %d", 
+                      nbTRTNativeKCacheInputs, nbKVCacheInputs, expectedKVLayers);
             return false;
         }
     }
@@ -819,9 +1055,11 @@ bool LLMEngineRunner::validateConfigFromEngine()
     Dims const logitsDim = mEngine->getTensorShape(binding_names::kLogits);
     isOk &= validate_eq_engine_with_config(mConfig.outputVocabSize, logitsDim.d[2], "outputVocabSize");
 
-    // Obtain rotary dim from the engine.
-    Dims const ropeCosSinCacheDim = mEngine->getTensorShape(binding_names::kRopeCosSin);
-    isOk &= validate_eq_engine_with_config(mConfig.rotaryDim, ropeCosSinCacheDim.d[2], "rotaryDim");
+    if (mHasRopeBinding)
+    {
+        Dims const ropeCosSinCacheDim = mEngine->getTensorShape(binding_names::kRopeCosSin);
+        isOk &= validate_eq_engine_with_config(mConfig.rotaryDim, ropeCosSinCacheDim.d[2], "rotaryDim");
+    }
 
     if (!isOk)
     {
@@ -832,6 +1070,25 @@ bool LLMEngineRunner::validateConfigFromEngine()
 
 LLMEngineRunner::~LLMEngineRunner() noexcept
 {
+    // Unregister and unmap dynamic weights
+    for (auto const& pair : mMmappedWeights)
+    {
+        if (pair.first)
+        {
+            cudaHostUnregister(pair.first);
+            munmap(pair.first, pair.second);
+        }
+    }
+
+    // Free pinned fallback weights
+    for (auto const& pair : mMallocWeights)
+    {
+        if (pair.first)
+        {
+            cudaFreeHost(pair.first);
+        }
+    }
+    
     for (auto& [key, graphPair] : mCudaGraphs)
     {
         cudaGraphDestroy(graphPair.first);
@@ -846,71 +1103,99 @@ LLMEngineRunner::~LLMEngineRunner() noexcept
 
 bool LLMEngineRunner::bindPluginKVCacheToEngine(int32_t activeBatchSize)
 {
-    // Prepare special input binding shape for prefill stage KVCache input.
-    Dims const kvCacheDims = {5, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
     int32_t const kvCacheLayers
         = (mConfig.numAttentionLayers > 0) ? mConfig.numAttentionLayers : mConfig.numDecoderLayers;
     bool status{true};
     // Bind KV cache tensors to execution contexts
     for (int32_t i = 0; i < kvCacheLayers; ++i)
     {
-        std::string const pastKeyValuesName = binding_names::formatKVCacheName(i, true);
-        std::string const presentKeyValuesName = binding_names::formatKVCacheName(i, false);
+        std::string const pastKeyValuesName = binding_names::formatKVCacheName(mEngine.get(), i, true);
+        std::string const presentKeyValuesName = binding_names::formatKVCacheName(mEngine.get(), i, false);
 
-        rt::Tensor kvCacheBlock = mKVCache.getCombinedKVCacheForDecoderLayer(i);
-        status &= mTRTExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
-        status &= mTRTExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
-        status &= mTRTExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
+        if (!pastKeyValuesName.empty() && binding_names::hasTensor(mEngine.get(), pastKeyValuesName.c_str()))
+        {
+            // Use the actual shape from the engine to avoid static dimension mismatches
+            Dims kvCacheDims = mEngine->getTensorShape(pastKeyValuesName.c_str());
+            if (kvCacheDims.nbDims < 0) {
+                // Fallback to config if query fails
+                kvCacheDims = {5, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
+            }
+            
+            // Resolve dynamic dimensions
+            kvCacheDims.d[0] = activeBatchSize;
+            for (int32_t j = 0; j < kvCacheDims.nbDims; ++j) {
+                if (kvCacheDims.d[j] < 0) {
+                    // For KV cache in fragmented engines, dynamic dim is usually seq_len (index 3)
+                    kvCacheDims.d[j] = (j == 3) ? mConfig.maxKVCacheCapacity : 1;
+                }
+            }
+
+            rt::Tensor kvCacheBlock = mKVCache.getCombinedKVCacheForDecoderLayer(i);
+            status &= mTRTExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
+            status &= mTRTExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
+            status &= mTRTExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
+        }
     }
     return status;
 }
 
 bool LLMEngineRunner::bindTRTNativeKVCacheToEngine(int32_t activeBatchSize)
 {
-    // TRT native path: separate K and V caches without the "2" dimension
-    // Shape: [batch, num_kv_heads, seq_len, head_dim]
-    Dims const kCacheDimIn = {4, {activeBatchSize, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
-    Dims const vCacheDimIn = {4, {activeBatchSize, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
-
     int32_t const kvCacheLayers
         = (mConfig.numAttentionLayers > 0) ? mConfig.numAttentionLayers : mConfig.numDecoderLayers;
     bool status{true};
     // Bind separate K and V cache tensors to execution contexts
     for (int32_t i = 0; i < kvCacheLayers; ++i)
     {
-        std::string const pastKCacheName = binding_names::formatKCacheName(i, true);
-        std::string const presentKCacheName = binding_names::formatKCacheName(i, false);
-        std::string const pastVCacheName = binding_names::formatVCacheName(i, true);
-        std::string const presentVCacheName = binding_names::formatVCacheName(i, false);
+        std::string const pastKCacheName = binding_names::formatKCacheName(mEngine.get(), i, true);
+        std::string const presentKCacheName = binding_names::formatKCacheName(mEngine.get(), i, false);
+        std::string const pastVCacheName = binding_names::formatVCacheName(mEngine.get(), i, true);
+        std::string const presentVCacheName = binding_names::formatVCacheName(mEngine.get(), i, false);
 
         std::pair<rt::Tensor, rt::Tensor> kvCacheBlocks = mKVCache.getSeparateKVCacheForDecoderLayer(i);
         rt::Tensor& kCacheBlock = kvCacheBlocks.first;
         rt::Tensor& vCacheBlock = kvCacheBlocks.second;
 
         // Bind K cache
-        status &= mTRTExecutionContext->setTensorAddress(pastKCacheName.c_str(), kCacheBlock.rawPointer());
-        status &= mTRTExecutionContext->setTensorAddress(presentKCacheName.c_str(), kCacheBlock.rawPointer());
+        if (!pastKCacheName.empty() && binding_names::hasTensor(mEngine.get(), pastKCacheName.c_str()))
+        {
+            Dims kCacheDim = mEngine->getTensorShape(pastKCacheName.c_str());
+            if (kCacheDim.nbDims < 0) kCacheDim = {4, {activeBatchSize, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
+            kCacheDim.d[0] = activeBatchSize;
+
+            status &= mTRTExecutionContext->setTensorAddress(pastKCacheName.c_str(), kCacheBlock.rawPointer());
+            if (!presentKCacheName.empty()) {
+                status &= mTRTExecutionContext->setTensorAddress(presentKCacheName.c_str(), kCacheBlock.rawPointer());
+            }
+            status &= mTRTExecutionContext->setInputShape(pastKCacheName.c_str(), kCacheDim);
+        }
 
         // Bind V cache
-        status &= mTRTExecutionContext->setTensorAddress(pastVCacheName.c_str(), vCacheBlock.rawPointer());
-        status &= mTRTExecutionContext->setTensorAddress(presentVCacheName.c_str(), vCacheBlock.rawPointer());
+        if (!pastVCacheName.empty() && binding_names::hasTensor(mEngine.get(), pastVCacheName.c_str()))
+        {
+            Dims vCacheDim = mEngine->getTensorShape(pastVCacheName.c_str());
+            if (vCacheDim.nbDims < 0) vCacheDim = {4, {activeBatchSize, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
+            vCacheDim.d[0] = activeBatchSize;
 
-        // Set shapes for K/V cache
-        status &= mTRTExecutionContext->setInputShape(pastKCacheName.c_str(), kCacheDimIn);
-        status &= mTRTExecutionContext->setInputShape(pastVCacheName.c_str(), vCacheDimIn);
+            status &= mTRTExecutionContext->setTensorAddress(pastVCacheName.c_str(), vCacheBlock.rawPointer());
+            if (!presentVCacheName.empty()) {
+                status &= mTRTExecutionContext->setTensorAddress(presentVCacheName.c_str(), vCacheBlock.rawPointer());
+            }
+            status &= mTRTExecutionContext->setInputShape(pastVCacheName.c_str(), vCacheDim);
+        }
     }
     return status;
 }
 
 bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
 {
-    if (mConfig.useTrtNativeOps)
+    if (mKVCacheType == KVCacheType::kUNIFIED)
     {
-        return bindTRTNativeKVCacheToEngine(activeBatchSize);
+        return bindPluginKVCacheToEngine(activeBatchSize);
     }
     else
     {
-        return bindPluginKVCacheToEngine(activeBatchSize);
+        return bindTRTNativeKVCacheToEngine(activeBatchSize);
     }
 }
 
@@ -1062,8 +1347,10 @@ bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputsEmbeds,
         }
     }
 
+    Dims const engineLogitsDim = mEngine->getTensorShape(binding_names::kLogits);
     bool const isLogitsShapeValid
-        = outputLogits.getShape().getNumDims() == 2 && outputLogits.getShape()[1] == mConfig.outputVocabSize;
+        = (outputLogits.getShape().getNumDims() == engineLogitsDim.nbDims) && 
+          (outputLogits.getShape()[outputLogits.getShape().getNumDims()-1] == mConfig.outputVocabSize);
     if (!isLogitsShapeValid)
     {
         LOG_ERROR(
@@ -1145,10 +1432,17 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
         binding_names::kInputsEmbeds, const_cast<void*>(inputsEmbeds.rawPointer()));
     setEngineIOStatus
         &= mTRTExecutionContext->setInputShape(binding_names::kInputsEmbeds, inputsEmbeds.getShape().getTRTDims());
-    setEngineIOStatus
-        &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+    const char* contextLengthsName = binding_names::kContextLengths;
+    if (mEngine->getTensorIOMode(contextLengthsName) == nvinfer1::TensorIOMode::kNONE) {
+        contextLengthsName = binding_names::kAttentionMask;
+    }
+
+    if (mEngine->getTensorIOMode(contextLengthsName) != nvinfer1::TensorIOMode::kNONE)
+    {
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(contextLengthsName, mSequenceContextLengths.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+            contextLengthsName, mSequenceContextLengths.getShape().getTRTDims());
+    }
     setEngineIOStatus
         &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1165,17 +1459,23 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
     }
     else
     {
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+        if (mEngine->getTensorIOMode(binding_names::kKVCacheStartIndex) != nvinfer1::TensorIOMode::kNONE)
+        {
+            setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+                binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+            setEngineIOStatus
+                &= mTRTExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+        }
     }
 
     // RopeCosSin tensor address is set during object construction. We only set shape here to accommodate ND-Rope.
     // For ND-RoPE like MRope, the runtime will update the tensor shape and contents based on multimodal inputs.
     // For persistent rope, the cache is fixed at {1, maxSeqLen, rotaryDim} and shared across all batches.
-    setEngineIOStatus
-        &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+    if (mHasRopeBinding)
+    {
+        setEngineIOStatus
+            &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+    }
 
     // Process deepstack embeds: bind already-embedded tensors to engine
     // Runtime must provide these tensors (zero tensors for non-multimodal use cases)
@@ -1193,12 +1493,6 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
                 &= mTRTExecutionContext->setInputShape(embedName.c_str(), embedTensor.getShape().getTRTDims());
         }
     }
-    // Bind hidden states output if requested
-    if (outputHiddenStates.has_value())
-    {
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kOutputHiddenStates, outputHiddenStates.value().get().rawPointer());
-    }
 
     if (mConfig.enableEagleSpecDecode)
     {
@@ -1213,11 +1507,37 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
             binding_names::kAttentionPosId, Coords{activeBatchSize, 1}.getTRTDims());
     }
 
-    // Engine output tensors.
+    // Bind dynamic weight streams (also handles unbound fragmented outputs)
+    setEngineIOStatus &= this->bindDynamicWeights();
+
+    // Engine output tensors (must be bound after bindDynamicWeights to override dummy allocator)
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+    if (outputHiddenStates.has_value())
+    {
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kOutputHiddenStates, outputHiddenStates->get().rawPointer());
+    }
 
     // Bind the KVCache IO to the engine
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
+
+    // Aggressively bind ANY OTHER tensor matching "hidden_states" or "logits" or fragmented outputs to dummy buffer if not bound.
+    // This is critical for fragmented engines that expose internal layer outputs.
+    void* dummyPtr = (mDummyOutputTensor.getMemoryCapacity() > 0) ? mDummyOutputTensor.rawPointer() : mDummyInputTensor.rawPointer();
+    for (int i = 0; i < mEngine->getNbIOTensors(); ++i) {
+        char const* name = mEngine->getIOTensorName(i);
+        if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kOUTPUT) {
+            // If it was already bound (status already true), skip
+            // However, TRT doesn't provide a direct way to check if a tensor is already bound
+            // without keeping track of it ourselves. 
+            // We'll skip the ones we know we just bound.
+            std::string sname(name);
+            if (sname == binding_names::kLogits || sname == binding_names::kOutputHiddenStates || binding_names::isKVCacheBinding(sname)) {
+                continue;
+            }
+            // LOG_DEBUG("executePrefillStep(): Binding rogue output '%s' to dummy buffer", name);
+            setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(name, dummyPtr);
+        }
+    }
 
     // Bind Mamba state for Mamba layers
     setEngineIOStatus &= this->bindConvStateToEngine(activeBatchSize);
@@ -1231,6 +1551,7 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
 
     // launch the engine execution.
     bool executeStatus{true};
+
     executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     if (!executeStatus)
     {
@@ -1290,7 +1611,7 @@ bool LLMEngineRunner::vanillaDecodingStepPrepareInputs(int32_t activeBatchSize, 
     check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
 
     // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
-    if (mConfig.ropeConfig.type == RopeType::kMRope)
+    if (mHasRopeBinding && mConfig.ropeConfig.type == RopeType::kMRope)
     {
         check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
             "Tensor reshape failed");
@@ -1328,21 +1649,34 @@ bool LLMEngineRunner::vanillaDecodingStepBindTensors(rt::Tensor const& inputsEmb
         binding_names::kInputsEmbeds, const_cast<void*>(inputsEmbeds.rawPointer()));
     setEngineIOStatus
         &= mTRTExecutionContext->setInputShape(binding_names::kInputsEmbeds, inputsEmbeds.getShape().getTRTDims());
-    setEngineIOStatus
-        &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+    const char* contextLengthsName = binding_names::kContextLengths;
+    if (mEngine->getTensorIOMode(contextLengthsName) == nvinfer1::TensorIOMode::kNONE) {
+        contextLengthsName = binding_names::kAttentionMask;
+    }
+
+    if (mEngine->getTensorIOMode(contextLengthsName) != nvinfer1::TensorIOMode::kNONE)
+    {
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(contextLengthsName, mSequenceContextLengths.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+            contextLengthsName, mSequenceContextLengths.getShape().getTRTDims());
+    }
     setEngineIOStatus
         &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
-    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+    if (mEngine->getTensorIOMode(binding_names::kKVCacheStartIndex) != nvinfer1::TensorIOMode::kNONE)
+    {
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus
+            &= mTRTExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+    }
 
-    setEngineIOStatus
-        &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+    if (mHasRopeBinding)
+    {
+        setEngineIOStatus
+            &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+    }
 
     // Update KV cache shapes to match activeBatchSize
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
@@ -1362,7 +1696,10 @@ bool LLMEngineRunner::vanillaDecodingStepBindTensors(rt::Tensor const& inputsEmb
         }
     }
 
-    // Engine output tensors.
+    // Bind dynamic weight streams (also handles unbound fragmented outputs)
+    setEngineIOStatus &= this->bindDynamicWeights();
+
+    // Engine output tensors (must be bound after bindDynamicWeights to override dummy allocator)
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
 
     if (outputHiddenStates.has_value())
@@ -1370,12 +1707,18 @@ bool LLMEngineRunner::vanillaDecodingStepBindTensors(rt::Tensor const& inputsEmb
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kOutputHiddenStates, outputHiddenStates.value().get().rawPointer());
     }
-    else if (mDummyOutputTensor.getMemoryCapacity() > 0)
-    {
-        // Engine has hidden_states output but user doesn't need it
-        // Bind to dummy buffer (EAGLE or Qwen3-Omni text-only mode)
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kOutputHiddenStates, mDummyOutputTensor.rawPointer());
+
+    // Aggressively bind ANY OTHER tensor matching "hidden_states" to dummy buffer if not bound.
+    // This is critical for fragmented engines that expose internal layer outputs.
+    void* dummyPtr = (mDummyOutputTensor.getMemoryCapacity() > 0) ? mDummyOutputTensor.rawPointer() : mDummyInputTensor.rawPointer();
+    for (int i = 0; i < mEngine->getNbIOTensors(); ++i) {
+        char const* name = mEngine->getIOTensorName(i);
+        if (std::string(name).find(binding_names::kOutputHiddenStates) != std::string::npos) {
+            if (mTRTExecutionContext->getTensorAddress(name) == nullptr) {
+                LOG_DEBUG("vanillaDecodingStepBindTensors(): Binding dummy buffer to rogue output: %s", name);
+                setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(name, dummyPtr);
+            }
+        }
     }
 
     return setEngineIOStatus;
@@ -1426,6 +1769,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(rt::Tensor const& inputsEmbeds,
 
         // launch the engine execution.
         bool executeStatus{true};
+
         executeStatus &= mTRTExecutionContext->enqueueV3(stream);
         if (!executeStatus)
         {
@@ -1550,28 +1894,41 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepBindTensors(rt::Tensor const& bas
         binding_names::kInputsEmbeds, const_cast<void*>(baseTreeDecodingInputsEmbeds.rawPointer()));
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kInputsEmbeds, baseTreeDecodingInputsEmbeds.getShape().getTRTDims());
-    setEngineIOStatus
-        &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+    const char* contextLengthsName = binding_names::kContextLengths;
+    if (mEngine->getTensorIOMode(contextLengthsName) == nvinfer1::TensorIOMode::kNONE) {
+        contextLengthsName = binding_names::kAttentionMask;
+    }
+
+    if (mEngine->getTensorIOMode(contextLengthsName) != nvinfer1::TensorIOMode::kNONE)
+    {
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(contextLengthsName, mSequenceContextLengths.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+            contextLengthsName, mSequenceContextLengths.getShape().getTRTDims());
+    }
     setEngineIOStatus
         &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
-    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+    if (mEngine->getTensorIOMode(binding_names::kKVCacheStartIndex) != nvinfer1::TensorIOMode::kNONE)
+    {
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus
+            &= mTRTExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+    }
 
     // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
-    if (mConfig.ropeConfig.type == RopeType::kMRope)
+    if (mHasRopeBinding && mConfig.ropeConfig.type == RopeType::kMRope)
     {
         check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
             "Tensor reshape failed");
     }
 
-    setEngineIOStatus
-        &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+    if (mHasRopeBinding)
+    {
+        setEngineIOStatus
+            &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+    }
 
     // Update KV cache shapes to match activeBatchSize
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
@@ -1611,6 +1968,8 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepBindTensors(rt::Tensor const& bas
         LOG_ERROR("Failed to bind engine input and output tensors.");
         return false;
     }
+    
+    setEngineIOStatus &= this->bindDynamicWeights();
 
     return true;
 }

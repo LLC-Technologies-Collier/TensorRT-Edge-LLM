@@ -110,6 +110,12 @@ public:
     //! @return Reference to LinearKVCache
     rt::LinearKVCache& getLinearKVCache() noexcept;
 
+    //! @brief Get the TensorRT engine
+    nvinfer1::ICudaEngine* getTRTEngine() const noexcept
+    {
+        return mEngine.get();
+    }
+
     //! @brief Get engine configuration
     //! @return Engine configuration structure
     LLMEngineRunnerConfig getEngineConfig() const noexcept;
@@ -238,6 +244,36 @@ private:
     rt::Tensor mExecContextMemory{};                                   //!< Device memory for the execution contexts
     std::unique_ptr<nvinfer1::IExecutionContext> mTRTExecutionContext; //!< Prefill and Generation execution context
 
+    //! Holds pointers to mmapped files for dynamic weight streaming
+    std::vector<std::pair<void*, size_t>> mMmappedWeights;
+    
+    //! Holds pointers to cudaMallocHost'ed memory for fallback when mmap/hostregister fails (e.g. NFS)
+    std::vector<std::pair<void*, size_t>> mMallocWeights;
+    
+    //! Map of weight tensor names to their loaded/mapped device pointers
+    std::unordered_map<std::string, void*> mDynamicWeightPointers;
+    
+    //! Initialize and map dynamic weights from disk
+    bool initializeDynamicWeights(std::filesystem::path const& enginePath);
+    
+    //! Bind dynamic weights to execution context
+    // A dummy allocator to satisfy TensorRT for outputs we don't care about (common in fragmented engines)
+    class DummyOutputAllocator : public nvinfer1::IOutputAllocator
+    {
+    public:
+        DummyOutputAllocator(void* dummyBuffer) : mDummyBuffer(dummyBuffer) {}
+        void* reallocateOutput(char const* tensorName, void* currentMemory, uint64_t size, uint64_t alignment) noexcept override
+        {
+            return mDummyBuffer;
+        }
+        void notifyShape(char const* tensorName, nvinfer1::Dims const& dims) noexcept override {}
+    private:
+        void* mDummyBuffer;
+    };
+    std::unique_ptr<DummyOutputAllocator> mDummyOutputAllocator;
+
+    bool bindDynamicWeights();
+
     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique key value
     //! which denote the input/output shapes and other execution properties like LoRA weights.
     hash_utils::HashMap<DecodingGraphKey, std::pair<cudaGraph_t, cudaGraphExec_t>> mCudaGraphs;
@@ -251,10 +287,12 @@ private:
     std::string mActiveLoraWeightsName{}; //!< Name of currently active LoRA weights
 
     LLMEngineRunnerConfig mConfig{}; //!< Engine configuration
+    mutable KVCacheType mKVCacheType{KVCacheType::kUNIFIED}; //!< Detected KV cache naming strategy
 
     //! The Rope CosSinCache tensor that pre-computed prior to engine execution.
     //! The design is to produce better performance and accommodate complex context dependent rope.
     rt::Tensor mPosEncCosSinCache{};
+    bool mHasRopeBinding{false};
 
     //! The select token indices tensor is used to select indices from hidden states to pass to
     //! the LM head of LLM model. Enforce to be int64_t to align with ONNX Gather-ND specification.
@@ -279,6 +317,10 @@ private:
     //! Dummy output tensor used to reserve space for unused output tensors. TRT engines have static I/O, to keep
     //! runtime design clean, we will route unused output tensors to this dummy tensor.
     rt::Tensor mDummyOutputTensor{};
+    //! @brief Dedicated dummy buffer for logits to prevent overflow (vocab size can be large)
+    rt::Tensor mLogitsDummyBuffer{};
+    //! @brief Unique dummy buffers for rogue fragmented engine outputs to prevent aliasing
+    std::unordered_map<std::string, rt::Tensor> mRogueOutputBuffers;
 
     //! The eagle base position ids tensor within the sequence that used by positional encoding.
     rt::Tensor mEagleBasePositionIds{};
@@ -402,6 +444,12 @@ private:
      * @return True on success, false on failure
      */
     bool bindConvStateToEngine(int32_t activeBatchSize);
+
+    /*!
+     * @brief Bind all engine outputs to unique dummy buffers to satisfy TRT/CUDA Graph requirements.
+     *        This avoids aliasing issues in fragmented engines.
+     */
+    void bindAllOutputsToDummy();
 };
 
 } // namespace rt

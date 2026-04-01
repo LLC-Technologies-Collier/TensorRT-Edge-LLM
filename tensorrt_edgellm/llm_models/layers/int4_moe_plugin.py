@@ -483,9 +483,10 @@ class Int4MoePluginModule(nn.Module):
             D = self.hidden_size
             G = I // group_size if group_size != -1 else 1
 
-            self.register_buffer("fc_gate_up_qweights", torch.empty((E, I//16, D*2), dtype=torch.int8, device='meta'))
+            # Use int32 for bit-packed containers to avoid TensorRT treating them as quantized INT8 operands
+            self.register_buffer("fc_gate_up_qweights", torch.empty((E, I//16, (D*2)//4), dtype=torch.int32, device='meta'))
             self.register_buffer("fc_gate_up_scales", torch.empty((E, G, D), dtype=torch.float16, device='meta'))
-            self.register_buffer("fc_down_qweights", torch.empty((E, D//16, I), dtype=torch.int8, device='meta'))
+            self.register_buffer("fc_down_qweights", torch.empty((E, D//16, I//4), dtype=torch.int32, device='meta'))
             self.register_buffer("fc_down_scales", torch.empty((E, D//group_size if group_size != -1 else 1, I//2), dtype=torch.float16, device='meta'))
             return
 
@@ -569,7 +570,7 @@ class Int4MoePluginModule(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = hidden_states.shape
-        hidden_flat = hidden_states.reshape(-1, hidden_dim)
+        hidden_flat = hidden_states.reshape(batch_size * seq_len, hidden_dim)
         
         # Ensure hidden_flat matches self.gate.in_features exactly.
         # Hybrid models like Qwen 3.5 MoE might have varying head counts.

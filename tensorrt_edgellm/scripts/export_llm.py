@@ -30,20 +30,44 @@ Usage:
     python export_llm.py --model_dir /path/to/model --output_dir /path/to/output --chat_template /path/to/chat_template.json
 """
 
+import os
+import sys
+import tensorrt_edgellm
+
+# WORKAROUND: Global Injection for broken huggingface_hub
+import huggingface_hub
+if not hasattr(huggingface_hub, 'is_offline_mode'):
+    def is_offline_mode():
+        return os.environ.get("HF_HUB_OFFLINE", "0").upper() in ("1", "ON", "YES", "TRUE")
+    huggingface_hub.is_offline_mode = is_offline_mode
+    # Also inject into utils for safety
+    import huggingface_hub.utils
+    huggingface_hub.utils.is_offline_mode = is_offline_mode
+
+import huggingface_hub.dataclasses
+if not hasattr(huggingface_hub.dataclasses, 'validate_typed_dict'):
+    def validate_typed_dict(d, cls):
+        return d # No-op validation
+    huggingface_hub.dataclasses.validate_typed_dict = validate_typed_dict
+
+# DEFINITIVE WORKSPACE PRECEDENCE
+ws_root = '/srv/nfs/robo-src/github/c9h/tensorrt'
+sys.path.insert(0, os.path.join(ws_root, 'TensorRT-Edge-LLM'))
+sys.path.insert(0, os.path.join(ws_root, 'nvidia-modelopt'))
+sys.path.insert(0, os.path.join(ws_root, 'transformers/src'))
+
 import argparse
 import sys
 import traceback
 
-from tensorrt_edgellm.onnx_export.llm_export import export_llm_model
-
-
 def main() -> None:
-    """
-    Main function that parses command line arguments and exports the LLM model.
-    
-    This function sets up argument parsing for the LLM export script and calls
-    the export_llm_model function with the provided parameters.
-    """
+    from tensorrt_edgellm.onnx_export.llm_export import export_llm_model
+    import tensorrt_edgellm
+    import sys
+    print(f"DEBUG: sys.path={sys.path}")
+    print(f"DEBUG: tensorrt_edgellm location={tensorrt_edgellm.__file__}")
+    sys.stdout.flush()
+
     parser = argparse.ArgumentParser(
         description="Export standard/Eagle3 base LLM model to ONNX format")
     parser.add_argument(
@@ -121,11 +145,20 @@ def main() -> None:
         action="store_true",
         help="Whether to load model on meta device for skeleton tracing (required for 100B+ models)"
     )
+    parser.add_argument(
+        "--qwen35_interleaving",
+        action="store_true",
+        help="Whether to apply Qwen 3.5 grouped-interleaved weight packing for hybrid layers"
+    )
 
+    print("DEBUG: About to parse arguments...")
+    sys.stdout.flush()
     args = parser.parse_args()
+    print("DEBUG: Arguments parsed.")
 
     try:
         # Export model(s)
+        print(f"DEBUG: Calling export_llm_model with model_dir={args.model_dir}...")
         export_llm_model(model_dir=args.model_dir,
                          output_dir=args.output_dir,
                          device=args.device,
@@ -138,7 +171,8 @@ def main() -> None:
                          fp8_kv_cache=args.fp8_kv_cache,
                          trt_native_ops=args.trt_native_ops,
                          output_hidden_states=args.output_hidden_states,
-                         load_meta=args.load_meta)
+                         load_meta=args.load_meta,
+                         qwen35_interleaving=args.qwen35_interleaving)
 
         print("LLM model export completed successfully!")
 
@@ -150,4 +184,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        print(f"DEBUG: SystemExit caught with code {e.code}")
+        traceback.print_stack()
+        raise
+    except Exception as e:
+        print(f"DEBUG: Exception caught in main wrapper: {e}")
+        traceback.print_exc()
+        raise

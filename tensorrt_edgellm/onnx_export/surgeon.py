@@ -1,177 +1,139 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import onnx
 import onnx_graphsurgeon as gs
 import numpy as np
+from typing import Dict, List, Optional
+
+def fuse_attention_nodes(graph, config=None, is_hybrid=False):
+    """
+    Tags AttentionPlugin nodes with domain='trt' and prunes shuffle artifacts
+    on k/v inputs to satisfy TensorRT 10.x parser requirements.
+    """
+    print(f"DEBUG Surgeon: fuse_attention_nodes called with {len(graph.nodes)} total nodes.")
+    
+    nodes_to_remove = []
+    
+    # Identify custom attention nodes
+    attention_ops = ["AttentionPlugin", "qwen3_delta_attention"]
+    attention_nodes = [n for n in graph.nodes if any(op in n.op for op in attention_ops)]
+    print(f"DEBUG Surgeon: Found {len(attention_nodes)} custom attention nodes.")
+
+    for node in attention_nodes:
+        # Force full 'domain::op' name AND explicit domain property
+        node.op = "AttentionPlugin"
+        node.domain = "trt_edgellm"
+        
+        # Remove any confusing attributes
+        if "plugin_version" in node.attrs:
+            del node.attrs["plugin_version"]
+        
+        print(f"DEBUG Surgeon: Tagging {node.name} with op='{node.op}' domain='{node.domain}'")
+        
+        # For 1D-Neutralized trace, we expect inputs[1] (k) and inputs[2] (v) 
+        # to be 1D. PyTorch often inserts chains of Reshape/Transpose ops
+        # that cause IShuffleLayer errors in the TensorRT parser.
+        # We trace back and bypass these chains entirely.
+        for i in [1, 2]: # k and v
+            if i < len(node.inputs):
+                curr_var = node.inputs[i]
+                depth = 0
+                while len(curr_var.inputs) > 0 and depth < 10:
+                    producer = curr_var.inputs[0]
+                    if producer.op in ["Transpose", "Reshape", "Identity", "Unsqueeze", "Squeeze"]:
+                        if producer not in nodes_to_remove:
+                            nodes_to_remove.append(producer)
+                        curr_var = producer.inputs[0]
+                        depth += 1
+                    else:
+                        break
+                # Final connection: connect plugin input directly to the source 1D tensor
+                node.inputs[i] = curr_var
+
+    graph.cleanup()
+    return graph
+
+def enforce_plugin_domains(onnx_model):
+    """
+    Final Domain Enforcement using raw ONNX API.
+    GraphSurgeon sometimes strips domains during export if they aren't in a known opset.
+    """
+    print("DEBUG Surgeon: enforce_plugin_domains called.")
+    fixed_domains = 0
+    for node in onnx_model.graph.node:
+        op = node.op_type
+        # Match our custom ops even if they have prefixes like 'trt::'
+        if "AttentionPlugin" in op or "qwen3_delta_attention" in op:
+            node.domain = "trt_edgellm"
+            fixed_domains += 1
+            print(f"DEBUG Surgeon: [FINAL] Force domain='trt_edgellm' for node={node.name} (op={op})")
+        elif "TRT_FP4" in op:
+            node.domain = ""
+            fixed_domains += 1
+            print(f"DEBUG Surgeon: [FINAL] Force domain='' for node={node.name} (op={op})")
+            
+    print(f"DEBUG Surgeon: enforce_plugin_domains finished. Forced domain for {fixed_domains} nodes.")
+
+    return onnx_model
 
 def fix_flatten_reshapes(graph):
     """
-    Finds Reshape nodes that flatten [B, S, H] to [B*S, H] and ensures 
-    the output shape is calculated dynamically to avoid volume mismatches.
+    Placeholder for future flatten-specific fixes.
     """
-    for node in list(graph.nodes):
-        if node.op == "Reshape":
-            inp = node.inputs[0]
-            out = node.outputs[0]
-            
-            # Target Reshapes: 3D input [B, S, H] -> 2D output [B*S, H]
-            if inp.shape and len(inp.shape) == 3 and out.shape and len(out.shape) == 2:
-                print(f"DEBUG Surgeon: Forcing dynamic flatten for Reshape {node.name}")
-                
-                # 1. Get input shape [B, S, H]
-                inp_shape = gs.Variable(name=node.name + "_inp_shape_f", dtype=np.int64, shape=(3,))
-                graph.nodes.append(gs.Node(op="Shape", inputs=[inp], outputs=[inp_shape]))
-                
-                # 2. Extract B (0) and S (1)
-                b_val = gs.Variable(name=node.name + "_b_f", dtype=np.int64, shape=(1,))
-                graph.nodes.append(gs.Node(op="Slice", inputs=[inp_shape, 
-                                                              gs.Constant(name=node.name + "_s0_f", values=np.array([0], dtype=np.int64)),
-                                                              gs.Constant(name=node.name + "_e0_f", values=np.array([1], dtype=np.int64))], 
-                                           outputs=[b_val]))
-                
-                s_val = gs.Variable(name=node.name + "_s_f", dtype=np.int64, shape=(1,))
-                graph.nodes.append(gs.Node(op="Slice", inputs=[inp_shape, 
-                                                              gs.Constant(name=node.name + "_s1_f", values=np.array([1], dtype=np.int64)),
-                                                              gs.Constant(name=node.name + "_e1_f", values=np.array([2], dtype=np.int64))], 
-                                           outputs=[s_val]))
-                
-                # 3. Multiply B * S
-                prod_val = gs.Variable(name=node.name + "_bs_prod", dtype=np.int64, shape=(1,))
-                graph.nodes.append(gs.Node(op="Mul", inputs=[b_val, s_val], outputs=[prod_val]))
-                
-                # 4. Get H (2) from input shape
-                h_val_v = gs.Variable(name=node.name + "_h_f_v", dtype=np.int64, shape=(1,))
-                graph.nodes.append(gs.Node(op="Slice", inputs=[inp_shape, 
-                                                              gs.Constant(name=node.name + "_s2_f", values=np.array([2], dtype=np.int64)),
-                                                              gs.Constant(name=node.name + "_e2_f", values=np.array([3], dtype=np.int64))], 
-                                           outputs=[h_val_v]))
-                
-                new_shape = gs.Variable(name=node.name + "_dyn_shape", dtype=np.int64, shape=(2,))
-                graph.nodes.append(gs.Node(op="Concat", inputs=[prod_val, h_val_v], outputs=[new_shape], attrs={"axis": 0}))
-                
-                # Update node to use dynamic shape
-                node.inputs[1] = new_shape
-
-    return graph
-
-def broadcast_heterogeneous_heads(graph):
-    """
-    Finds MatMul nodes where the head dimension (dim 1 of 4D tensor) doesn't match
-    and injects Tile nodes to make them conformable for TensorRT.
-    """
-    for node in list(graph.nodes):
-        if node.op == "MatMul":
-            in0, in1 = node.inputs
-            if (in0.shape and len(in0.shape) == 4 and isinstance(in0.shape[1], int) and
-                in1.shape and len(in1.shape) == 4 and isinstance(in1.shape[1], int)):
-                
-                h0 = in0.shape[1]
-                h1 = in1.shape[1]
-                
-                if h0 != h1:
-                    print(f"DEBUG Surgeon: Found heterogeneous MatMul {node.name}: {h0} vs {h1} heads")
-                    if h0 > h1 and h0 % h1 == 0:
-                        ratio = h0 // h1
-                        repeats_const = gs.Constant(name=node.name + "_h_repeats", values=np.array([1, ratio, 1, 1], dtype=np.int64))
-                        tiled_var = gs.Variable(name=in1.name + "_h_tiled", dtype=in1.dtype)
-                        graph.nodes.append(gs.Node(op="Tile", inputs=[in1, repeats_const], outputs=[tiled_var]))
-                        node.inputs[1] = tiled_var
-                    elif h1 > h0 and h1 % h0 == 0:
-                        ratio = h1 // h0
-                        repeats_const = gs.Constant(name=node.name + "_h_repeats", values=np.array([1, ratio, 1, 1], dtype=np.int64))
-                        tiled_var = gs.Variable(name=in0.name + "_h_tiled", dtype=in0.dtype)
-                        graph.nodes.append(gs.Node(op="Tile", inputs=[in0, repeats_const], outputs=[tiled_var]))
-                        node.inputs[0] = tiled_var
-
-    return graph
-
-def fuse_attention_nodes(graph):
-    """
-    Decomposes AttentionPlugin with internal Slice barriers to force Myelin fragmentation.
-    """
-    for node in list(graph.nodes):
-        if node.op == "AttentionPlugin":
-            # Extract inputs
-            q, k, v, kv_cache, context_len, rope, kv_start = node.inputs[:7]
-            
-            print(f"DEBUG Surgeon: Decomposing {node.name} with internal fragmentation barriers")
-            
-            # 0. Helper for barriers
-            def add_barrier(name, inp):
-                inp_sh = gs.Variable(name=name + "_sh", dtype=np.int64, shape=(len(inp.shape),))
-                graph.nodes.append(gs.Node(op="Shape", inputs=[inp], outputs=[inp_sh]))
-                out = gs.Variable(name=name + "_bar", dtype=inp.dtype)
-                starts = gs.Constant(name=name + "_st", values=np.zeros(len(inp.shape), dtype=np.int64))
-                axes = gs.Constant(name=name + "_ax", values=np.array(list(range(len(inp.shape))), dtype=np.int64))
-                graph.nodes.append(gs.Node(op="Slice", name=name + "_node",
-                                           inputs=[inp, starts, inp_sh, axes], outputs=[out]))
-                return out
-
-            # 1. Normalize
-            q_h = node.attrs.get("num_q_heads", 64)
-            kv_h = node.attrs.get("num_kv_heads", 2)
-            h_dim = node.attrs.get("head_size", 128)
-            
-            # [B, H, S, D] - Simplified for validation
-            q_step = q
-            k_step = k
-            v_step = v
-
-            # 2. QK MatMul + Barrier
-            qk_raw = gs.Variable(name=node.name + "_qk_raw", dtype=q.dtype)
-            k_t = gs.Variable(name=node.name + "_k_t", dtype=k.dtype)
-            graph.nodes.append(gs.Node(op="Transpose", inputs=[k_step], outputs=[k_t], attrs={"perm": [0, 1, 3, 2]}))
-            graph.nodes.append(gs.Node(op="MatMul", inputs=[q_step, k_t], outputs=[qk_raw]))
-            qk_out = add_barrier(node.name + "_qk", qk_raw)
-            
-            # 3. Softmax + Barrier
-            probs_raw = gs.Variable(name=node.name + "_probs_raw", dtype=q.dtype)
-            graph.nodes.append(gs.Node(op="Softmax", inputs=[qk_out], outputs=[probs_raw], attrs={"axis": -1}))
-            probs_out = add_barrier(node.name + "_probs", probs_raw)
-            
-            # 4. PV MatMul + Barrier
-            attn_raw = gs.Variable(name=node.name + "_attn_raw", dtype=q.dtype)
-            graph.nodes.append(gs.Node(op="MatMul", inputs=[probs_out, v_step], outputs=[attn_raw]))
-            attn_out = add_barrier(node.name + "_attn", attn_raw)
-            
-            # 5. Connect outputs
-            graph.nodes.append(gs.Node(op="Identity", inputs=[attn_out], outputs=[node.outputs[0]]))
-            graph.nodes.append(gs.Node(op="Identity", inputs=[kv_cache], outputs=[node.outputs[1]]))
-            
-            node.outputs = []
-            node.op = "Identity"
-            node.inputs = [q]
-            
-        elif node.op == "int4_moe_plugin":
-            node.op = "Int4MoePlugin"
-        elif node.op == "int4_gemm_plugin":
-            node.op = "Int4GroupwiseGemmPlugin"
-
-    return graph
-
-def barrier_plugins(graph):
-    """
-    Injects a dynamic Slice barrier between Attention and MLP.
-    """
-    print("DEBUG Surgeon: Injecting block boundary barrier between Attention and MLP")
-    
-    boundary_tensor_name = "/layers.0/post_attention_layernorm/Cast_1_output_0"
-    
-    for node in list(graph.nodes):
-        for i, inp in enumerate(node.inputs):
-            if inp.name == boundary_tensor_name:
-                inp_shape = gs.Variable(name=node.name + "_bound_sh", dtype=np.int64, shape=(len(inp.shape),))
-                graph.nodes.append(gs.Node(op="Shape", inputs=[inp], outputs=[inp_shape]))
-                
-                barrier_out = gs.Variable(name=inp.name + "_bound_bar", dtype=inp.dtype)
-                starts = gs.Constant(name=node.name + "_bound_st", values=np.zeros(len(inp.shape), dtype=np.int64))
-                axes = gs.Constant(name=node.name + "_bound_ax", values=np.array(list(range(len(inp.shape))), dtype=np.int64))
-                
-                graph.nodes.append(gs.Node(op="Slice", name=node.name + "_bound_slice",
-                                           inputs=[inp, starts, inp_shape, axes], 
-                                           outputs=[barrier_out]))
-                node.inputs[i] = barrier_out
-
     return graph
 
 def cleanup_graph(graph):
-    graph.cleanup().toposort()
+    """
+    Performs general graph cleanup, including NVFP4 signature fixes and 
+    removing non-standard attributes that cause TensorRT parser SEGVs.
+    """
+    dummy_scale = gs.Constant(name="dummy_fp4_scale_tensor", values=np.array([1.0], dtype=np.float32))
+    fixed_nvfp4_nodes = 0
+    fixed_dq_nodes = 0
+    
+    for node in graph.nodes:
+        # 1. Fix NVFP4 custom ops
+        if node.op in ["TRT_FP4DynamicQuantize", "TRT_FP4QDQ"]:
+            # Fix inputs: ensure scale tensor is present
+            if len(node.inputs) == 1:
+                node.inputs.append(dummy_scale)
+            # Fix outputs: ensure dummy scale output is present
+            if len(node.outputs) == 1:
+                dummy_out = gs.Variable(name=node.outputs[0].name + "_dummy_scale_out", dtype=np.float32, shape=[1])
+                node.outputs.append(dummy_out)
+            fixed_nvfp4_nodes += 1
+            node.domain = ""
+            node.op = node.op.split("::")[-1] # Ensure no domain in op name
+            
+        # 2. Fix non-standard attributes in standard ops
+        if node.op == "DequantizeLinear":
+            if "block_size" in node.attrs:
+                print(f"DEBUG Surgeon: Removing invalid 'block_size' attribute from {node.name}")
+                del node.attrs["block_size"]
+                fixed_dq_nodes += 1
+
+    if fixed_nvfp4_nodes > 0:
+        print(f"DEBUG Surgeon: Fixed signature for {fixed_nvfp4_nodes} NVFP4 nodes.")
+    if fixed_dq_nodes > 0:
+        print(f"DEBUG Surgeon: Cleaned {fixed_dq_nodes} DequantizeLinear nodes.")
+        
+    return graph
+
+def barrier_plugins(graph):
+    return graph
+
+def broadcast_heterogeneous_heads(graph):
     return graph

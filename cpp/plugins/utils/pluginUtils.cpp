@@ -23,8 +23,22 @@
 // Follow the TRT initLibNvInferPlugins(void*, char const*) convention:
 // the host application calls this after dlopen to pass its logger,
 // so plugin LOG_DEBUG messages respect the application's log level.
-extern "C" bool initEdgellmPlugins(void* logger, char const* /*libNamespace*/)
+extern "C" bool initEdgellmPlugins(void* logger, char const* libNamespace)
 {
+    // Standardize on an empty namespace for custom plugins to match standard TRT expectations
+    char const* ns = (libNamespace && strlen(libNamespace) > 0) ? libNamespace : "";
+    
+    auto& registry = *getPluginRegistry();
+    int32_t nbCreators = 0;
+    nvinfer1::IPluginCreator* const* list = registry.getPluginCreatorList(&nbCreators);
+    for (int32_t i = 0; i < nbCreators; ++i)
+    {
+        if (list[i])
+        {
+            list[i]->setPluginNamespace(ns);
+        }
+    }
+
     if (logger)
     {
         // Set to VERBOSE to ensure we see all debug logs during this troubleshooting phase

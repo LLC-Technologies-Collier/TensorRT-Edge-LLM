@@ -441,8 +441,9 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
 
     bool const isSm8x = (smVersion == fmha_v2::kSM_80 || smVersion == fmha_v2::kSM_86 || smVersion == fmha_v2::kSM_87
         || smVersion == fmha_v2::kSM_89);
-    bool const isSm10x = (smVersion == fmha_v2::kSM_100 || smVersion == fmha_v2::kSM_101);
+    bool const isSm10x = (smVersion == fmha_v2::kSM_100 || smVersion == fmha_v2::kSM_101 || smVersion == 110);
     bool const isSm12x = (smVersion == fmha_v2::kSM_120 || smVersion == fmha_v2::kSM_121);
+
     check::check((isSm8x || isSm10x || isSm12x), "Other SMs are not supported by context FMHA-v2 kernels");
     // Handle kernel selection under different context.
     if (isSm8x || isSm10x || isSm12x)
@@ -555,7 +556,11 @@ bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t 
 bool ContextFMHARunner::loadContextFMHAKernels(int32_t smVersion, nvinfer1::DataType dataType)
 {
     int32_t searchSmVersion = smVersion;
-    if (searchSmVersion >= 100) searchSmVersion = 89;
+    if (searchSmVersion == 110) searchSmVersion = 101;
+    else if (searchSmVersion > 101 && searchSmVersion < 120) searchSmVersion = 101;
+    else if (searchSmVersion >= 120) searchSmVersion = 120;
+    else if (searchSmVersion >= 100 && searchSmVersion <= 101) searchSmVersion = searchSmVersion; // Keep native
+    else if (searchSmVersion > 89 && searchSmVersion < 100) searchSmVersion = 89;
 
 
     fprintf(stderr, "[DEBUG] ContextFMHARunner::loadContextFMHAKernels: smVersion=%d, dataType=%d (searched as %d)\n", smVersion, (int)dataType, searchSmVersion);
@@ -585,9 +590,21 @@ void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& para
     bool forceFp32Acc = mLaunchParams.force_fp32_acc;
     bool unrollKey = mLaunchParams.force_unroll;
     bool tiledKey = mLaunchParams.use_granular_tiling;
-    
+
+    // Q
+    uint64_t total_s = static_cast<uint64_t>(params.s * mBatchSize);
+
     if (mLaunchParams.flash_attention) {
         unrollKey = true; // Flash kernels have mUnrollStep != 0
+
+        // TMA alignment: Blackwell hardware swizzling REQUIRES tensor_size to be multiple of 8.
+        // If the actual buffer (total_s) is not aligned, we MUST fall back to non-TMA kernels
+        // (Tiled=0) which use standard global memory access to avoid IMA.
+        if ((mSmVersion == 100 || mSmVersion == 101 || mSmVersion == 110) && (total_s % 8 != 0)) {
+            fprintf(stderr, "[DEBUG] total_s=%lu is not multiple of 8, forcing non-TMA (Tiling=0) for Blackwell safety\n", total_s);
+            fflush(stderr);
+            tiledKey = false;
+        }
 
         // Tiled kernels (64_128 or 128_128) use FP32 accumulation
         // Non-tiled kernels (64_32 or 64_64) use FP16 accumulation
@@ -601,8 +618,7 @@ void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& para
         if (mSmVersion == 100 || mSmVersion == 101 || mSmVersion == 110) {
             forceFp32Acc = true;
         }
-        }
-
+    }
         int32_t stepQ = 64;
         int32_t stepKV = 32;
         if (tiledKey) {
@@ -660,7 +676,7 @@ void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& para
         throw std::runtime_error("There must be one kernel to implement the MHA");
     }
     
-    if (mSmVersion == 100 || mSmVersion == 101 || mSmVersion == 110) {
+    if ((mSmVersion == 100 || mSmVersion == 101 || mSmVersion == 110) && tiledKey) {
         int d = mHeadSize;
         int h = mNumHeads;
         int h_kv = mNumKVHeads;
@@ -677,13 +693,19 @@ void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& para
         
         uint32_t elem_stride[3] = {1, 1, 1};
         
-        // Q
-        uint64_t tensor_size_q[3] = {static_cast<uint64_t>(d), static_cast<uint64_t>(h), static_cast<uint64_t>(params.s * mBatchSize)};
+        // TMA alignment: Blackwell hardware swizzling REQUIRES tensor_size to be multiple of 8.
+        // We pad aligned_total_s to multiple of 8 and use OOB_FILL to safely handle the tail.
+        uint64_t aligned_total_s = ((total_s + 7) / 8) * 8;
+        uint64_t tensor_size_q[3] = {static_cast<uint64_t>(d), static_cast<uint64_t>(h), aligned_total_s};
         uint64_t tensor_stride_q[2] = {static_cast<uint64_t>(d_bytes), static_cast<uint64_t>(params.q_stride_in_bytes)};
-        uint32_t box_size_q[3] = {static_cast<uint32_t>(d_per_group), 1, static_cast<uint32_t>(stepQ)};
+        // Box must be multiple of 8 for Blackwell.
+        uint32_t box_s_q = ((stepQ + 7) / 8) * 8; 
+        // Ensure box_s_q <= aligned_total_s to satisfy cuTensorMapEncodeTiled
+        if (box_s_q > aligned_total_s) box_s_q = aligned_total_s;
+        uint32_t box_size_q[3] = {static_cast<uint32_t>(d_per_group), 1, box_s_q};
         
-        fprintf(stderr, "[DEBUG] cuTensorMapEncodeTiled Q: ptr=%p (align16=%d), size=[%lu, %lu, %lu], stride=[%lu, %lu], box=[%u, %u, %u], swizzle=%d\n",
-            params.q_ptr, ((uintptr_t)params.q_ptr % 16) == 0, tensor_size_q[0], tensor_size_q[1], tensor_size_q[2],
+        fprintf(stderr, "[DEBUG] cuTensorMapEncodeTiled Q: ptr=%p, size=[%lu, %lu, %lu] (real_s=%lu), stride=[%lu, %lu], box=[%u, %u, %u], swizzle=%d\n",
+            params.q_ptr, tensor_size_q[0], tensor_size_q[1], tensor_size_q[2], total_s,
             tensor_stride_q[0], tensor_stride_q[1], box_size_q[0], box_size_q[1], box_size_q[2], (int)swizzle_mode);
         fflush(stderr);
             
@@ -699,17 +721,19 @@ void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& para
             CU_TENSOR_MAP_INTERLEAVE_NONE,
             swizzle_mode,
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
         ));
             
         // K & V 
-        uint64_t tensor_size_k[3] = {static_cast<uint64_t>(d), static_cast<uint64_t>(h_kv), static_cast<uint64_t>(params.s * mBatchSize)};
-        uint64_t tensor_stride_k[2] = {static_cast<uint64_t>(d_bytes), static_cast<uint64_t>(params.k_stride_in_bytes)};
-        uint32_t box_size_kv[3] = {static_cast<uint32_t>(d_per_group), 1, static_cast<uint32_t>(stepKV)};
+        uint64_t tensor_size_kv[3] = {static_cast<uint64_t>(d), static_cast<uint64_t>(h_kv), aligned_total_s};
+        uint64_t tensor_stride_kv[2] = {static_cast<uint64_t>(d_bytes), static_cast<uint64_t>(params.k_stride_in_bytes)};
+        uint32_t box_s_kv = ((stepKV + 7) / 8) * 8;
+        if (box_s_kv > aligned_total_s) box_s_kv = aligned_total_s;
+        uint32_t box_size_kv[3] = {static_cast<uint32_t>(d_per_group), 1, box_s_kv};
         
-        fprintf(stderr, "[DEBUG] cuTensorMapEncodeTiled K: ptr=%p (align16=%d), size=[%lu, %lu, %lu], stride=[%lu, %lu], box=[%u, %u, %u], swizzle=%d\n",
-            params.k_ptr, ((uintptr_t)params.k_ptr % 16) == 0, tensor_size_k[0], tensor_size_k[1], tensor_size_k[2],
-            tensor_stride_k[0], tensor_stride_k[1], box_size_kv[0], box_size_kv[1], box_size_kv[2], (int)swizzle_mode);
+        fprintf(stderr, "[DEBUG] cuTensorMapEncodeTiled K: ptr=%p, size=[%lu, %lu, %lu] (real_s=%lu), stride=[%lu, %lu], box=[%u, %u, %u], swizzle=%d\n",
+            params.k_ptr, tensor_size_kv[0], tensor_size_kv[1], tensor_size_kv[2], total_s,
+            tensor_stride_kv[0], tensor_stride_kv[1], box_size_kv[0], box_size_kv[1], box_size_kv[2], (int)swizzle_mode);
         fflush(stderr);
 
         CUDA_DRIVER_CHECK(cuTensorMapEncodeTiled(
@@ -717,17 +741,19 @@ void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& para
             CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
             3,
             const_cast<void*>(params.k_ptr),
-            tensor_size_k,
-            tensor_stride_k,
+            tensor_size_kv,
+            tensor_stride_kv,
             box_size_kv,
             elem_stride,
             CU_TENSOR_MAP_INTERLEAVE_NONE,
             swizzle_mode,
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
         ));
         
-        fprintf(stderr, "[DEBUG] cuTensorMapEncodeTiled V: ptr=%p (align16=%d)\n", params.v_ptr, ((uintptr_t)params.v_ptr % 16) == 0);
+        fprintf(stderr, "[DEBUG] cuTensorMapEncodeTiled V: ptr=%p, size=[%lu, %lu, %lu] (real_s=%lu), stride=[%lu, %lu], box=[%u, %u, %u], swizzle=%d\n",
+            params.v_ptr, tensor_size_kv[0], tensor_size_kv[1], tensor_size_kv[2], total_s,
+            tensor_stride_kv[0], tensor_stride_kv[1], box_size_kv[0], box_size_kv[1], box_size_kv[2], (int)swizzle_mode);
         fflush(stderr);
             
         CUDA_DRIVER_CHECK(cuTensorMapEncodeTiled(
@@ -735,14 +761,14 @@ void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& para
             CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
             3,
             const_cast<void*>(params.v_ptr),
-            tensor_size_k, // uses same shapes as K
-            tensor_stride_k,
+            tensor_size_kv, 
+            tensor_stride_kv,
             box_size_kv,
             elem_stride,
             CU_TENSOR_MAP_INTERLEAVE_NONE,
             swizzle_mode,
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
         ));
     }
     

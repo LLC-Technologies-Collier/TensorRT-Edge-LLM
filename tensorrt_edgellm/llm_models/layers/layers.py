@@ -679,22 +679,83 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
                 self.torch_dtype)
             self.post_feedforward_layernorm = self.post_feedforward_layernorm.to(
                 self.torch_dtype)
-        # Robustly identify the attention module (linear_attn for Qwen3.5 MoE, self_attn for Llama/Qwen2)
-        attn_module = getattr(decoder_layer, "linear_attn", 
-                             getattr(decoder_layer, "self_attn", 
-                                    getattr(decoder_layer, "attn", None)))
-        if attn_module is None:
-            raise AttributeError(f"Could not find attention module in {type(decoder_layer)}")
-
-        # Qwen 3.5 Gated Delta Attention requires specialized TRTNative implementation
-        if "GatedDeltaNet" in type(attn_module).__name__:
+        # Robustly identify the attention module
+        # Qwen 3.5 MoE uses an explicit 'layer_types' array in the config, or defaults to standard MTP (hybrid) spacing
+        is_hybrid = False
+        layer_idx = getattr(self, 'layer_index', 0)
+        
+        # Check config for layer_types
+        config = getattr(decoder_layer, 'config', getattr(self, 'config', None))
+        # Support Qwen 3.5 text_config nesting
+        if config and hasattr(config, 'text_config'):
+            config = config.text_config
+            
+        if config and hasattr(config, 'layer_types') and isinstance(config.layer_types, list):
+            if layer_idx < len(config.layer_types):
+                is_hybrid = (config.layer_types[layer_idx] == "linear_attention")
+        else:
+            # Fallback to the known Qwen 3.5 122B MoE spacing, but ONLY if it is that model type
+            model_type = getattr(config, 'model_type', '')
+            if model_type in ('qwen3_5_moe', 'qwen3_5_moe_text'):
+                if (layer_idx + 1) % 4 != 0:
+                    is_hybrid = True
+            
+        if is_hybrid:
+            # Qwen 3.5 MoE uses linear_attn for hybrid MTP layers
+            attn_module = getattr(decoder_layer, "linear_attn", None)
+            if attn_module is None:
+                raise AttributeError(f"Could not find linear_attn module in {type(decoder_layer)} for hybrid layer {layer_idx}")
+                
             from ..models.qwen3_5_moe_trtnative import Qwen3_5MoeGatedDeltaNetTRTNative
             self.self_attn = Qwen3_5MoeGatedDeltaNetTRTNative(
                 attn_module, eagle3_draft=self.eagle3_draft)
         else:
-            from .attention_trt import EdgeLLMAttentionTRTNative
-            self.self_attn = EdgeLLMAttentionTRTNative(
-                attn_module, eagle3_draft=self.eagle3_draft)
+            attn_module = getattr(decoder_layer, "self_attn", 
+                                 getattr(decoder_layer, "attn", 
+                                        getattr(decoder_layer, "attention", 
+                                               getattr(decoder_layer, "linear_attn", None))))
+            if attn_module is None:
+                # Provide diagnostic info to help identify the correct attribute name
+                submodules = [n for n, _ in decoder_layer.named_children()]
+                raise AttributeError(f"Could not find self_attn/attn/attention/linear_attn module in {type(decoder_layer)} for standard layer {layer_idx}. Submodules found: {submodules}")
+            
+            # Identify if this is a Gated Delta Attention (Linear Attention) layer
+            is_linear_attn = "Delta" in type(attn_module).__name__ or "Linear" in type(attn_module).__name__ or hasattr(decoder_layer, "linear_attn")
+            
+            if is_linear_attn:
+                print(f"  Layer {layer_idx}: Using Gated Delta Net wrapper for {type(attn_module).__name__}")
+                from ..models.qwen3_5_moe_trtnative import Qwen3_5MoeGatedDeltaNetTRTNative
+                self.self_attn = Qwen3_5MoeGatedDeltaNetTRTNative(
+                    attn_module, eagle3_draft=self.eagle3_draft)
+            else:
+                # Standard Attention Layer (SDPA)
+                # SHAPE PARADOX: TensorRT FFMHA only supports head_dim <= 128.
+                # Qwen 3.5 0.8B has orig_hd=256, so we MUST split heads to use hd=128.
+                self.head_dim = 128
+                
+                # Directly use config to avoid stale attributes on attn_module.
+                t_config = getattr(config, "text_config", config)
+                orig_q_heads = getattr(t_config, "num_attention_heads", 8)
+                orig_kv_heads = getattr(t_config, "num_key_value_heads", 2)
+                orig_hd = getattr(t_config, "head_dim", 256)
+                
+                # Recalculate heads to preserve volume (e.g. 8*256 -> 16*128)
+                num_q_heads = (orig_q_heads * orig_hd) // self.head_dim
+                num_kv_heads = (orig_kv_heads * orig_hd) // self.head_dim
+                
+                attn_module.num_attention_heads = num_q_heads
+                attn_module.num_key_value_heads = num_kv_heads
+                attn_module.head_dim = self.head_dim
+                
+                # Diagnostic for standard layers
+                qh = getattr(attn_module, "num_attention_heads", -1)
+                kvh = getattr(attn_module, "num_key_value_heads", -1)
+                hd = getattr(attn_module, "head_dim", -1)
+                print(f"DEBUG TRTNative: Standard Layer {getattr(self, 'layer_index', '?')} heads: Q={qh}, KV={kvh}, D={hd}")
+                
+                from .attention_trt import EdgeLLMAttentionTRTNative
+                self.self_attn = EdgeLLMAttentionTRTNative(
+                    attn_module, eagle3_draft=self.eagle3_draft)
 
     def _init_with_config(self, config: Any):
         # Construct new components from config (for draft models)
@@ -750,6 +811,9 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: (hidden_states, present_kv_cache)
         """
+        if hasattr(self, "layer_index"):
+            print(f"DEBUG Layer {self.layer_index}: forward hidden_states={hidden_states.shape}")
+        
         residual = hidden_states
 
         if self.eagle3_draft:

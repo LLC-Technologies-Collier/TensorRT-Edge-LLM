@@ -34,6 +34,12 @@ namespace trt_edgellm
 namespace rt
 {
 
+enum class KVCacheType
+{
+    kUNIFIED = 0,
+    kSEPARATE = 1
+};
+
 /*!
  * @brief Message with role and contents
  */

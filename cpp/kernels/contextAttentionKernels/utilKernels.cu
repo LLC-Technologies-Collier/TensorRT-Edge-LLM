@@ -54,11 +54,10 @@ __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, 
 
 // ===== kernel: produce [B, S, 2, H, D] (FMHA expected padded layout) =====
 //! This kernel prepares the KV-cache input required by the FMHA kernel when using
-//! the CONTIGUOUS_Q_KV input layout. Currently, that FMHA path only supports FP16 KV cache,
-//! so `dst` is always `half`.
-template <typename T>
+//! the CONTIGUOUS_Q_KV input layout.
+template <typename T, typename T_DST = half>
 __global__ void cvtKVLayoutBHSDToBSHDKernel(T const* __restrict__ src, // [B, 2, H, S, D]
-    half* __restrict__ dst,                                            // [B, S, 2, H, D]
+    T_DST* __restrict__ dst,                                           // [B, S, 2, H, D]
     float const* __restrict__ kScaleQuantOrig, float const* __restrict__ vScaleQuantOrig, int32_t B, int32_t S,
     int32_t H, int32_t D)
 {
@@ -92,7 +91,7 @@ __global__ void cvtKVLayoutBHSDToBSHDKernel(T const* __restrict__ src, // [B, 2,
     if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
     {
         float const scale = (kv == 0) ? kScaleQuantOrig[0] : vScaleQuantOrig[0];
-        dst[dstIdx] = __float2half(static_cast<float>(src[srcIdx]) * scale);
+        dst[dstIdx] = (T_DST) (static_cast<float>(src[srcIdx]) * scale);
     }
     else
 #endif
@@ -159,8 +158,13 @@ void cvtKVLayoutBHSDToBSHD(
 
     if (src.getDataType() == nvinfer1::DataType::kHALF)
     {
-        cvtKVLayoutBHSDToBSHDKernel<half><<<grid, block, 0, stream>>>(
+        cvtKVLayoutBHSDToBSHDKernel<half, half><<<grid, block, 0, stream>>>(
             src.dataPointer<half>(), dst.dataPointer<half>(), nullptr, nullptr, B, S, H, D);
+    }
+    else if (src.getDataType() == nvinfer1::DataType::kBF16)
+    {
+        cvtKVLayoutBHSDToBSHDKernel<__nv_bfloat16, __nv_bfloat16><<<grid, block, 0, stream>>>(
+            src.dataPointer<__nv_bfloat16>(), dst.dataPointer<__nv_bfloat16>(), nullptr, nullptr, B, S, H, D);
     }
 #if SUPPORTS_FP8
     else if (src.getDataType() == nvinfer1::DataType::kFP8)
@@ -172,7 +176,7 @@ void cvtKVLayoutBHSDToBSHD(
         float const* const scales = kvScaleQuantOrig.dataPointer<float>();
         float const* const kScaleQuantOrigPtr = scales + 0;
         float const* const vScaleQuantOrigPtr = scales + 1;
-        cvtKVLayoutBHSDToBSHDKernel<__nv_fp8_e4m3><<<grid, block, 0, stream>>>(src.dataPointer<__nv_fp8_e4m3>(),
+        cvtKVLayoutBHSDToBSHDKernel<__nv_fp8_e4m3, half><<<grid, block, 0, stream>>>(src.dataPointer<__nv_fp8_e4m3>(),
             dst.dataPointer<half>(), kScaleQuantOrigPtr, vScaleQuantOrigPtr, B, S, H, D);
     }
 #endif

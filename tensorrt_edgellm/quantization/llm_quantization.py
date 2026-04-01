@@ -450,6 +450,9 @@ def quantize_and_save_llm(model_dir: str,
     if processor is not None:
         processor.save_pretrained(output_dir)
 
+    # Append SDK version to config.json for stale artifact detection
+    _append_version_to_config(output_dir)
+
     # Save the quant config
     quant_config = get_quant_config(model)
     with open(os.path.join(output_dir, "hf_quant_config.json"), "w") as f:
@@ -527,3 +530,22 @@ def quantize_and_save_draft(
         f"Quantized model saved to {output_dir} in {end_time - quant_end_time}s."
     )
     print(f"Total time: {end_time - start_time}s.")
+
+
+def _append_version_to_config(output_dir: str):
+    import json
+    import os
+    import sys
+    try:
+        from tensorrt_edgellm.version import __version__ as kRUNTIME_VERSION
+    except ImportError:
+        sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
+        from tensorrt_edgellm.version import __version__ as kRUNTIME_VERSION
+        
+    config_path = os.path.join(output_dir, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        config["edgellm_version"] = kRUNTIME_VERSION
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)

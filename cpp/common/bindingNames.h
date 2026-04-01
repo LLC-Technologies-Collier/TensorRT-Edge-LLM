@@ -18,16 +18,14 @@
 #pragma once
 
 #include <string>
+#include <cstring>
+#include <NvInferRuntime.h>
 
 namespace trt_edgellm
 {
 /*!
  * @namespace binding_names
  * @brief Unified tensor binding names for TensorRT engines
- *
- * This namespace provides a centralized location for all tensor binding names
- * used across both the builder and runtime components to ensure consistency
- * and avoid duplication.
  */
 namespace binding_names
 {
@@ -35,413 +33,125 @@ namespace binding_names
 /*! @name Core LLM Input/Output Bindings
  * @{
  */
-
-/*!
- * @brief Input embeddings tensor - contains the embedded input sequence
- *
- * Shape: [batch_size, sequence_length, hidden_size] (FLOAT16)
- */
 inline constexpr char const* kInputsEmbeds = "inputs_embeds";
-
-/*!
- * @brief Context lengths tensor - specifies the actual length of each sequence in the batch
- *
- * Shape: [batch_size] (INT32)
- */
 inline constexpr char const* kContextLengths = "context_lengths";
-
-/*!
- * @brief Last token IDs tensor - indices of the last tokens to extract from hidden states
- *
- * Shape: [batch_size] for Eagle models, [batch_size, 1] for vanilla models (INT64)
- */
 inline constexpr char const* kLastTokenIds = "last_token_ids";
-
-/*!
- * @brief Output logits tensor - probability distribution over vocabulary
- *
- * Shape: [batch_size, vocab_size] or [select_tokens, vocab_size] (FLOAT32)
- */
 inline constexpr char const* kLogits = "logits";
-
-/*!
- * @brief Output hidden states tensor - intermediate representations for speculative decoding
- *
- * Shape: [batch_size, sequence_length, hidden_dim] (FLOAT16)
- */
 inline constexpr char const* kOutputHiddenStates = "hidden_states";
-
 /*! @} */
 
 /*! @name Positional Encoding Bindings
  * @{
  */
-
-/*!
- * @brief Rotary positional encoding cos/sin cache tensor
- *
- * Shape: [batch_size, max_seq_len, rotary_dim] (FLOAT32)
- */
 inline constexpr char const* kRopeCosSin = "rope_rotary_cos_sin";
-
 /*! @} */
 
 /*! @name KV Cache Bindings
  * @{
  */
-
-/*!
- * @brief KV cache start index tensor - starting position for KV cache reuse
- *
- * Shape: [batch_size] (INT32)
- */
 inline constexpr char const* kKVCacheStartIndex = "kvcache_start_index";
-
-/*!
- * @brief Past key-value cache tensor template - use with layer index formatting
- *
- * Template: "past_key_values_{layer_idx}"
- * Shape: [batch_size, 2, num_kv_heads, seq_len, head_dim] (FLOAT16)
- */
 inline constexpr char const* kPastKeyValuesTemplate = "past_key_values";
-
-/*!
- * @brief Present key-value cache tensor template - use with layer index formatting
- *
- * Template: "present_key_values_{layer_idx}"
- * Shape: [batch_size, 2, num_kv_heads, seq_len, head_dim] (FLOAT16)
- */
 inline constexpr char const* kPresentKeyValuesTemplate = "present_key_values";
-
-/*!
- * @brief K cache tensor template for TensorRT native KVCacehUpdate operations - use with layer index formatting
- *
- * Template: "k_cache_{layer_idx}"
- * Shape: [batch_size, num_kv_heads, seq_len, head_dim] (FLOAT16)
- */
 inline constexpr char const* kKCacheTemplate = "k_cache";
-
-/*!
- * @brief V cache tensor template for TensorRT native KVCacheUpdate operations - use with layer index formatting
- *
- * Template: "v_cache_{layer_idx}"
- * Shape: [batch_size, num_kv_heads, seq_len, head_dim] (FLOAT16)
- */
 inline constexpr char const* kVCacheTemplate = "v_cache";
-
-/*!
- * @brief Present K cache tensor template for TensorRT native KVCacheUpdate operations - use with layer index formatting
- *
- * Template: "present_k_cache_{layer_idx}"
- * Shape: [batch_size, num_kv_heads, seq_len, head_dim] (FLOAT16)
- */
 inline constexpr char const* kPresentKCacheTemplate = "present_k_cache";
-
-/*!
- * @brief Present V cache tensor template for TensorRT native KVCacheUpdate operations - use with layer index formatting
- *
- * Template: "present_v_cache_{layer_idx}"
- * Shape: [batch_size, num_kv_heads, seq_len, head_dim] (FLOAT16)
- */
 inline constexpr char const* kPresentVCacheTemplate = "present_v_cache";
-
 /*! @} */
 
 /*! @name SSM (Mamba) State Bindings
  * @{
  */
-
-/*!
- * @brief Past SSM state tensor template for Mamba layers
- *
- * Template: "ssm_state_{mamba_layer_idx}"
- * Shape: [batch_size, mamba_num_heads, mamba_head_dim, ssm_state_size] (FLOAT16)
- */
 inline constexpr char const* kSSMStateTemplate = "ssm_state";
-
-/*!
- * @brief Present SSM state tensor template for Mamba layers
- *
- * Template: "present_ssm_state_{mamba_layer_idx}"
- * Shape: [batch_size, mamba_num_heads, mamba_head_dim, ssm_state_size] (FLOAT16)
- */
 inline constexpr char const* kPresentSSMStateTemplate = "present_ssm_state";
-
-/*!
- * @brief Past conv state tensor template for Mamba layers
- *
- * Template: "conv_state_{mamba_layer_idx}"
- * Shape: [batch_size, conv_dim, conv_kernel_size] (FLOAT16)
- */
 inline constexpr char const* kConvStateTemplate = "conv_state";
-
-/*!
- * @brief Present conv state tensor template for Mamba layers
- *
- * Template: "present_conv_state_{mamba_layer_idx}"
- * Shape: [batch_size, conv_dim, conv_kernel_size] (FLOAT16)
- */
 inline constexpr char const* kPresentConvStateTemplate = "present_conv_state";
-
 /*! @} */
 
 /*! @name Eagle Speculative Decoding Bindings
  * @{
  */
-
-/*!
- * @brief Base model hidden states input for Eagle draft models
- *
- * Shape: [batch_size, sequence_length, base_hidden_dim] (FLOAT16)
- */
 inline constexpr char const* kBaseModelHiddenStates = "hidden_states_input";
-
-/*!
- * @brief Draft model hidden states input for Eagle draft models
- *
- * Shape: [batch_size, sequence_length, draft_hidden_dim] (FLOAT16)
- */
 inline constexpr char const* kDraftModelHiddenStates = "hidden_states_from_draft";
-
-/*!
- * @brief Attention mask for Eagle models - packed tree attention mask
- *
- * Shape: [batch_size, tree_size, packed_mask_len] (INT32 for base, INT8 for draft)
- */
 inline constexpr char const* kAttentionMask = "attention_mask";
-
-/*!
- * @brief Attention position IDs for Eagle models
- *
- * Shape: [batch_size, tree_size] (INT32)
- */
 inline constexpr char const* kAttentionPosId = "attention_pos_id";
-
 /*! @} */
 
 /*! @name Visual Encoder Bindings (Qwen-VL, InternVL)
  * @{
  */
-
-/*!
- * @brief Visual input tensor for vision transformers
- *
- * Shape: [sequence_length, input_dim] for Qwen-VL, [num_blocks, channels, height, width] for InternVL
- */
 inline constexpr char const* kVisualInput = "input";
-
-/*!
- * @brief Visual output tensor from vision transformers
- *
- * Shape: [num_image_tokens, hidden_size] (FLOAT16)
- */
 inline constexpr char const* kVisualOutput = "output";
-
-/*!
- * @brief Rotary positional embeddings for visual inputs (Qwen-VL specific)
- *
- * Shape: [sequence_length, embed_dim] (FLOAT32)
- */
 inline constexpr char const* kRotaryPosEmb = "rotary_pos_emb";
-
-/*!
- * @brief Cumulative sequence lengths for ragged ViT attention
- *
- * Shape: [num_images + 1] (INT32)
- */
 inline constexpr char const* kCuSeqlens = "cu_seqlens";
-
-/*!
- * @brief Shape-only input used to convey runtime max sequence-length for FMHA launch
- *
- * Shape: [max_seqlen] (INT32)
- */
 inline constexpr char const* kMaxSeqLenCarrier = "max_seqlen_carrier";
-
-/*!
- * @brief Cumulative window sequence lengths for Qwen2.5-VL window attention
- *
- * Shape: [num_windows + 1] (INT32)
- */
 inline constexpr char const* kCuWindowSeqlens = "cu_window_seqlens";
-
-/*!
- * @brief Window index for Qwen2.5-VL sliding window attention
- *
- * Shape: [num_windows] (INT64)
- */
 inline constexpr char const* kWindowIndex = "window_index";
-
-/*!
- * @brief Reverse window index for Qwen2.5-VL sliding window attention
- *
- * Shape: [num_windows] (INT64)
- */
 inline constexpr char const* kReverseWindowIndex = "reverse_window_index";
-
-/*!
- * @brief Fast position embeddings index tensor for Qwen3-VL vision model
- *
- * Shape: [4, sequence_length] (INT64)
- */
 inline constexpr char const* kFastPosEmbIdx = "fast_pos_embed_idx";
-
-/*!
- * @brief Fast position embeddings weight tensor for Qwen3-VL vision model
- *
- * Shape: [4, sequence_length] (FLOAT16)
- */
 inline constexpr char const* kFastPosEmbWeight = "fast_pos_embed_weight";
-
-/*!
- * @brief Deepstack features tensor for Qwen3-VL vision model (visual encoder output)
- *
- * Shape: [num_image_tokens, hidden_size] (FLOAT16)
- */
 inline constexpr char const* kDeepstackFeaturesTemplate = "deepstack_features";
-
-/*!
- * @brief Deepstack embeddings tensor template for Qwen3-VL text model (LLM input)
- *
- * Template: "deepstack_embeds_{layer_idx}" where layer_idx is 0, 1, or 2
- * Shape: [batch_size, sequence_length, hidden_size] (FLOAT16)
- */
 inline constexpr char const* kDeepstackEmbedsTemplate = "deepstack_embeds";
-
 /*! @} */
 
 /*! @name Vocabulary Mapping Configuration
  * @{
  */
-
-/*!
- * @brief JSON configuration key for reduced vocabulary size
- *
- * Used to check if the model uses vocabulary reduction optimization
- */
 inline constexpr char const* kReducedVocabSizeKey = "reduced_vocab_size";
-
-/*!
- * @brief Vocabulary mapping file name
- *
- * SafeTensors file containing mapping between full and reduced vocabulary
- */
 inline constexpr char const* kVocabMapFileName = "vocab_map.safetensors";
-
 /*! @} */
 
 /*! @name Audio Encoder Bindings (Qwen3-Omni)
  * @{
  */
-
-/*!
- * @brief Audio padded features tensor - chunked and padded Mel-spectrogram
- *
- * Shape: [num_chunks, mel_bins, max_chunk_len] (FLOAT16)
- */
 inline constexpr char const* kAudioPaddedFeatures = "padded_feature";
-
-/*!
- * @brief Audio padded mask indices - nonzero indices from mask
- *
- * Shape: [num_valid_elements, 2] (INT64)
- * Each row is [chunk_idx, position_idx] indicating valid positions after CNN downsampling
- */
 inline constexpr char const* kAudioPaddedMaskIndices = "padded_mask_after_cnn_indices";
-
-/*!
- * @brief Audio attention mask - block-diagonal mask for chunk-wise attention
- *
- * Shape: [num_attention_elems, num_attention_elems] (FLOAT16)
- * Block-diagonal matrix where each block corresponds to one audio chunk
- */
 inline constexpr char const* kAudioAttentionMask = "attention_mask";
-
-/*!
- * @brief Audio encoder output - audio embeddings
- *
- * Shape: [num_audio_tokens, hidden_size] (FLOAT16)
- */
 inline constexpr char const* kAudioOutput = "last_hidden_state";
-
 /*! @} */
 
 /*! @name CodePredictor Bindings (Qwen3-Omni)
  * @{
  */
-
-/*!
- * @brief LM head weight tensor - dynamically bound weight for CodePredictor
- *
- * Shape: [vocab_size, hidden_size] (FLOAT16)
- * This is used for dynamic lm_head selection in CodePredictor (15 different heads for RVQ layers)
- */
 inline constexpr char const* kLmHeadWeight = "lm_head_weight";
-
 /*! @} */
 
 /*! @name Code2Wav Vocoder Bindings (Qwen3-Omni)
  * @{
  */
-
-/*!
- * @brief Code2Wav input codes tensor - RVQ codec codes for vocoder
- *
- * Shape: [batch_size, num_quantizers, sequence_length] (INT32)
- * num_quantizers: 15 for Qwen3-Omni
- */
 inline constexpr char const* kCode2WavCodes = "codes";
-
-/*!
- * @brief Code2Wav output waveform tensor - generated audio waveform
- *
- * Shape: [batch_size, 1, waveform_length] (FLOAT32)
- * Values in range [-1.0, 1.0]
- */
 inline constexpr char const* kCode2WavWaveform = "waveform";
-
 /*! @} */
 
 /*! @name LoRA (Low-Rank Adaptation) Bindings
  * @{
  */
-
-/*!
- * @brief LoRA A weight matrix prefix - use with layer/component specific suffixes
- *
- * Template: "lora_A_{component}_{layer}"
- * Shape: [gemm_k, lora_rank] (FLOAT16)
- */
 inline constexpr char const* kLoraAPrefix = "lora_A";
-
-/*!
- * @brief LoRA B weight matrix prefix - use with layer/component specific suffixes
- *
- * Template: "lora_B_{component}_{layer}"
- * Shape: [lora_rank, gemm_n] (FLOAT16)
- */
 inline constexpr char const* kLoraBPrefix = "lora_B";
-
-/*!
- * @brief EDGELLM version
- *
- * Value: "major.minor.patch.build"
- * Example: "0.5.0.0"
- */
 inline constexpr char const* kEdgellmVersion = "edgellm_version";
-
 /*! @} */
 
 /*! @name Utility Functions
  * @{
  */
 
+/**
+ * @brief Check if engine has a tensor with the given name without triggering TRT internal error logs.
+ */
+inline bool hasTensor(nvinfer1::ICudaEngine const* engine, char const* name)
+{
+    if (!engine || !name || name[0] == '\0') return false;
+    for (int i = 0; i < engine->getNbIOTensors(); ++i)
+    {
+        if (std::strcmp(engine->getIOTensorName(i), name) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 /*!
- * @brief Format KV cache binding name for a specific layer
- *
- * @param layerIdx The decoder layer index
- * @param isPast Whether this is past (true) or present (false) key-values
- * @return Formatted binding name like "past_key_values_0" or "present_key_values_0"
+ * @brief Format KV cache binding name for a specific layer (Static version for building)
  */
 inline std::string formatKVCacheName(int32_t layerIdx, bool isPast = true)
 {
@@ -449,11 +159,27 @@ inline std::string formatKVCacheName(int32_t layerIdx, bool isPast = true)
 }
 
 /*!
- * @brief Format K cache binding name for a specific layer (TensorRT native operations)
- *
- * @param layerIdx The decoder layer index
- * @param isPast Whether this is past (true) or present (false) K cache
- * @return Formatted binding name like "k_cache_0" or "present_k_cache_0"
+ * @brief Format KV cache binding name for a specific layer (Runtime version with auto-detection)
+ */
+inline std::string formatKVCacheName(nvinfer1::ICudaEngine const* engine, int32_t layerIdx, bool isPast = true)
+{
+    // 1. past_key_values_N (Standard TRT-LLM)
+    std::string name = formatKVCacheName(layerIdx, isPast);
+    if (hasTensor(engine, name.c_str())) return name;
+
+    // 1b. past_key_values.N (Alternative dot separator)
+    name = std::string(isPast ? kPastKeyValuesTemplate : kPresentKeyValuesTemplate) + "." + std::to_string(layerIdx);
+    if (hasTensor(engine, name.c_str())) return name;
+
+    // 2. kv_cache_N (Fragmented style)
+    name = (isPast ? "kv_cache_" : "present_kv_cache_") + std::to_string(layerIdx);
+    if (hasTensor(engine, name.c_str())) return name;
+
+    return "";
+}
+
+/*!
+ * @brief Format K cache binding name for a specific layer (Static version for building)
  */
 inline std::string formatKCacheName(int32_t layerIdx, bool isPast = true)
 {
@@ -461,11 +187,23 @@ inline std::string formatKCacheName(int32_t layerIdx, bool isPast = true)
 }
 
 /*!
- * @brief Format V cache binding name for a specific layer (TensorRT native operations)
- *
- * @param layerIdx The decoder layer index
- * @param isPast Whether this is past (true) or present (false) V cache
- * @return Formatted binding name like "v_cache_0" or "present_v_cache_0"
+ * @brief Format K cache binding name for a specific layer (Runtime version with auto-detection)
+ */
+inline std::string formatKCacheName(nvinfer1::ICudaEngine const* engine, int32_t layerIdx, bool isPast = true)
+{
+    // If unified KV exists, K name is the unified name.
+    std::string name = formatKVCacheName(engine, layerIdx, isPast);
+    if (!name.empty()) return name;
+
+    // 3. k_cache_N (Separate style)
+    name = formatKCacheName(layerIdx, isPast);
+    if (hasTensor(engine, name.c_str())) return name;
+
+    return "";
+}
+
+/*!
+ * @brief Format V cache binding name for a specific layer (Static version for building)
  */
 inline std::string formatVCacheName(int32_t layerIdx, bool isPast = true)
 {
@@ -473,70 +211,47 @@ inline std::string formatVCacheName(int32_t layerIdx, bool isPast = true)
 }
 
 /*!
- * @brief Format SSM state binding name for a specific Mamba layer
- *
- * @param mambaLayerIdx The Mamba layer index (0-based, only counting Mamba layers)
- * @param isPast Whether this is past (true) or present (false) SSM state
- * @return Formatted binding name like "ssm_state_0" or "present_ssm_state_0"
+ * @brief Format V cache binding name for a specific layer (Runtime version with auto-detection)
  */
+inline std::string formatVCacheName(nvinfer1::ICudaEngine const* engine, int32_t layerIdx, bool isPast = true)
+{
+    // If unified KV exists, there is no separate V binding.
+    if (!formatKVCacheName(engine, layerIdx, isPast).empty()) return "";
+
+    // 3. v_cache_N (Separate style)
+    std::string name = formatVCacheName(layerIdx, isPast);
+    if (hasTensor(engine, name.c_str())) return name;
+
+    return "";
+}
+
 inline std::string formatSSMStateName(int32_t mambaLayerIdx, bool isPast = true)
 {
     return std::string(isPast ? kSSMStateTemplate : kPresentSSMStateTemplate) + "_" + std::to_string(mambaLayerIdx);
 }
 
-/*!
- * @brief Check if a binding name is an SSM state tensor
- *
- * @param bindingName The tensor binding name to check
- * @return True if the binding is an SSM state tensor
- */
 inline bool isSSMStateBinding(std::string const& bindingName)
 {
     return bindingName.find(kSSMStateTemplate) != std::string::npos
         || bindingName.find(kPresentSSMStateTemplate) != std::string::npos;
 }
 
-/*!
- * @brief Format conv state binding name for a specific Mamba layer
- *
- * @param mambaLayerIdx The Mamba layer index (0-based, only counting Mamba layers)
- * @param isPast Whether this is past (true) or present (false) conv state
- * @return Formatted binding name like "conv_state_0" or "present_conv_state_0"
- */
 inline std::string formatConvStateName(int32_t mambaLayerIdx, bool isPast = true)
 {
     return std::string(isPast ? kConvStateTemplate : kPresentConvStateTemplate) + "_" + std::to_string(mambaLayerIdx);
 }
 
-/*!
- * @brief Check if a binding name is a conv state tensor
- *
- * @param bindingName The tensor binding name to check
- * @return True if the binding is a conv state tensor
- */
 inline bool isConvStateBinding(std::string const& bindingName)
 {
     return bindingName.find(kConvStateTemplate) != std::string::npos
         || bindingName.find(kPresentConvStateTemplate) != std::string::npos;
 }
 
-/*!
- * @brief Check if a binding name is a LoRA weight tensor
- *
- * @param bindingName The tensor binding name to check
- * @return True if the binding is a LoRA weight tensor
- */
 inline bool isLoraBinding(std::string const& bindingName) noexcept
 {
     return bindingName.find(kLoraAPrefix) != std::string::npos || bindingName.find(kLoraBPrefix) != std::string::npos;
 }
 
-/*!
- * @brief Check if a binding name is a KV cache tensor
- *
- * @param bindingName The tensor binding name to check
- * @return True if the binding is a KV cache tensor
- */
 inline bool isKVCacheBinding(std::string const& bindingName) noexcept
 {
     return bindingName.find(kPastKeyValuesTemplate) != std::string::npos
@@ -547,23 +262,11 @@ inline bool isKVCacheBinding(std::string const& bindingName) noexcept
         || bindingName.find(kPresentVCacheTemplate) != std::string::npos;
 }
 
-/*!
- * @brief Format deepstack features binding name for a specific layer
- *
- * @param layerIdx The layer index
- * @return Formatted binding name like "deepstack_features_0"
- */
 inline std::string formatDeepstackFeaturesName(int32_t layerIdx)
 {
     return std::string(kDeepstackFeaturesTemplate) + "_" + std::to_string(layerIdx);
 }
 
-/*!
- * @brief Format deepstack embeddings binding name for a specific index
- *
- * @param embedIdx The embedding index (0, 1, or 2 for Qwen3VL)
- * @return Formatted binding name like "deepstack_embeds_0"
- */
 inline std::string formatDeepstackEmbedsName(int32_t embedIdx)
 {
     return std::string(kDeepstackEmbedsTemplate) + "_" + std::to_string(embedIdx);

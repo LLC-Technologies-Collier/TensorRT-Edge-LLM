@@ -53,13 +53,16 @@ struct DlDeleter
  *
  * @return Unique pointer to library handle, or nullptr on failure
  */
-inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void) noexcept
+inline void* loadEdgellmPluginLib(void) noexcept
 {
+    static void* persistentHandle = nullptr;
+    if (persistentHandle) return persistentHandle;
+
     char const* pluginPath = std::getenv("EDGELLM_PLUGIN_PATH");
 
     if (pluginPath != nullptr)
     {
-        LOG_INFO("EDGELLM_PLUGIN_PATH: %s", pluginPath);
+        LOG_INFO("loadEdgellmPluginLib(): Using EDGELLM_PLUGIN_PATH: %s", pluginPath);
     }
     else
     {
@@ -67,24 +70,25 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void) noexcept
         pluginPath = "build/libNvInfer_edgellm_plugin.so";
     }
 
-    auto handle = std::unique_ptr<void, DlDeleter>(dlopen(pluginPath, RTLD_LAZY));
-    if (!handle)
+    // Load with RTLD_GLOBAL so nvonnxparser can find the plugin creator symbols
+    persistentHandle = dlopen(pluginPath, RTLD_NOW | RTLD_GLOBAL);
+    if (!persistentHandle)
     {
         LOG_ERROR("Cannot open plugin library: %s", dlerror());
-        return std::unique_ptr<void, DlDeleter>(nullptr);
+        return nullptr;
     }
 
     // Sync log level with the plugin (follows the TRT initLibNvInferPlugins pattern).
     using InitPluginsFn = bool (*)(void*, char const*);
-    auto initPlugins = reinterpret_cast<InitPluginsFn>(dlsym(handle.get(), "initEdgellmPlugins"));
+    auto initPlugins = reinterpret_cast<InitPluginsFn>(dlsym(persistentHandle, "initEdgellmPlugins"));
     if (initPlugins)
     {
-        initPlugins(static_cast<nvinfer1::ILogger*>(&gLogger), "");
-        // Force the global logger to the same level as what we just passed
+        LOG_DEBUG("loadEdgellmPluginLib(): Calling initEdgellmPlugins with trt namespace");
+        initPlugins(static_cast<nvinfer1::ILogger*>(&gLogger), "trt");
         gLogger.setLevel(gLogger.getLevel());
     }
 
-    return handle;
+    return persistentHandle;
 }
 
 //! Capture a TensorRT CUDA graph from an execution context and stream.

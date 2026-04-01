@@ -244,7 +244,7 @@ public:
         std::filesystem::path const& onnxDir, std::filesystem::path const& engineDir, LLMBuilderConfig const& config);
 
     //! Destructor.
-    ~LLMBuilder() noexcept = default;
+    ~LLMBuilder() noexcept;
 
     //! Build the TensorRT engine from the ONNX model.
     //! This method performs the complete build process including:

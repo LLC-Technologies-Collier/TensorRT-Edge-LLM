@@ -80,10 +80,28 @@ class EdgeLLMModelTRTNative(nn.Module):
         self.norm = language_model.norm.to(self.torch_dtype)
 
         # Replace decoder layers with our custom ones
-        self.layers = nn.ModuleList([
-            EdgeLLMDecoderLayerTRTNative(layer, self.torch_dtype)
-            for layer in language_model.layers
-        ])
+        print(f"DEBUG TRTNative: Replacing {len(language_model.layers)} decoder layers...")
+        self.layers = nn.ModuleList()
+        for i, layer in enumerate(language_model.layers):
+            # Qwen 3.5 MoE MTP layers might have different hidden_size
+            l_hs = getattr(layer, "hidden_size", -1)
+            print(f"  Layer {i}: type={type(layer).__name__}, HS={l_hs}")
+            new_layer = EdgeLLMDecoderLayerTRTNative(layer, self.torch_dtype, layer_index=i)
+            
+            # CRITICAL: Ensure every parameter is a unique object to prevent JIT de-duplication.
+            # We use zeros to avoid NaNs during tracing.
+            # For massive models, we can use "meta" device if needed, but standard tracing 
+            # requires same-device tensors.
+            replacement_device = "meta" if self.config.hidden_size > 10000 else next(new_layer.parameters()).device
+            
+            for name, param in new_layer.named_parameters():
+                new_param = nn.Parameter(torch.zeros_like(param, device=replacement_device), requires_grad=False)
+                parts = name.split('.')
+                curr = new_layer
+                for p in parts[:-1]: curr = getattr(curr, p)
+                setattr(curr, parts[-1], new_param)
+                
+            self.layers.append(new_layer)
 
         # Set max_position_embeddings on attention modules from the model's config
         for layer in self.layers:
@@ -113,6 +131,7 @@ class EdgeLLMModelTRTNative(nn.Module):
         # Determine output configuration based on model type
         output_hidden_states = self.is_eagle_base
 
+        # Bypass embedding lookup, use inputs_embeds directly
         hidden_states = inputs_embeds.to(self.torch_dtype)
         present_kv_caches = ()
         all_hidden_states = () if output_hidden_states else None
@@ -210,11 +229,20 @@ class EdgeLLMModelTRTNative(nn.Module):
         max_position_embeddings = model_config.max_position_embeddings
         max_kv_cache_capacity = 4096  # TRT KVCacheUpdate layer requires a static value for capacity
 
-        # Use head_dim from config if available, otherwise calculate from hidden_size
+        # SHAPE PARADOX: TensorRT FFMHA only supports head_dim <= 128.
+        # We MUST standardize on head_dim=128 for plugin compatibility.
+        # We use head_dim from config if available, otherwise calculate from hidden_size.
         if hasattr(model_config, 'head_dim'):
-            head_dim = model_config.head_dim
+            orig_head_dim = model_config.head_dim
         else:
-            head_dim = hidden_size // num_heads
+            orig_head_dim = hidden_size // num_heads
+            
+        head_dim = 128 if orig_head_dim > 128 else orig_head_dim
+        if head_dim != orig_head_dim:
+            print(f"DEBUG TRTNative: Overriding head_dim {orig_head_dim} -> {head_dim} for plugin compatibility")
+            # Re-scale head counts to preserve total volume (e.g. 8*256 -> 16*128)
+            num_heads = (num_heads * orig_head_dim) // head_dim
+            num_kv_heads = (num_kv_heads * orig_head_dim) // head_dim
 
         # Determine rotary dimension from partial_rotary_factor if provided
         partial_rotary_factor = getattr(model_config, 'partial_rotary_factor',
@@ -225,7 +253,7 @@ class EdgeLLMModelTRTNative(nn.Module):
 
         # inputs_embeds
         shape = (dummy_batch_size, dummy_seq_len, hidden_size)
-        inputs_embeds = torch.randn(shape, dtype=torch.float16, device=device)
+        inputs_embeds = torch.randn(shape, dtype=self.torch_dtype, device=device)
         dummy_inputs.append(inputs_embeds)
         input_names.append('inputs_embeds')
         dynamic_axes['inputs_embeds'] = {
@@ -269,12 +297,13 @@ class EdgeLLMModelTRTNative(nn.Module):
         kv_caches = []
         kv_caches_names = []
         
-        # Radical Unification: Force a "Super-Super-Shape" for ALL layers to eliminate profile mismatches.
-        # Blackwell-optimized FMHA and hybrid models (Qwen 3.5 MoE) require consistent shapes.
-        # Max heads across all layers is 64, max dim is 256.
-        unified_heads = 64
-        unified_dim = 256
+        # SHAPE PARADOX: All layers must match the global KV head count.
+        # For Qwen 3.5 0.8B with head_dim=128, we use 32 KV heads globally.
+        unified_heads = 32
+        unified_dim = head_dim
         
+        print(f"DEBUG TRTNative: Global KV cache heads={unified_heads} dim={unified_dim}")
+
         # Match max_kv_cache from the build pipeline (32K context)
         max_kv_cache_capacity = 32768
 
@@ -465,7 +494,7 @@ class Eagle3DraftModelTRTNative(nn.Module):
 
     def forward(
         self,
-        inputs_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         last_token_ids: torch.Tensor,
@@ -480,26 +509,13 @@ class Eagle3DraftModelTRTNative(nn.Module):
             torch.Tensor, ...]]:
         """
         Forward pass of the EAGLE3 draft model with native ops.
-        
-        Args:
-            inputs_embeds: Input embeddings (batch_size, seq_len, hidden_size)
-            rope_rotary_cos_sin: RoPE embeddings (batch_size, seq_len, head_dim)
-            context_lengths: Current position in cache (batch_size,)
-            last_token_ids: Indices of last tokens to extract (batch_size,)
-            k_caches: Key caches for TensorRT native mode (batch, num_heads, capacity, head_dim)
-            v_caches: Value caches for TensorRT native mode (batch, num_heads, capacity, head_dim)
-            kvcache_start_index: Start index of KV cache (batch_size,)
-            hidden_states_from_base: Hidden states from base model (batch_size, seq_len, target_hidden_size * 3)
-            hidden_states_from_draft: Hidden states from draft (batch_size, seq_len, hidden_size)
-            position_ids: Position IDs (batch_size, seq_len)
-            attention_mask: Attention mask (batch_size, seq_len, seq_len + past_len)
-            
-        Returns:
-            (logits, hidden_states, present_k_caches, present_v_caches)
         """
 
+        # Perform embedding lookup
+        hidden_states = self.embed_tokens(input_ids).to(self.torch_dtype)
+        
         # Fuse hidden states and combine with draft hidden states
-        hidden_states = self.fc(hidden_states_from_base)
+        hidden_states = hidden_states + self.fc(hidden_states_from_base)
 
         # TODO: WAR for INT4 ONNX export
         hidden_states_from_draft = hidden_states_from_draft.to(torch.float16)
@@ -612,11 +628,20 @@ class Eagle3DraftModelTRTNative(nn.Module):
         max_position_embeddings = model_config.max_position_embeddings
         max_kv_cache_capacity = 4096  # TRT KVCacheUpdate layer requires a static value for capacity
 
-        # Use head_dim from config if available, otherwise calculate from hidden_size
+        # SHAPE PARADOX: TensorRT FFMHA only supports head_dim <= 128.
+        # We MUST standardize on head_dim=128 for plugin compatibility.
+        # We use head_dim from config if available, otherwise calculate from hidden_size.
         if hasattr(model_config, 'head_dim'):
-            head_dim = model_config.head_dim
+            orig_head_dim = model_config.head_dim
         else:
-            head_dim = hidden_size // num_heads
+            orig_head_dim = hidden_size // num_heads
+            
+        head_dim = 128 if orig_head_dim > 128 else orig_head_dim
+        if head_dim != orig_head_dim:
+            print(f"DEBUG TRTNative: Overriding head_dim {orig_head_dim} -> {head_dim} for plugin compatibility")
+            # Re-scale head counts to preserve total volume (e.g. 8*256 -> 16*128)
+            num_heads = (num_heads * orig_head_dim) // head_dim
+            num_kv_heads = (num_kv_heads * orig_head_dim) // head_dim
 
         # Determine rotary dimension from partial_rotary_factor if provided
         partial_rotary_factor = getattr(model_config, 'partial_rotary_factor',
@@ -629,12 +654,12 @@ class Eagle3DraftModelTRTNative(nn.Module):
         target_hidden_size = model_config.target_hidden_size if hasattr(
             model_config, "target_hidden_size") else hidden_size
 
-        # inputs_embeds
-        shape = (dummy_batch_size, dummy_seq_len, hidden_size)
-        inputs_embeds = torch.randn(shape, dtype=torch.float16, device=device)
-        dummy_inputs.append(inputs_embeds)
-        input_names.append('inputs_embeds')
-        dynamic_axes['inputs_embeds'] = {
+        # input_ids
+        shape = (dummy_batch_size, dummy_seq_len)
+        input_ids = torch.zeros(shape, dtype=torch.int32, device=device)
+        dummy_inputs.append(input_ids)
+        input_names.append('input_ids')
+        dynamic_axes['input_ids'] = {
             0: 'batch_size',
             1: 'seq_len',
         }
@@ -672,12 +697,13 @@ class Eagle3DraftModelTRTNative(nn.Module):
         kv_caches = []
         kv_caches_names = []
         
-        # Radical Unification: Force a "Super-Super-Shape" for ALL layers to eliminate profile mismatches.
-        # Blackwell-optimized FMHA and hybrid models (Qwen 3.5 MoE) require consistent shapes.
-        # Max heads across all layers is 64, max dim is 256.
-        unified_heads = 64
-        unified_dim = 256
+        # SHAPE PARADOX: All layers must match the global KV head count.
+        # For Qwen 3.5 0.8B with head_dim=128, we use 32 KV heads globally.
+        unified_heads = 32
+        unified_dim = head_dim
         
+        print(f"DEBUG TRTNative: Global KV cache heads={unified_heads} dim={unified_dim}")
+
         # Match max_kv_cache from the build pipeline (32K context)
         max_kv_cache_capacity = 32768
 

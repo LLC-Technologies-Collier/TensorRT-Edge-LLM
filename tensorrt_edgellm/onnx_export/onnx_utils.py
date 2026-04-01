@@ -100,7 +100,10 @@ def export_onnx(model,
                 output_names,
                 dynamic_axes,
                 custom_opsets=None,
-                dynamo=False):
+                dynamo=False,
+                qwen35_interleaving=False,
+                config=None) -> None:
+
     '''
     Export the model to ONNX format.
     Args:
@@ -116,6 +119,7 @@ def export_onnx(model,
     t0 = time.time()
     os.makedirs(output_dir, exist_ok=True)
     onnx_path = f'{output_dir}/model.onnx'
+    print(f"DEBUG: Entering export_onnx (path={onnx_path})")
 
     print(f"DEBUG: Starting standard torch.onnx.export (jit.trace) to {onnx_path}...")
     
@@ -129,7 +133,35 @@ def export_onnx(model,
     if is_meta:
         print(f"DEBUG: Meta device detected, setting export_params=False for skeleton tracing. ONNX_OPSET_VERSION is {ONNX_OPSET_VERSION}")
 
+    if custom_opsets is None:
+        custom_opsets = {"trt_edgellm": 1}
+    else:
+        custom_opsets["trt_edgellm"] = 1
+
+    # Force reload of core modules to ensure fresh symbolic functions and wrappers are used
+    import importlib
+    import sys
+    
+    # Reload modules in order of dependency
+    modules_to_reload = [
+        "tensorrt_edgellm.common",
+        "tensorrt_edgellm.version",
+        "tensorrt_edgellm.llm_models.layers.attention_trt",
+        "tensorrt_edgellm.llm_models.models.qwen3_5_moe_trtnative",
+        "tensorrt_edgellm.llm_models.layers.layers",
+        "tensorrt_edgellm.llm_models.models.llm_model_trtnative",
+    ]
+    
+    for mod_name in modules_to_reload:
+        if mod_name in sys.modules:
+            print(f"DEBUG: Reloading {mod_name}...")
+            importlib.reload(sys.modules[mod_name])
+    
+    print("DEBUG: Force-reloaded core SDK modules.")
+
     with torch.inference_mode():
+
+
         # Force dynamo=False to use legacy jit.trace, which is more robust for complex MoE
         print(f"DEBUG: Calling torch.onnx.export with opset_version={ONNX_OPSET_VERSION}")
         torch.onnx.export(model,
@@ -150,62 +182,66 @@ def export_onnx(model,
     onnx.shape_inference.infer_shapes_path(onnx_path)
     onnx_model = onnx.load(onnx_path)
     
-    # Always use graph surgeon for custom op mapping
-    from .surgeon import fuse_attention_nodes, broadcast_heterogeneous_heads, fix_flatten_reshapes, barrier_plugins, cleanup_graph
+    # Pass 1: Initial GraphSurgeon import and attention fusion
+    from .surgeon import fuse_attention_nodes, broadcast_heterogeneous_heads, fix_flatten_reshapes, barrier_plugins, cleanup_graph, enforce_plugin_domains
     graph = gs.import_onnx(onnx_model)
-    print("Applying AttentionPlugin transformation, broadcasting heads, fixing reshapes, and isolating plugins...")
-    graph = fuse_attention_nodes(graph)
-    graph = broadcast_heterogeneous_heads(graph)
-    graph = fix_flatten_reshapes(graph)
+    del onnx_model
+    gc.collect()
+
+    if qwen35_interleaving:
+        print("Applying Qwen 3.5 specific AttentionPlugin transformation and fixing reshapes...")
+        graph = fuse_attention_nodes(graph, config=config)
+        graph = fix_flatten_reshapes(graph)
+    else:
+        print("Applying AttentionPlugin transformation, broadcasting heads, and fixing reshapes...")
+        graph = fuse_attention_nodes(graph, config=config)
+        graph = broadcast_heterogeneous_heads(graph)
+        graph = fix_flatten_reshapes(graph)
+
     graph = barrier_plugins(graph)
 
-    if _is_int4_awq_quantized(model):
-        from .int4_awq_utils import fix_model_int4_output_dtypes, int4_dq_gemm_to_plugin
-        from .quant_utils import INT4QuantExporter
-        print(
-            "INT4 AWQ quantization detected in the model, compressing some weights to INT4 and inserting int4 gemm plugin"
-        )
-        onnx_model = INT4QuantExporter.compute_scales(onnx_model)
-        onnx_model = INT4QuantExporter.compress_weights(onnx_model)
-        onnx_model = INT4QuantExporter.post_process(onnx_model)
-        # Fix the Cast nodes and hidden_states output types for INT4 models
-        onnx_model = fix_model_int4_output_dtypes(onnx_model)
-        graph = gs.import_onnx(onnx_model)
-        graph = int4_dq_gemm_to_plugin(graph)
-
+    # NVFP4 processing (Surgical modification on GraphSurgeon graph BEFORE final export)
     if _is_nvfp4_quantized(model):
-        from .nvfp4_utils import nvfp4_to_plugin
-        from .quant_utils import NVFP4QuantExporter
-        print(
-            "NVFP4 quantization detected in the model, compressing some weights to NVFP4 and inserting nvfp4 gemm plugin"
-        )
-        onnx_model = NVFP4QuantExporter.compute_scales(onnx_model)
-        onnx_model = NVFP4QuantExporter.compress_weights(onnx_model)
-        onnx_model = NVFP4QuantExporter.post_process(onnx_model)
-        graph = gs.import_onnx(onnx_model)
-        graph = nvfp4_to_plugin(graph)
+        print("DEBUG: NVFP4 quantization detected. Resolving Identity aliases...")
+        for node in graph.nodes:
+            if node.op == "TRT_FP4QDQ":
+                inp = node.inputs[0]
+                while inp.inputs and inp.inputs[0].op == "Identity":
+                    inp = inp.inputs[0].inputs[0]
+                if isinstance(inp, gs.Constant):
+                    unique_const = gs.Constant(name=node.name + "_unique_weight", values=inp.values)
+                    node.inputs[0] = unique_const
+                else:
+                    node.inputs[0] = inp
 
-    if _is_mxfp8_quantized(model):
-        from .mxfp8_utils import mxfp8_to_plugin
-        from .quant_utils import MXFP8QuantExporter
-        print(
-            "MXFP8 quantization detected in the model, compressing some weights to MXFP8"
-        )
-        onnx_model = MXFP8QuantExporter.compute_scales(onnx_model)
-        onnx_model = MXFP8QuantExporter.compress_weights(onnx_model)
-        onnx_model = MXFP8QuantExporter.post_process(onnx_model)
-        graph = gs.import_onnx(onnx_model)
-        graph = mxfp8_to_plugin(graph)
+    # Standard post-processing for custom plugins
+    graph = cleanup_graph(graph)
+    
+    # FINAL EXPORT
+    print("DEBUG: Exporting final graph from surgeon...")
+    graph.cleanup().toposort()
+    onnx_model = gs.export_onnx(graph, do_type_check=False)
+    del graph
+    gc.collect()
 
-    if graph is not None:
-        # Standard post-processing for custom plugins
-        onnx_model = gs.export_onnx(cleanup_graph(graph))
-        
-        # Large models need to be saved with external data
-        onnx.save_model(onnx_model,
-                        onnx_path,
-                        save_as_external_data=True,
-                        all_tensors_to_one_file=True,
-                        location="model.onnx.data")
+    # Final ModelOpt NVFP4 weight compression
+    if _is_nvfp4_quantized(model):
+        from modelopt.onnx.export import NVFP4QuantExporter
+        print("NVFP4 quantization detected. Processing weights with modelopt...")
+        onnx_model = NVFP4QuantExporter.process_model(onnx_model)
+        gc.collect()
+
+    # Pass 3: Final Domain Enforcement using raw ONNX API
+    onnx_model = enforce_plugin_domains(onnx_model)
+
+    # 3. Save the final ONNX model
+    # Large models need to be saved with external data
+    print(f"DEBUG: Saving final ONNX model to {onnx_path} (Fragmented External Data enabled)...")
+    onnx.save_model(onnx_model,
+                    onnx_path,
+                    save_as_external_data=True,
+                    all_tensors_to_one_file=False)
+
+    print(f"Final ONNX model saved to {onnx_path}")
 
     print(f"Final ONNX model saved to {onnx_path}")

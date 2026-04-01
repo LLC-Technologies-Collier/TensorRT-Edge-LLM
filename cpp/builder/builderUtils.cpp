@@ -284,17 +284,15 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
     {
         LOG_INFO("Enabling weight streaming flag for build.");
         config->setFlag(nvinfer1::BuilderFlag::kWEIGHT_STREAMING);
-        
-        // For massive models on constrained hardware, also disable timing cache,
-        // use fastest optimization level, and DISABLE all external tactic sources 
-        // to avoid internal tactic selection errors (like Error Code 10).
-        LOG_INFO("Using aggressive memory-saving build settings (Optimization Level 0, No Timing Cache, No External Tactics).");
-        config->setFlag(nvinfer1::BuilderFlag::kDISABLE_TIMING_CACHE);
-        config->setBuilderOptimizationLevel(0);
-        
-        // Clear all tactic sources
-        config->setTacticSources(0);
     }
+    
+    // Unconditionally use aggressive memory-saving build settings for Edge LLMs
+    // (Optimization Level 0, No Timing Cache) to bypass aggressive Myelin fusion
+    // and prevent Error Code 10 / out-of-memory compiler crashes.
+    LOG_INFO("Using aggressive memory-saving build settings (Optimization Level 0, No Timing Cache, Refit Enabled).");
+    config->setFlag(nvinfer1::BuilderFlag::kDISABLE_TIMING_CACHE);
+    config->setFlag(nvinfer1::BuilderFlag::kREFIT);
+    config->setBuilderOptimizationLevel(0);
 
     return config;
 }
@@ -302,27 +300,54 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
 std::unique_ptr<nvonnxparser::IParser> parseOnnxModel(
     nvinfer1::INetworkDefinition* network, std::string const& onnxFilePath)
 {
+    printf("[Builder] parseOnnxModel: %s\n", onnxFilePath.c_str());
     if (!network)
     {
+        printf("[Builder] FAILED: network is nullptr\n");
         LOG_ERROR("Network is nullptr");
         return nullptr;
+    }
+
+    // Check if file exists and get size
+    if (!std::filesystem::exists(onnxFilePath)) {
+        printf("[Builder] FAILED: file does not exist: %s\n", onnxFilePath.c_str());
+        return nullptr;
+    }
+    size_t fsize = (size_t)std::filesystem::file_size(onnxFilePath);
+    printf("[Builder] ONNX file size: %zu bytes\n", fsize);
+
+    if (fsize > 0) {
+        std::ifstream f(onnxFilePath, std::ios::binary);
+        char buf[16];
+        f.read(buf, 16);
+        printf("[Builder] ONNX file header (first 16 bytes): ");
+        for (int i=0; i<16; ++i) printf("%02x ", (unsigned char)buf[i]);
+        printf("\n");
     }
 
     // Create ONNX parser
     auto parser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, gLogger));
     if (!parser)
     {
+        printf("[Builder] FAILED to create ONNX parser\n");
         LOG_ERROR("Failed to create ONNX parser");
         return nullptr;
     }
 
     // Parse ONNX model
+    printf("[Builder] parser->parseFromFile start...\n");
     if (!parser->parseFromFile(onnxFilePath.c_str(), static_cast<int>(gLogger.getLevel())))
     {
+        printf("[Builder] FAILED to parse ONNX file: %s\n", onnxFilePath.c_str());
+        for (int i = 0; i < parser->getNbErrors(); ++i) {
+            auto* error = parser->getError(i);
+            printf("[Builder]   Parser Error [%d]: (code %d) %s\n", i, (int)error->code(), error->desc());
+        }
         LOG_ERROR("Failed to parse ONNX file: %s", onnxFilePath.c_str());
         return nullptr;
     }
 
+    printf("[Builder] Successfully parsed ONNX model: %s\n", onnxFilePath.c_str());
     LOG_DEBUG("Successfully parsed ONNX model: %s", onnxFilePath.c_str());
     return parser;
 }
