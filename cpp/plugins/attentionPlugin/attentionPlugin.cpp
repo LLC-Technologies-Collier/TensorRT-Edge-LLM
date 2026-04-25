@@ -50,7 +50,7 @@ namespace
 {
 constexpr char const* kATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kATTENTION_PLUGIN_NAME{"AttentionPlugin"};
-constexpr char const* kATTENTION_PLUGIN_NAMESPACE{"trt_edgellm"};
+constexpr char const* kATTENTION_PLUGIN_NAMESPACE{""};
 
 // Select KV cache storage datatype based on FP8 enablement
 static inline DataType selectKvCacheDataType(bool enableFp8KVCache)
@@ -93,6 +93,7 @@ enum class AttentionExecutionMode
 
 AttentionExecutionMode deduceModeVanilla(rt::Tensor const& qInputTensor, rt::Tensor const& kvCacheStartIdxTensor)
 {
+    fprintf(stderr, "  Inside deduceModeVanilla: qInputTensor shape=%s\n", qInputTensor.getShape().formatString().c_str());
     // Empty KVCache Start indices means normal prefill without previous KVCache. Notice single token is also a valid
     // prefill length.
     if (kvCacheStartIdxTensor.getShape()[0] == 0)
@@ -166,8 +167,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
 {
     mDataType = nvinfer1::DataType::kHALF;
     mSMVersion = getSMVersion();
-    if (mSMVersion == 110) mSMVersion = 101;
-    else if (mSMVersion >= 100) mSMVersion = 89;
+    applyThorSMRenumberWAR(mSMVersion);
+
 
 
 
@@ -247,8 +248,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, std::byte const* data,
 #endif
 
     mSMVersion = getSMVersion();
-    if (mSMVersion == 110) mSMVersion = 101;
-    else if (mSMVersion >= 100) mSMVersion = 89;
+    applyThorSMRenumberWAR(mSMVersion);
+
 
 
 
@@ -369,6 +370,16 @@ void AttentionPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* i
     int32_t nbOutputs) noexcept
 {
     mDataType = in[kIN_Q_IDX].desc.type;
+    
+    // Update head counts and dimensions from input descriptors to ensure consistency with the engine.
+    // Use the KV cache dimensions to determine the number of KV heads in the cache.
+    // KV cache shape: [B, 2, Hkv, Capacity, D]
+    mNumKVHeads = static_cast<int32_t>(in[kIN_KV_CACHE_IDX].desc.dims.d[2]);
+    mHeadSize = static_cast<int32_t>(in[kIN_KV_CACHE_IDX].desc.dims.d[4]);
+    
+    // Q input shape: [B, S, Hq * D]
+    int32_t const totalQDim = static_cast<int32_t>(in[kIN_Q_IDX].desc.dims.d[2]);
+    mNumQHeads = totalQDim / mHeadSize;
 }
 
 // TODO: extend the workspace calculation to a more generalized form.
@@ -421,37 +432,55 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     // we will use shape of [B, S, Hq, D] to represent the tensor.
     // K and V inputs are in shape [B, S, Hkv x D], represented as [B, S, Hkv, D].
     PluginTensorDesc const& qInputDesc = inputDesc[kIN_Q_IDX];
+    
+    LOG_DEBUG("AttentionPlugin::enqueue: Q nbDims=%d, d[0]=%d, d[1]=%d, d[2]=%d", 
+              qInputDesc.dims.nbDims, qInputDesc.dims.d[0], qInputDesc.dims.d[1], qInputDesc.dims.d[2]);
+    fprintf(stderr, "  AttentionPlugin: mNumQHeads=%d, mNumKVHeads=%d, mHeadSize=%d\n", mNumQHeads, mNumKVHeads, mHeadSize);
+
     PluginTensorDesc const& kInputDesc = inputDesc[kIN_K_IDX];
     PluginTensorDesc const& vInputDesc = inputDesc[kIN_V_IDX];
+    fprintf(stderr, "  AttentionPlugin: K dims=[%ld, %ld, %ld], V dims=[%ld, %ld, %ld]\n", 
+            kInputDesc.dims.d[0], kInputDesc.dims.d[1], kInputDesc.dims.d[2],
+            vInputDesc.dims.d[0], vInputDesc.dims.d[1], vInputDesc.dims.d[2]);
     int32_t const runtimeBatchSize = static_cast<int32_t>(qInputDesc.dims.d[0]);
     int32_t const runtimeSeqLen = static_cast<int32_t>(qInputDesc.dims.d[1]);
+    
+    // Determine the number of KV heads in the input tensors (might be different from cache due to GQA)
+    int32_t const numKVHeadsIn = static_cast<int32_t>(kInputDesc.dims.d[2]) / mHeadSize;
+
     check::check(kInputDesc.dims.d[0] == runtimeBatchSize && vInputDesc.dims.d[0] == runtimeBatchSize,
         "Batch size must be consistent across Q/K/V inputs.");
     check::check(kInputDesc.dims.d[1] == runtimeSeqLen && vInputDesc.dims.d[1] == runtimeSeqLen,
         "Sequence length must be consistent across Q/K/V inputs.");
     check::check(qInputDesc.dims.d[2] == mNumQHeads * mHeadSize, "Q input shape shall be consistent.");
-    check::check(kInputDesc.dims.d[2] == mNumKVHeads * mHeadSize, "K input shape shall be consistent.");
-    check::check(vInputDesc.dims.d[2] == mNumKVHeads * mHeadSize, "V input shape shall be consistent.");
+    check::check(kInputDesc.dims.d[2] == numKVHeadsIn * mHeadSize, "K input shape shall be consistent.");
+    check::check(vInputDesc.dims.d[2] == numKVHeadsIn * mHeadSize, "V input shape shall be consistent.");
 
     rt::Tensor qInputTensor(const_cast<void*>(inputs[kIN_Q_IDX]),
         rt::Coords{runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, rt::DeviceType::kGPU, qInputDesc.type);
     rt::Tensor kInputTensor(const_cast<void*>(inputs[kIN_K_IDX]),
-        rt::Coords{runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU, kInputDesc.type);
+        rt::Coords{runtimeBatchSize, runtimeSeqLen, numKVHeadsIn, mHeadSize}, rt::DeviceType::kGPU, kInputDesc.type);
     rt::Tensor vInputTensor(const_cast<void*>(inputs[kIN_V_IDX]),
-        rt::Coords{runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU, vInputDesc.type);
+        rt::Coords{runtimeBatchSize, runtimeSeqLen, numKVHeadsIn, mHeadSize}, rt::DeviceType::kGPU, vInputDesc.type);
 
+    fprintf(stderr, "  AttentionPlugin Enqueue: q=%p, k=%p, v=%p, cache=%p, context=%p, rope=%p, start=%p\n",
+            inputs[kIN_Q_IDX], inputs[kIN_K_IDX], inputs[kIN_V_IDX], inputs[kIN_KV_CACHE_IDX],
+            inputs[kIN_CONTEXT_LENGTH_IDX], inputs[kIN_ROPE_COS_SIN_IDX], inputs[kIN_KV_CACHE_START_IDX]);
     PluginTensorDesc const& contextLengthInputDesc = inputDesc[kIN_CONTEXT_LENGTH_IDX];
     rt::Tensor const contextLengthTensor(const_cast<void*>(inputs[kIN_CONTEXT_LENGTH_IDX]),
         rt::Coords{contextLengthInputDesc.dims}, rt::DeviceType::kGPU, contextLengthInputDesc.type);
 
+    fprintf(stderr, "  Creating ropeCosSinTensor\n");
     PluginTensorDesc const& posEncodingCosSinDesc = inputDesc[kIN_ROPE_COS_SIN_IDX];
     rt::Tensor const ropeCosSinTensor(const_cast<void*>(inputs[kIN_ROPE_COS_SIN_IDX]),
         rt::Coords{posEncodingCosSinDesc.dims}, rt::DeviceType::kGPU, posEncodingCosSinDesc.type);
 
+    fprintf(stderr, "  Creating kvCacheStartIdxTensor\n");
     PluginTensorDesc const& kvCacheStartIdxInputDesc = inputDesc[kIN_KV_CACHE_START_IDX];
     rt::Tensor const kvCacheStartIdxTensor(const_cast<void*>(inputs[kIN_KV_CACHE_START_IDX]),
         rt::Coords{kvCacheStartIdxInputDesc.dims}, rt::DeviceType::kGPU, kvCacheStartIdxInputDesc.type);
 
+    fprintf(stderr, "  Creating attentionOutputTensor\n");
     PluginTensorDesc const& attentionOutputDesc = outputDesc[kOUT_ATTENTION_IDX];
     rt::Tensor attentionOutputTensor(outputs[kOUT_ATTENTION_IDX], rt::Coords{attentionOutputDesc.dims},
         rt::DeviceType::kGPU, attentionOutputDesc.type);
@@ -530,16 +559,46 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     if (executionMode == AttentionExecutionMode::kNORMAL_PREFILL
         || executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
     {
+        fprintf(stderr, "  Creating cuQSeqLensTensor\n");
         rt::Tensor cuQSeqLensTensor
             = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
 
+        fprintf(stderr, "  Creating cuKVSeqLensTensor\n");
         rt::Tensor cuKVSeqLensTensor
             = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
+
+        fprintf(stderr, "  Creating kvCacheEndIdxsTensor\n");
         rt::Tensor kvCacheEndIdxsTensor
             = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize}, DataType::kINT32);
 
-        kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
-            cuKVSeqLensTensor, kvCacheEndIdxsTensor, runtimeSeqLen, stream);
+        fprintf(stderr, "  Initializing cu_seqlens on host (runtimeSeqLen=%d)\n", runtimeSeqLen);
+        
+        // Host-side initialization
+        int32_t* hostCuQ = new int32_t[runtimeBatchSize + 1];
+        int32_t* hostCuKV = new int32_t[runtimeBatchSize + 1];
+        int32_t* hostEndIdxs = new int32_t[runtimeBatchSize];
+        
+        hostCuQ[0] = 0;
+        hostCuKV[0] = 0;
+        for (int32_t i = 0; i < runtimeBatchSize; ++i) {
+            hostCuQ[i+1] = hostCuQ[i] + runtimeSeqLen;
+            hostCuKV[i+1] = hostCuKV[i] + runtimeSeqLen;
+            hostEndIdxs[i] = runtimeSeqLen;
+        }
+        
+        CUDA_CHECK(cudaMemcpy(cuQSeqLensTensor.rawPointer(), hostCuQ, 
+                                  (runtimeBatchSize + 1) * sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(cuKVSeqLensTensor.rawPointer(), hostCuKV, 
+                                  (runtimeBatchSize + 1) * sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(kvCacheEndIdxsTensor.rawPointer(), hostEndIdxs, 
+                                  runtimeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice));
+        
+        delete[] hostCuQ;
+        delete[] hostCuKV;
+        delete[] hostEndIdxs;
+        
+        // Synchronize to ensure sequence lengths are ready for FMHA
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
 #ifdef CUTE_DSL_FMHA_ENABLED
         // Enable CuteDSL FMHA for single batch prefill usecase when FP8 KVCache is disabled.
@@ -547,6 +606,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         bool const enableCuteDslFMHA = mUseCuteDslFMHA && !mEnableFp8KVCache && runtimeBatchSize == 1;
         if (enableCuteDslFMHA)
         {
+            fprintf(stderr, "  Using CuteDSL FMHA\n");
             kernel::launchApplyRopeWriteKVSplitQKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
                 vInputTensor, kvCacheTensor, kvScaleQuantOrigTensor, stream);
 
@@ -563,18 +623,39 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         else
 #endif
         {
-            AttentionInputLayout attentionInputLayout = executionMode == AttentionExecutionMode::kCHUNKED_PREFILL
+            fprintf(stderr, "  Using FMHA_v2\n");
+            // Force CONTIGUOUS_Q_KV layout (using KV cache) if GQA broadcasting is required,
+            // as the FMHA raw input kernels don't handle broadcasting.
+            bool const forceKvCachePath = (numKVHeadsIn != mNumKVHeads);
+            
+            AttentionInputLayout attentionInputLayout = (executionMode == AttentionExecutionMode::kCHUNKED_PREFILL || forceKvCachePath)
                 ? AttentionInputLayout::CONTIGUOUS_Q_KV
                 : AttentionInputLayout::SEPARATE_Q_K_V;
+            
+            fprintf(stderr, "  Creating ContextFMHARunner (forceKvCachePath=%d)\n", (int)forceKvCachePath);
             auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads,
                 mHeadSize, mSMVersion, attentionInputLayout);
 
-            // Prepare FMHA_v2 params to launch FMHA kernel
-            FusedMultiheadAttentionParamsV2 params{};
+            fprintf(stderr, "  Setting up FMHA_v2 params\n");
+            // Use heap-allocated aligned memory for params to ensure strict 64-byte alignment
+            // as required by the CUDA driver for structs containing TMA descriptors.
+            void* raw_params = nullptr;
+            if (posix_memalign(&raw_params, 64, sizeof(FusedMultiheadAttentionParamsV2)) != 0) {
+                LOG_ERROR("Failed to allocate aligned FMHA params");
+                return 1;
+            }
+            std::unique_ptr<FusedMultiheadAttentionParamsV2, void(*)(void*)> params_guard(
+                static_cast<FusedMultiheadAttentionParamsV2*>(raw_params), free);
+            FusedMultiheadAttentionParamsV2& params = *params_guard;
+            params = FusedMultiheadAttentionParamsV2{};
+            
+            fprintf(stderr, "  Params address=%p, alignment=%zu\n", (void*)&params, (size_t)(&params) % 64);
             fmhaRunner.setupParams(params);
+            
+            fprintf(stderr, "  Setting cu_q_seqlens\n");
             params.cu_q_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
 
-            if (executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
+            if (attentionInputLayout == AttentionInputLayout::CONTIGUOUS_Q_KV)
             {
                 // FMHA kernel with CONTIGUOUS_Q_KV input layout currently only supports FP16 KV cache.
                 // kvCache: [b, 2, hkv, s, d] -> [b, s, 2, hkv, d]
@@ -601,8 +682,11 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                 params.q_ptr = qInputTensor.dataPointer<half>();
                 params.k_ptr = kInputTensor.dataPointer<half>();
                 params.v_ptr = vInputTensor.dataPointer<half>();
-                params.cu_kv_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
+                params.cu_kv_seqlens = cuKVSeqLensTensor.dataPointer<int32_t>();
                 params.o_ptr = attentionOutputTensor.dataPointer<half>();
+                
+                fprintf(stderr, "  FMHA Pointers: q=%p, k=%p, v=%p, cuQ=%p, cuKV=%p, o=%p\n",
+                        params.q_ptr, params.k_ptr, params.v_ptr, params.cu_q_seqlens, params.cu_kv_seqlens, params.o_ptr);
             }
 
             // Dispatch FMHA kernel

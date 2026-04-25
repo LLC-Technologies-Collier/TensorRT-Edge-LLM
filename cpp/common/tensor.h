@@ -176,8 +176,10 @@ public:
      */
     int64_t& operator[](int32_t idx)
     {
+        fprintf(stderr, "  Coords::operator[] (mutable): idx=%d, mNumDims=%d\n", idx, mNumDims);
         if (idx < 0 || idx >= mNumDims)
         {
+            fprintf(stderr, "[Coords] ERROR (mutable): index %d out of range (mNumDims=%d)\n", idx, mNumDims);
             throw std::out_of_range("Coords: index out of range");
         }
         return mDims[idx];
@@ -193,6 +195,7 @@ public:
     {
         if (idx < 0 || idx >= mNumDims)
         {
+            fprintf(stderr, "[Coords] ERROR (const): index %d out of range (mNumDims=%d)\n", idx, mNumDims);
             throw std::out_of_range("Coords: index out of range");
         }
         return mDims[idx];

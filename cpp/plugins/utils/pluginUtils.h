@@ -32,7 +32,7 @@ namespace trt_edgellm
 namespace plugins
 {
 //! Device memory alignment requirement (128 bytes)
-constexpr int32_t kDEVICE_ALIGNMENT{128};
+constexpr int32_t kDEVICE_ALIGNMENT{256};
 
 //! @brief Workaround for CUDA12/13 Thor SM re-numbering.
 //! @param smVersion CUDA SM version that may be normalized in-place.

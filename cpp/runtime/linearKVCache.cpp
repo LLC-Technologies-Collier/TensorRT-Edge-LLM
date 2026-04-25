@@ -59,7 +59,7 @@ LinearKVCache::LinearKVCache(CacheConfig const& config, cudaStream_t stream)
     CUDA_CHECK(
         cudaMemsetAsync(mDeviceKVCacheLengths.rawPointer(), 0, mDeviceKVCacheLengths.getMemoryCapacity(), stream));
 
-    if (mConfig.numMambaLayers > 0)
+    if (mConfig.numMambaLayers > 0 && mConfig.mambaNumHeads > 0 && mConfig.ssmStateSize > 0 && mConfig.convDim > 0)
     {
         mDeviceSSMStates = rt::Tensor({mConfig.numMambaLayers, mConfig.maxBatchSize, mConfig.mambaNumHeads,
                                           mConfig.mambaHeadDim, mConfig.ssmStateSize},

@@ -285,14 +285,12 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
         LOG_INFO("Enabling weight streaming flag for build.");
         config->setFlag(nvinfer1::BuilderFlag::kWEIGHT_STREAMING);
     }
-    
-    // Unconditionally use aggressive memory-saving build settings for Edge LLMs
-    // (Optimization Level 0, No Timing Cache) to bypass aggressive Myelin fusion
-    // and prevent Error Code 10 / out-of-memory compiler crashes.
-    LOG_INFO("Using aggressive memory-saving build settings (Optimization Level 0, No Timing Cache, Refit Enabled).");
+
+    LOG_INFO("Using build settings: Optimization Level 0 (Memory Saving), No Timing Cache, Refit Disabled.");
     config->setFlag(nvinfer1::BuilderFlag::kDISABLE_TIMING_CACHE);
-    config->setFlag(nvinfer1::BuilderFlag::kREFIT);
+    // config->setFlag(nvinfer1::BuilderFlag::kREFIT);
     config->setBuilderOptimizationLevel(0);
+
 
     return config;
 }
@@ -362,12 +360,18 @@ bool buildAndSerializeEngine(nvinfer1::IBuilder* builder, nvinfer1::INetworkDefi
     }
 
     // Build serialized network
+    printf("[Builder] buildAndSerializeEngine: Starting buildSerializedNetwork...\n");
+    LOG_INFO("Starting buildSerializedNetwork...");
+    
     auto engine = std::unique_ptr<nvinfer1::IHostMemory>(builder->buildSerializedNetwork(*network, *config));
     if (!engine)
     {
+        printf("[Builder] buildSerializedNetwork FAILED! Check TensorRT logs for details.\n");
         LOG_ERROR("Failed to build serialized engine");
         return false;
     }
+
+    printf("[Builder] buildSerializedNetwork successful. Plan size: %zu bytes\n", engine->size());
 
     // Write to file
     std::ofstream ofs(engineFilePath, std::ios::out | std::ios::binary);

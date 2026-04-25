@@ -74,6 +74,7 @@ std::array<int64_t, kMAX_DIMS> computeStrides(Coords const& shape)
 {
     std::array<int64_t, kMAX_DIMS> strides;
     int32_t const numDims = shape.getNumDims();
+    fprintf(stderr, "  computeStrides: numDims=%d, shape=%s\n", numDims, shape.formatString().c_str());
     strides[numDims - 1] = 1;
     int64_t stride = 1;
     for (int32_t i = numDims - 2; i >= 0; --i)
@@ -341,6 +342,7 @@ bool Tensor::reshape(Coords shape) noexcept
     {
         return false;
     }
+    if (shape.getNumDims() > 0) { LOG_INFO("Reshaping tensor %s to %s", mName.c_str(), shape.formatString().c_str()); }
 
     if (static_cast<int64_t>(shape.volume() * utils::getTypeSize(mDataType)) > memoryCapacity)
     {

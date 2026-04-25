@@ -22,6 +22,41 @@ import torch.nn as nn
 from .. import model_utils
 
 
+from transformers.cache_utils import Cache
+
+class MockQwen35Cache(Cache):
+    def __init__(self, states, layer_types):
+        self.layer_types = layer_types
+        self.key_cache = [None] * len(states)
+        self.value_cache = [None] * len(states)
+        self.conv_states = [None] * len(states)
+        self.recurrent_states = [None] * len(states)
+        for i, state in enumerate(states):
+            if isinstance(state, tuple):
+                if len(state) == 2 and state[0].dim() == 3:
+                    self.conv_states[i] = state[0]
+                    self.recurrent_states[i] = state[1]
+                else:
+                    self.key_cache[i], self.value_cache[i] = state
+            elif state.dim() == 5:
+                self.key_cache[i] = state
+                self.value_cache[i] = state
+            else:
+                self.recurrent_states[i] = state
+    def __len__(self): return len(self.key_cache)
+    def get_seq_length(self, layer_idx=0):
+        # Find first attention layer to get seq len
+        for k in self.key_cache:
+            if k is not None: return k.shape[2]
+        return 0
+    def get_mask_sizes(self, query_length: int, layer_idx: int) -> Tuple[int, int]:
+        return query_length + self.get_seq_length(layer_idx), 0
+    @property
+    def has_previous_state(self):
+        return any(k is not None for k in self.key_cache)
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        return key_states, value_states
+
 class EdgeLLMModel(nn.Module):
     """
     Base wrapper for EdgeLLM models.
@@ -48,6 +83,54 @@ class EdgeLLMHybridModel(nn.Module):
 
     def forward(self, *args, **kwargs) -> Union[Tuple, Dict[str, torch.Tensor]]:
         """Forward pass for hybrid models."""
+        # Clean up kwargs to avoid double-passing
+        for key in ["input_ids", "attention_mask", "position_ids", "past_key_values", 
+                    "inputs_embeds", "use_cache", "output_hidden_states", "return_dict"]:
+            kwargs.pop(key, None)
+            
+        # Mapping for Qwen 3.5 TextModel.forward
+        # During jit.trace, args has the interleaved structure from llm_export.py
+        # It's now a FLAT list of states.
+        if len(args) > 5:
+            num_layers = self.language_model.config.num_hidden_layers
+            layer_types = self.language_model.config.layer_types
+            inputs_embeds = args[0]
+            
+            # Extract states based on layer types
+            state_idx = 1
+            past_key_values_list = []
+            for ltype in layer_types:
+                if "full_attention" in ltype:
+                    past_key_values_list.append(args[state_idx])
+                    state_idx += 1
+                else:
+                    # GatedDeltaNet has TWO states: conv and recurrent
+                    past_key_values_list.append((args[state_idx], args[state_idx+1]))
+                    state_idx += 2
+            
+            # Custom tensors
+            custom_names = ["rope_rotary_cos_sin", "context_lengths", "last_token_ids", 
+                            "kvcache_start_index", "position_ids", "attention_mask"]
+            for i, name in enumerate(custom_names):
+                offset = state_idx + i
+                if len(args) > offset:
+                    kwargs[name] = args[offset]
+            
+            # Wrap in Mock Cache
+            past_key_values = MockQwen35Cache(past_key_values_list, layer_types)
+                
+            # Directly call forward to bypass any remaining decorators
+            # We must use keyword arguments to be safe
+            return self.language_model.forward(
+                input_ids=None,
+                attention_mask=kwargs.pop("attention_mask", None),
+                position_ids=kwargs.pop("position_ids", None),
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=True,
+                **kwargs
+            )
+
         return self.language_model(*args, **kwargs)
 
 
@@ -59,10 +142,16 @@ class EdgeLLMHybridModelForCausalLM(nn.Module):
     def __init__(self,
                  hf_model: nn.Module,
                  reduced_vocab_size: Optional[int] = None,
-                 vocab_map: Optional[torch.Tensor] = None):
+                 vocab_map: Optional[torch.Tensor] = None,
+                 trt_native_ops: bool = False):
         super().__init__()
         self.config = hf_model.config
         self.torch_dtype = hf_model.dtype
+
+        # Replace layers with TRT native versions if requested
+        if trt_native_ops:
+            from ..layers.layers import replace_decoder_layers_with_trt_native
+            hf_model = replace_decoder_layers_with_trt_native(hf_model, trt_native_ops=True)
 
         # Extract language model from hf_model if nested (e.g. Qwen2MambaForCausalLM)
         language_model = getattr(hf_model, "model", hf_model)
@@ -82,6 +171,24 @@ class EdgeLLMHybridModelForCausalLM(nn.Module):
         else:
             self.lm_head = lm_head
 
+    @property
+    def num_attention_layers(self):
+        config = self.config
+        if hasattr(config, "text_config"):
+            config = config.text_config
+        if hasattr(config, "layer_types"):
+            return sum(1 for t in config.layer_types if "full_attention" in t)
+        return getattr(config, "num_attention_layers", 0)
+
+    @property
+    def num_mamba_layers(self):
+        config = self.config
+        if hasattr(config, "text_config"):
+            config = config.text_config
+        if hasattr(config, "layer_types"):
+            return sum(1 for t in config.layer_types if "linear_attention" in t or "mamba" in t)
+        return getattr(config, "num_mamba_layers", 0)
+
     def forward(self, *args, **kwargs) -> Union[Tuple, Dict[str, torch.Tensor]]:
         """Forward pass for hybrid causal LM."""
         outputs = self.model(*args, **kwargs)
@@ -98,7 +205,37 @@ class EdgeLLMHybridModelForCausalLM(nn.Module):
                 attentions=outputs.attentions if hasattr(outputs, 'attentions') else None,
             )
 
-        return (logits, ) + outputs[1:]
+        # Combine outputs in the expected order for llm_export.py
+        final_outputs = [logits]
+        
+        # Handle hidden states if requested
+        should_output_hidden_states = getattr(self, "output_hidden_states", False) or kwargs.get("output_hidden_states", False)
+        if should_output_hidden_states:
+            final_outputs.append(hidden_states)
+            
+        # Extract present states from Cache object
+        if hasattr(outputs, "past_key_values") and outputs.past_key_values is not None:
+            cache = outputs.past_key_values
+            # The order must match the layer_types order
+            num_layers = self.model.language_model.config.num_hidden_layers
+            layer_types = self.model.language_model.config.layer_types
+            for i in range(num_layers):
+                ltype = layer_types[i]
+                if "full_attention" in ltype:
+                    # key_cache and value_cache might be 4D or 5D. 
+                    # If 5D, they are already stacked.
+                    k = cache.key_cache[i]
+                    v = cache.value_cache[i]
+                    if k.dim() == 4:
+                        final_outputs.append(torch.stack([k, v], dim=1))
+                    else:
+                        final_outputs.append(k) # Already stacked
+                else:
+                    # GatedDeltaNet has TWO states: conv and recurrent
+                    final_outputs.append(cache.conv_states[i])
+                    final_outputs.append(cache.recurrent_states[i])
+        
+        return tuple(final_outputs)
 
 
 class EdgeLLMModelForCausalLM(nn.Module):
@@ -157,14 +294,33 @@ class EdgeLLMModelForCausalLM(nn.Module):
         attention_pos_id = None
         attention_mask_input = None
 
-        # Determine if this is a tracing call or a standard call
+        # Determine total state tensors based on layer types
+        is_qwen3_5 = getattr(self.model.config, "model_type", "") in ["qwen3_5", "qwen3_5_text", "qwen3_5_moe_text"]
+        layer_types = getattr(self.model.config, "layer_types", [])
+        
+        # In Qwen 3.5, each layer has exactly ONE state (either 5D KV or 4D Recurrent)
+        # For older Mamba, some might have 2. For now, assume 1:1 mapping for Qwen 3.5.
+        num_layers = len(layer_types) if layer_types else self.config.num_hidden_layers
+        
         if len(args) >= num_layers + 1:
-            # Order: inputs_embeds, KV0, KV1, ..., KVn-1, rope, context, last, kv_start, pos, attn
+            # Order: inputs_embeds, State0, State1, ..., StateN-1, rope, context, last, kv_start, pos, attn
             inputs_embeds = args[0]
             
-            past_key_values_list = []
+            # Construct interleaved past_key_values for transformers
+            # We'll use a custom list that contains both 5D and 4D states
+            interleaved_states = []
             for i in range(num_layers):
-                past_key_values_list.append(args[1 + i])
+                state = args[1 + i]
+                if state.dim() == 5:
+                    # Attention KV: [B, 2, H, S, D] -> Unstack to (K, V)
+                    interleaved_states.append((state[:, 0, ...], state[:, 1, ...]))
+                else:
+                    # Recurrent state: [B, H, D, D] or [B, D, K]
+                    interleaved_states.append(state)
+            
+            from transformers.cache_utils import DynamicCache
+            # Note: We may need a custom Cache class if transformers doesn't like 4D tensors in DynamicCache
+            past_key_values = interleaved_states 
             
             offset = 1 + num_layers
             rope_rotary_cos_sin = args[offset]
@@ -174,11 +330,16 @@ class EdgeLLMModelForCausalLM(nn.Module):
             attention_pos_id = args[offset + 4]
             attention_mask_input = args[offset + 5]
             
-            # Convert to DynamicCache
-            # In transformers v5, DynamicCache expects separate K and V tensors
+            # Convert to DynamicCache for transformer layers
+            # Recurrent states will be handled separately by the model forward
             unstacked = [(t[:, 0, ...], t[:, 1, ...]) for t in past_key_values_list]
             from transformers.cache_utils import DynamicCache
             past_key_values = DynamicCache(tuple(unstacked))
+            
+            # Pack recurrent states if needed
+            # (Assuming the model forward knows how to handle these as kwargs)
+            kwargs["conv_states"] = conv_states
+            kwargs["ssm_states"] = ssm_states
         else:
             # Standard call
             inputs_embeds = kwargs.get("inputs_embeds")
@@ -196,13 +357,18 @@ class EdgeLLMModelForCausalLM(nn.Module):
         should_output_hidden_states = self.output_hidden_states or kwargs.get("output_hidden_states", False)
 
         # Call underlying model using keyword arguments
+        # Thoroughly clean kwargs to avoid multiple values for the same argument
+        # These are all explicitly passed as keyword arguments below
+        for key in ["input_ids", "attention_mask", "position_ids", "past_key_values", 
+                    "inputs_embeds", "use_cache", "output_hidden_states", "return_dict"]:
+            kwargs.pop(key, None)
+        
         outputs = self.model(
             input_ids=None,
             attention_mask=attention_mask_input,
             position_ids=attention_pos_id,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            use_cache=True,
             output_hidden_states=should_output_hidden_states,
             return_dict=True,
             rope_rotary_cos_sin=rope_rotary_cos_sin, # Pass RoPE tensor!
@@ -218,6 +384,12 @@ class EdgeLLMModelForCausalLM(nn.Module):
         if last_token_ids is not None:
             # We must use it in a way that doesn't change the output but forces inclusion
             logits = logits + 0 * last_token_ids.view(-1)[0].to(logits.dtype)
+        
+        if context_lengths is not None:
+            logits = logits + 0 * context_lengths.view(-1)[0].to(logits.dtype)
+            
+        if kvcache_start_index is not None:
+            logits = logits + 0 * kvcache_start_index.view(-1)[0].to(logits.dtype)
         
         # Combine outputs in the expected order for llm_export.py
         final_outputs = [logits]

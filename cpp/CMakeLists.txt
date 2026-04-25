@@ -39,10 +39,7 @@ set(FMHA_EXCLUDE_DEFINITIONS "")
 
 # Build a list of required FMHA SM versions based on target architectures. Some
 # SM versions reuse cubins from other SM versions at runtime.
-set(REQUIRED_FMHA_SM_VERSIONS ${CMAKE_CUDA_ARCHITECTURES})
-
-# Forcefully include Blackwell variants so their cubins are available at runtime
-list(APPEND REQUIRED_FMHA_SM_VERSIONS 100 101 110)
+set(REQUIRED_FMHA_SM_VERSIONS ${CMAKE_CUDA_ARCHITECTURES} 80 86 87 89 100 101 110)
 
 # SM 110 uses SM 101 FMHA cubins at runtime
 if(110 IN_LIST CMAKE_CUDA_ARCHITECTURES AND NOT 101 IN_LIST
@@ -94,13 +91,12 @@ set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 add_library(
   edgellmCore STATIC
-  $<TARGET_OBJECTS:edgellm_shared_objs>
   ${COMMON_CU_SRCS}
   ${MULTIMODAL_CPP_SRCS}
   ${RUNTIME_CPP_SRCS}
   ${PROFILER_CPP_SRCS})
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
-target_link_libraries(edgellmCore PRIVATE dl)
+target_link_libraries(edgellmCore PRIVATE edgellmKernels dl)
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
@@ -118,7 +114,8 @@ target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB} dl)
 
 # Generate the TensorRT plugin shared libraries
 file(GLOB_RECURSE PLUGIN_CPP_SRCS "plugins/*.cpp")
-add_library(NvInfer_edgellm_plugin SHARED ${PLUGIN_CPP_SRCS})
+file(GLOB_RECURSE PLUGIN_CU_SRCS "plugins/*.cu")
+add_library(NvInfer_edgellm_plugin SHARED ${PLUGIN_CPP_SRCS} ${PLUGIN_CU_SRCS})
 set_target_properties(NvInfer_edgellm_plugin PROPERTIES VERSION 1.0 SOVERSION 1)
 set_target_properties(NvInfer_edgellm_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
                                                         ${CMAKE_BINARY_DIR})

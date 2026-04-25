@@ -72,41 +72,44 @@ class Eagle3DraftModel(nn.Module):
         """
         super().__init__()
         self.config = config
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-        self.draft_vocab_size = getattr(config, "draft_vocab_size",
-                                        config.vocab_size)
+        cfg = config
+        if hasattr(cfg, "text_config"):
+            cfg = cfg.text_config
+        self.padding_idx = getattr(cfg, "pad_token_id", 0)
+        self.vocab_size = cfg.vocab_size
+        self.draft_vocab_size = getattr(cfg, "draft_vocab_size",
+                                        cfg.vocab_size)
         self.register_buffer(
             "d2t", torch.empty(self.draft_vocab_size, dtype=torch.int32))
 
         # Handle target hidden size for fusion
-        self.target_hidden_size = config.target_hidden_size if hasattr(
-            config, "target_hidden_size") else config.hidden_size
-        self.hidden_size = config.hidden_size
+        self.target_hidden_size = cfg.target_hidden_size if hasattr(
+            cfg, "target_hidden_size") else cfg.hidden_size
+        self.hidden_size = cfg.hidden_size
 
         # Fusion layer for combining hidden states
-        bias = getattr(config, "bias", False)
+        bias = getattr(cfg, "bias", False)
         self.fc = nn.Linear(self.target_hidden_size * 3,
                             self.hidden_size,
                             bias=bias)
 
-        self.embed_tokens = nn.Embedding(config.vocab_size,
-                                         config.hidden_size,
-                                         padding_idx=config.pad_token_id)
+        self.embed_tokens = nn.Embedding(cfg.vocab_size,
+                                         cfg.hidden_size,
+                                         padding_idx=self.padding_idx)
 
         # Decoder layers using our custom EdgeLLMDecoderLayer with config
         self.layers = nn.ModuleList([
-            EdgeLLMDecoderLayer(config, index, eagle3_draft=True)
-            for index in range(config.num_hidden_layers)
+            EdgeLLMDecoderLayer(cfg, index, eagle3_draft=True)
+            for index in range(cfg.num_hidden_layers)
         ])
 
         # RMS normalization layer
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = LlamaRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
         self.log_softmax = nn.LogSoftmax(dim=-1)
 
         # Language model head for token prediction
-        self.lm_head = nn.Linear(config.hidden_size,
+        self.lm_head = nn.Linear(cfg.hidden_size,
                                  self.draft_vocab_size,
                                  bias=False)
 

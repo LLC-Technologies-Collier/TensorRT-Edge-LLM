@@ -12,6 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+print("DEBUG: layers.py module loaded/reloaded")
+import sys; sys.stdout.flush()
+
 import math
 from typing import Any, Optional, Tuple, Union
 
@@ -134,22 +137,26 @@ class EdgeLLMAttention(nn.Module):
         super().__init__()
 
         # Copy configuration attributes from the original attention module
-        self.hidden_size: int = attention_module.config.hidden_size
-        self.num_key_value_heads: int = attention_module.config.num_key_value_heads
-        self.num_attention_heads: int = attention_module.config.num_attention_heads
+        cfg = attention_module.config
+        if hasattr(cfg, "text_config"):
+            cfg = cfg.text_config
+        
+        self.hidden_size: int = cfg.hidden_size
+        self.num_key_value_heads: int = cfg.num_key_value_heads
+        self.num_attention_heads: int = cfg.num_attention_heads
         assert self.num_attention_heads % self.num_key_value_heads == 0, \
             f"num_attention_heads ({self.num_attention_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})"
         self.num_key_value_groups: int = self.num_attention_heads // self.num_key_value_heads
 
         # Set head dimension
-        if hasattr(attention_module.config, 'head_dim'):
-            self.head_dim: int = attention_module.config.head_dim
+        if hasattr(cfg, 'head_dim'):
+            self.head_dim: int = cfg.head_dim
         else:
-            self.head_dim: int = attention_module.config.hidden_size // self.num_attention_heads
+            self.head_dim: int = cfg.hidden_size // self.num_attention_heads
 
         # Sliding window size (from model config, None = no sliding window)
         self.sliding_window_size: Optional[int] = getattr(
-            attention_module.config, 'sliding_window', None) or None
+            cfg, 'sliding_window', None) or None
 
         self.qkv_proj = EdgeLLMQKVProj(attention_module, eagle3_draft)
         self.o_proj = attention_module.o_proj
@@ -333,6 +340,44 @@ class EdgeLLMAttention(nn.Module):
 
         return attn_output
 
+
+def replace_decoder_layers_with_trt_native(model: nn.Module, trt_native_ops: bool = True) -> nn.Module:
+    """Replace decoder layers with optimized TRT native versions."""
+    if not trt_native_ops:
+        return model
+        
+    # Find the language model (e.g. model.model or model.transformer or self)
+    language_model = getattr(model, "model", getattr(model, "transformer", model))
+    if not hasattr(language_model, "layers"):
+        # If it's already a wrapper like EdgeLLMHybridModelForCausalLM
+        if hasattr(model, "model") and hasattr(model.model, "language_model"):
+            language_model = model.model.language_model
+            
+    if not hasattr(language_model, "layers"):
+        print("DEBUG: Could not find 'layers' attribute to replace.")
+        return model
+        
+    print(f"DEBUG TRTNative: Replacing {len(language_model.layers)} decoder layers...")
+    torch_dtype = next(language_model.parameters()).dtype
+    
+    new_layers = nn.ModuleList()
+    for i, layer in enumerate(language_model.layers):
+        new_layer = EdgeLLMDecoderLayerTRTNative(layer, torch_dtype, layer_index=i)
+        
+        # Ensure unique parameters to prevent JIT de-duplication
+        for name, param in new_layer.named_parameters():
+            if param.is_meta:
+                continue
+            new_param = nn.Parameter(torch.zeros_like(param), requires_grad=False)
+            parts = name.split('.')
+            curr = new_layer
+            for p in parts[:-1]: curr = getattr(curr, p)
+            setattr(curr, parts[-1], new_param)
+            
+        new_layers.append(new_layer)
+        
+    language_model.layers = new_layers
+    return model
 
 class EdgeLLMDecoderLayer(nn.Module):
     """
@@ -708,7 +753,8 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
                 
             from ..models.qwen3_5_moe_trtnative import Qwen3_5MoeGatedDeltaNetTRTNative
             self.self_attn = Qwen3_5MoeGatedDeltaNetTRTNative(
-                attn_module, eagle3_draft=self.eagle3_draft)
+                attn_module, eagle3_draft=self.eagle3_draft, layer_idx=getattr(self, "layer_index", 0))
+
         else:
             attn_module = getattr(decoder_layer, "self_attn", 
                                  getattr(decoder_layer, "attn", 
@@ -726,7 +772,8 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
                 print(f"  Layer {layer_idx}: Using Gated Delta Net wrapper for {type(attn_module).__name__}")
                 from ..models.qwen3_5_moe_trtnative import Qwen3_5MoeGatedDeltaNetTRTNative
                 self.self_attn = Qwen3_5MoeGatedDeltaNetTRTNative(
-                    attn_module, eagle3_draft=self.eagle3_draft)
+                    attn_module, eagle3_draft=self.eagle3_draft, layer_idx=getattr(self, "layer_index", 0))
+
             else:
                 # Standard Attention Layer (SDPA)
                 # SHAPE PARADOX: TensorRT FFMHA only supports head_dim <= 128.
@@ -755,8 +802,7 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
                 
                 from .attention_trt import EdgeLLMAttentionTRTNative
                 self.self_attn = EdgeLLMAttentionTRTNative(
-                    attn_module, eagle3_draft=self.eagle3_draft)
-
+                    attn_module, eagle3_draft=self.eagle3_draft, layer_idx=getattr(self, "layer_index", 0))
     def _init_with_config(self, config: Any):
         # Construct new components from config (for draft models)
         self.post_attention_layernorm = LlamaRMSNorm(
@@ -787,33 +833,24 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        rope_rotary_cos_sin: torch.Tensor,
-        context_lengths: torch.Tensor,
-        kvcache_start_index: torch.Tensor,
-        kv_cache: torch.Tensor,
+        rope_rotary_cos_sin: torch.Tensor = None,
+        context_lengths: torch.Tensor = None,
+        kvcache_start_index: torch.Tensor = None,
+        kv_cache: torch.Tensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Any] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass through the decoder layer for ONNX export.
-        
-        Args:
-            hidden_states: Input hidden states of shape (batch, seq_len, embed_dim)
-            rope_rotary_cos_sin: RoPE rotary embeddings of shape (batch, seq_len, head_dim)
-            context_lengths: Context length tensor of shape (batch,)
-            kvcache_start_index: Start index of KV cache of shape (kv_cache_start_batch_size,), required
-            kv_cache: Fused Key/Value cache (batch, 2, num_heads, capacity, head_dim)
-            attention_mask: Attention mask of shape (batch, seq_len, seq_len + past_len), optional
-            position_ids: Position IDs of shape (batch, seq_len), optional
-            inputs_embeds: Input embeddings for EAGLE3 draft (batch, seq_len, hidden_size), optional
+        # Handle naming mismatch between TextModel (plural) and Layer (singular)
+        if past_key_value is None and "past_key_values" in kwargs:
+            past_key_value = kwargs.pop("past_key_values")
             
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: (hidden_states, present_kv_cache)
-        """
-        if hasattr(self, "layer_index"):
-            print(f"DEBUG Layer {self.layer_index}: forward hidden_states={hidden_states.shape}")
-        
         residual = hidden_states
 
         if self.eagle3_draft:
@@ -840,6 +877,10 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
             kvcache_start_index=kvcache_start_index,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            past_key_value=past_key_value,
+            position_embeddings=position_embeddings,
+            **kwargs
         )
 
         if self.laurel is not None:

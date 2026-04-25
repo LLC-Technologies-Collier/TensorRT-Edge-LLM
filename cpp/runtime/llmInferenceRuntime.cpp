@@ -201,7 +201,7 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
         }
         mHostPackedInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
             rt::DeviceType::kCPU, DataType::kINT32, "LLMInferenceRuntime::mHostPackedInputIds");
-        mOutputLogits = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize}, rt::DeviceType::kGPU,
+        mOutputLogits = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength, mEngineConfig.outputVocabSize}, rt::DeviceType::kGPU,
             DataType::kFLOAT, "LLMInferenceRuntime::mOutputLogits");
         mSelectedIndices = rt::Tensor({mEngineConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT32,
             "LLMInferenceRuntime::mSelectedIndices");
@@ -464,7 +464,7 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
 
     check::check(mInputIds.reshape({activeBatchSize, packedInputLength}), "Tensor reshape failed");
     check::check(mHostContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
-    check::check(mOutputLogits.reshape({activeBatchSize, mEngineConfig.outputVocabSize}), "Tensor reshape failed");
+    check::check(mOutputLogits.reshape({activeBatchSize, packedInputLength, mEngineConfig.outputVocabSize}), "Tensor reshape failed");
 
     CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), mHostPackedInputIds.rawPointer(),
         activeBatchSize * packedInputLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
@@ -748,6 +748,7 @@ bool LLMInferenceRuntime::handleRequest(
                 + ",Computed=" + std::to_string(tokenCount.totalComputedTokens) + "]")
                 .c_str(),
             nvtx_colors::BLUE);
+        check::check(mOutputLogits.reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.outputVocabSize}), "Tensor reshape failed");
 
         bool prefillStatus = mLLMEngineRunner->executePrefillStep(mInputsEmbeds, mHostContextLengths, deepstackEmbeds,
             mOutputLogits, rt::OptionalOutputTensor{std::nullopt}, stream);
@@ -840,7 +841,7 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
     {
         check::check(mSelectedIndices.reshape({batchSize, 1}), "Tensor reshape failed");
         check::check(mInputsEmbeds.reshape({batchSize, 1, mEngineConfig.hiddenSize}), "Tensor reshape failed");
-        check::check(mOutputLogits.reshape({batchSize, mEngineConfig.outputVocabSize}), "Tensor reshape failed");
+        check::check(mOutputLogits.reshape({batchSize, 1, mEngineConfig.outputVocabSize}), "Tensor reshape failed");
 
         captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
             mInputsEmbeds, mOutputLogits, mEmptyLoraWeightsName, stream);

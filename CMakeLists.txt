@@ -189,7 +189,7 @@ if(BUILD_UNIT_TESTS)
   # Define project root path for tests to access resources
   target_compile_definitions(unitTest
                              PRIVATE PROJECT_ROOT_DIR="${CMAKE_SOURCE_DIR}")
-  target_link_libraries(unitTest PRIVATE gtest gtest_main edgellmCore
+  target_link_libraries(unitTest PRIVATE gtest gtest_main edgellmCore edgellmBuilder NvInfer_edgellm_plugin commonLibraryExt
                                          ${CUDART_LIB} ${CUDA_DRIVER_LIB})
   add_cross_build_link_options(unitTest)
 endif()

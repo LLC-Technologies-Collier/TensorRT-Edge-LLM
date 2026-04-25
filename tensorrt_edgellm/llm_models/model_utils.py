@@ -777,13 +777,14 @@ def load_llm_model(
                 gc.collect()
 
         is_hybrid = hasattr(hf_model.config, 'layers_block_type') or \
-                    getattr(hf_model.config, 'model_type', '') == 'qwen3_5_moe_text'
+                    getattr(hf_model.config, 'model_type', '') in ['qwen3_5_moe_text', 'qwen3_5', 'qwen3_5_text']
 
-        if is_hybrid and not trt_native_ops:
+        if is_hybrid:
             print("Detected hybrid (Mamba+Attention) architecture")
             edge_model = EdgeLLMHybridModelForCausalLM(hf_model,
                                                        reduced_vocab_size,
-                                                       vocab_map)
+                                                       vocab_map,
+                                                       trt_native_ops=trt_native_ops)
         elif not trt_native_ops:
             edge_model = {}
             edge_model["model"] = EdgeLLMModelForCausalLM(

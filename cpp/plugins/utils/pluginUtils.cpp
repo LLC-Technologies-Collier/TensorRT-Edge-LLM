@@ -31,10 +31,14 @@ extern "C" bool initEdgellmPlugins(void* logger, char const* libNamespace)
     auto& registry = *getPluginRegistry();
     int32_t nbCreators = 0;
     nvinfer1::IPluginCreator* const* list = registry.getPluginCreatorList(&nbCreators);
+    
+    fprintf(stderr, "[DEBUG] initEdgellmPlugins: Registry has %d creators\n", nbCreators);
     for (int32_t i = 0; i < nbCreators; ++i)
     {
         if (list[i])
         {
+            fprintf(stderr, "  - %s (Namespace: '%s', Version: %s)\n", 
+                    list[i]->getPluginName(), list[i]->getPluginNamespace(), list[i]->getPluginVersion());
             list[i]->setPluginNamespace(ns);
         }
     }
@@ -63,7 +67,7 @@ void applyThorSMRenumberWAR(int32_t& smVersion)
     // Loading SM 101 cubins on SM 110 silently corrupts the driver context and causes fatal CUDA errors.
     if (smVersion >= 100)
     {
-        smVersion = 89;
+        smVersion = 100;
     }
     fprintf(stderr, "[DEBUG] applyThorSMRenumberWAR: smVersion %d -> %d\n", orig, smVersion);
 }

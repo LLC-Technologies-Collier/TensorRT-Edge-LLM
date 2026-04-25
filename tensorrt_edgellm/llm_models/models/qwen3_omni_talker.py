@@ -419,6 +419,8 @@ def create_qwen3_omni_dummy_inputs(
     past_len = 0
 
     model_config = model.config
+    if model_config.model_type in ["qwen3_omni_thinker", "qwen3_asr", "qwen3_5"]:
+        model_config = model_config.text_config
     hidden_size = model_config.hidden_size
     num_layers = model_config.num_hidden_layers
     num_kv_heads = model_config.num_key_value_heads

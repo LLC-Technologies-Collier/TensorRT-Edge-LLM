@@ -138,27 +138,6 @@ def export_onnx(model,
     else:
         custom_opsets["trt_edgellm"] = 1
 
-    # Force reload of core modules to ensure fresh symbolic functions and wrappers are used
-    import importlib
-    import sys
-    
-    # Reload modules in order of dependency
-    modules_to_reload = [
-        "tensorrt_edgellm.common",
-        "tensorrt_edgellm.version",
-        "tensorrt_edgellm.llm_models.layers.attention_trt",
-        "tensorrt_edgellm.llm_models.models.qwen3_5_moe_trtnative",
-        "tensorrt_edgellm.llm_models.layers.layers",
-        "tensorrt_edgellm.llm_models.models.llm_model_trtnative",
-    ]
-    
-    for mod_name in modules_to_reload:
-        if mod_name in sys.modules:
-            print(f"DEBUG: Reloading {mod_name}...")
-            importlib.reload(sys.modules[mod_name])
-    
-    print("DEBUG: Force-reloaded core SDK modules.")
-
     with torch.inference_mode():
 
 

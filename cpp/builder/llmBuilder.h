@@ -128,6 +128,8 @@ struct LLMBuilderConfig
     int64_t maxVerifyTreeSize{60}; //!< Maximum length of input_ids passed into Eagle base model for tree verification
     int64_t maxDraftTreeSize{60};  //!< Maximum length of input_ids passed into Eagle draft model for draft generation
     bool useTrtNativeOps{false};   //!< Whether to use TensorRT native operations instead of custom plugin
+    std::string quantization{""};  //!< Quantization mode (e.g. "nvfp4")
+    int32_t builderOptimizationLevel{3}; //!< TensorRT builder optimization level
     
     // VLM and Weight Streaming members
     bool isVlm{false};                 //!< Whether this is a Vision-Language Model
@@ -147,6 +149,8 @@ struct LLMBuilderConfig
         json["max_lora_rank"] = maxLoraRank;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
         json["trt_native_ops"] = useTrtNativeOps;
+        json["quantization"] = quantization;
+        json["builder_optimization_level"] = builderOptimizationLevel;
         // Only include Eagle-specific fields when Eagle is enabled
         if (eagleBase)
         {
@@ -201,6 +205,14 @@ struct LLMBuilderConfig
         if (json.contains("trt_native_ops"))
         {
             config.useTrtNativeOps = json["trt_native_ops"];
+        }
+        if (json.contains("quantization"))
+        {
+            config.quantization = json["quantization"];
+        }
+        if (json.contains("weight_streaming_budget"))
+        {
+            config.weightStreamingBudget = json["weight_streaming_budget"];
         }
         return config;
     }

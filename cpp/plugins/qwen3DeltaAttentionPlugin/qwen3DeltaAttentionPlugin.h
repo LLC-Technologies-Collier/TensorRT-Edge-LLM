@@ -15,92 +15,90 @@ namespace trt_edgellm
 namespace plugins
 {
 
-//! \brief TensorRT plugin for Qwen 3.5 Gated Delta Attention
-//!
-//! Registered as "qwen3_delta_attention" under the "trt_edgellm" ONNX domain.
-//!
-//! Implements the gated delta rule linear attention from Qwen 3.5:
-//!   WY representation based chunked linear attention.
-//!
-//! Inputs:
-//!   [0] q          [batch, (seq_len,) n_q_heads, head_size]
-//!   [1] k          [batch, (seq_len,) n_kv_heads, head_size]
-//!   [2] v          [batch, (seq_len,) n_kv_heads, head_size]
-//!   [3] g          [batch, (seq_len,) n_q_heads]           (forget gate)
-//!   [4] beta       [batch, (seq_len,) n_q_heads]           (update rate)
-//!   [5] state_in   [batch, n_q_heads, head_size, head_size] (recurrent state)
-//!
-//! Outputs:
-//!   [0] output     [batch, (seq_len,) n_q_heads, head_size]
-//!   [1] state_out  [batch, n_q_heads, head_size, head_size]
-class Qwen3DeltaAttentionPlugin : public nvinfer1::IPluginV3,
-                                  public nvinfer1::IPluginV3OneCore,
-                                  public nvinfer1::IPluginV3OneBuild,
-                                  public nvinfer1::IPluginV3OneRuntime
+class Qwen3DeltaAttentionPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
-    Qwen3DeltaAttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize);
+    Qwen3DeltaAttentionPlugin(std::string name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, float eps = 1e-6f);
+
+    Qwen3DeltaAttentionPlugin(std::string const& name, void const* data, size_t length);
 
     Qwen3DeltaAttentionPlugin() = delete;
-    Qwen3DeltaAttentionPlugin(Qwen3DeltaAttentionPlugin const&) = delete;
-    ~Qwen3DeltaAttentionPlugin() override;
 
-    // IPluginV3OneCore
-    nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
-    nvinfer1::IPluginV3* clone() noexcept override;
-    char const* getPluginName() const noexcept override;
-    char const* getPluginVersion() const noexcept override;
-    char const* getPluginNamespace() const noexcept override;
+    ~Qwen3DeltaAttentionPlugin() override = default;
 
-    // IPluginV3OneBuild
+    // IPluginV2DynamicExt Methods
+    nvinfer1::IPluginV2DynamicExt* clone() const noexcept override;
     int32_t getNbOutputs() const noexcept override;
-    int32_t getOutputDataTypes(nvinfer1::DataType* outputTypes, int32_t nbOutputs, nvinfer1::DataType const* inputTypes,
-        int32_t nbInputs) const noexcept override;
-    int32_t getOutputShapes(nvinfer1::DimsExprs const* inputs, int32_t nbInputs, nvinfer1::DimsExprs const* shapeInputs,
-        int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs,
+    nvinfer1::DimsExprs getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs, int32_t nbInputs,
         nvinfer1::IExprBuilder& exprBuilder) noexcept override;
-    bool supportsFormatCombination(int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs,
-        int32_t nbOutputs) noexcept override;
-    int32_t configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
+    bool supportsFormatCombination(
+        int32_t pos, nvinfer1::PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept override;
+    void configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
         nvinfer1::DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept override;
-    size_t getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
-        nvinfer1::DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept override;
-
-    // IPluginV3OneRuntime
+    size_t getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int32_t nbInputs,
+        nvinfer1::PluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept override;
     int32_t enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
-    int32_t onShapeChange(nvinfer1::PluginTensorDesc const* in, int32_t nbInputs, nvinfer1::PluginTensorDesc const* out,
-        int32_t nbOutputs) noexcept override;
-    nvinfer1::IPluginV3* attachToContext(nvinfer1::IPluginResourceContext* context) noexcept override;
-    nvinfer1::PluginFieldCollection const* getFieldsToSerialize() noexcept override;
+    size_t getSerializationSize() const noexcept override;
+    void serialize(void* buffer) const noexcept override;
+    
+    // IPluginV2 Methods
+    char const* getPluginType() const noexcept override;
+    char const* getPluginVersion() const noexcept override;
+    int32_t initialize() noexcept override;
+    void terminate() noexcept override;
+    void destroy() noexcept override;
+    void setPluginNamespace(char const* pluginNamespace) noexcept override;
+    char const* getPluginNamespace() const noexcept override;
+    nvinfer1::DataType getOutputDataType(int32_t index, nvinfer1::DataType const* inputTypes, int32_t nbInputs) const noexcept override;
 
-    void setPluginNamespace(char const* pluginNamespace) noexcept;
+// Input/Output indices
+static constexpr int32_t kIN_Q_IDX{0};
+static constexpr int32_t kIN_K_IDX{1};
+static constexpr int32_t kIN_V_IDX{2};
+static constexpr int32_t kIN_G_IDX{3};
+static constexpr int32_t kIN_BETA_IDX{4};
+static constexpr int32_t kIN_STATE_IDX{5};
+static constexpr int32_t kIN_Z_IDX{6};
+static constexpr int32_t kIN_NORM_WEIGHT_IDX{7};
 
-protected:
-    std::string mLayerName;
-    std::string mNamespace;
+static constexpr int32_t kOUT_OUTPUT_IDX{0};
+static constexpr int32_t kOUT_STATE_IDX{1};
 
-    int32_t mNumQHeads{};
-    int32_t mNumKVHeads{};
-    int32_t mHeadSize{};
+static constexpr int32_t kNUM_INPUTS{8};
+static constexpr int32_t kNUM_OUTPUTS{2};
 
-    std::vector<nvinfer1::PluginField> mDataToSerialize;
-    nvinfer1::PluginFieldCollection mFCToSerialize;
+private:
+std::string mLayerName;
+std::string mNamespace;
+int32_t mNumQHeads;
+int32_t mNumKVHeads;
+int32_t mHeadSize;
+float mEps{1e-6f};
+
 };
 
-class Qwen3DeltaAttentionPluginCreator : public nvinfer1::IPluginCreatorV3One
+class Qwen3DeltaAttentionPluginCreator : public nvinfer1::IPluginCreator
 {
 public:
     Qwen3DeltaAttentionPluginCreator();
+
     ~Qwen3DeltaAttentionPluginCreator() override = default;
 
     char const* getPluginName() const noexcept override;
+
     char const* getPluginVersion() const noexcept override;
+
     nvinfer1::PluginFieldCollection const* getFieldNames() noexcept override;
-    void setPluginNamespace(char const* pluginNamespace) noexcept;
+
+    nvinfer1::IPluginV2* createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept override;
+
+    nvinfer1::IPluginV2* deserializePlugin(
+        char const* name, void const* serialData, size_t serialLength) noexcept override;
+
+    void setPluginNamespace(char const* pluginNamespace) noexcept override;
+
     char const* getPluginNamespace() const noexcept override;
-    nvinfer1::IPluginV3* createPlugin(
-        char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept override;
 
 private:
     static nvinfer1::PluginFieldCollection mFieldCollection;

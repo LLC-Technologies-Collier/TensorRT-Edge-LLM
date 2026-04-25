@@ -92,7 +92,10 @@ class EdgeLLMModelTRTNative(nn.Module):
             # We use zeros to avoid NaNs during tracing.
             # For massive models, we can use "meta" device if needed, but standard tracing 
             # requires same-device tensors.
-            replacement_device = "meta" if self.config.hidden_size > 10000 else next(new_layer.parameters()).device
+            cfg = self.config
+            if hasattr(cfg, "text_config"):
+                cfg = cfg.text_config
+            replacement_device = "meta" if cfg.hidden_size > 10000 else next(new_layer.parameters()).device
             
             for name, param in new_layer.named_parameters():
                 new_param = nn.Parameter(torch.zeros_like(param, device=replacement_device), requires_grad=False)
@@ -104,8 +107,12 @@ class EdgeLLMModelTRTNative(nn.Module):
             self.layers.append(new_layer)
 
         # Set max_position_embeddings on attention modules from the model's config
+        cfg = self.config
+        if hasattr(cfg, "text_config"):
+            cfg = cfg.text_config
         for layer in self.layers:
-            layer.self_attn.max_position_embeddings = self.config.max_position_embeddings
+            if hasattr(layer, "self_attn"):
+                layer.self_attn.max_position_embeddings = cfg.max_position_embeddings
 
     @property
     def device(self):
@@ -298,17 +305,26 @@ class EdgeLLMModelTRTNative(nn.Module):
         kv_caches_names = []
         
         # SHAPE PARADOX: All layers must match the global KV head count.
-        # For Qwen 3.5 0.8B with head_dim=128, we use 32 KV heads globally.
-        unified_heads = 32
+        # Standardize on head_dim=128 for plugin compatibility.
+        # We calculate unified_heads based on the maximum volume across standard and hybrid layers.
+        linear_kv_heads = getattr(model_config, 'linear_num_key_heads', 0)
+        unified_heads = max(num_kv_heads, linear_kv_heads)
         unified_dim = head_dim
         
         print(f"DEBUG TRTNative: Global KV cache heads={unified_heads} dim={unified_dim}")
 
         # Match max_kv_cache from the build pipeline (32K context)
         max_kv_cache_capacity = 32768
+        layer_types = getattr(model_config, "layer_types", ["full_attention"] * num_layers)
 
         for i in range(num_layers):
-            kv_shape = (dummy_batch_size, 2, unified_heads, max_kv_cache_capacity, unified_dim)
+            is_linear = (layer_types[i] == "linear_attention")
+            if is_linear:
+                # Recurrent state for Gated Delta Rule: [B, H, D, D]
+                kv_shape = (dummy_batch_size, unified_heads, unified_dim, unified_dim)
+            else:
+                # Standard KV cache: [B, 2, H, S, D]
+                kv_shape = (dummy_batch_size, 2, unified_heads, max_kv_cache_capacity, unified_dim)
             
             kv_caches.append(torch.zeros(kv_shape, dtype=torch.float16, device=device))
             kv_caches_names.append(f'kv_cache_{i}')
@@ -468,8 +484,12 @@ class Eagle3DraftModelTRTNative(nn.Module):
                                  bias=False)
 
         # Set max_position_embeddings on attention modules from the model's config
+        cfg = self.config
+        if hasattr(cfg, "text_config"):
+            cfg = cfg.text_config
         for layer in self.layers:
-            layer.self_attn.max_position_embeddings = self.config.max_position_embeddings
+            if hasattr(layer, "self_attn"):
+                layer.self_attn.max_position_embeddings = cfg.max_position_embeddings
 
         # This logic is adapted from the transformers implementation for Qwen2.5-VL
         # See:https://github.com/huggingface/transformers/blob/v4.55.2/src/transformers/models/qwen2_5_vl/configuration_qwen2_5_vl.py#L262
@@ -698,17 +718,26 @@ class Eagle3DraftModelTRTNative(nn.Module):
         kv_caches_names = []
         
         # SHAPE PARADOX: All layers must match the global KV head count.
-        # For Qwen 3.5 0.8B with head_dim=128, we use 32 KV heads globally.
-        unified_heads = 32
+        # Standardize on head_dim=128 for plugin compatibility.
+        # We calculate unified_heads based on the maximum volume across standard and hybrid layers.
+        linear_kv_heads = getattr(model_config, 'linear_num_key_heads', 0)
+        unified_heads = max(num_kv_heads, linear_kv_heads)
         unified_dim = head_dim
         
         print(f"DEBUG TRTNative: Global KV cache heads={unified_heads} dim={unified_dim}")
 
         # Match max_kv_cache from the build pipeline (32K context)
         max_kv_cache_capacity = 32768
+        layer_types = getattr(model_config, "layer_types", ["full_attention"] * num_layers)
 
         for i in range(num_layers):
-            kv_shape = (dummy_batch_size, 2, unified_heads, max_kv_cache_capacity, unified_dim)
+            is_linear = (layer_types[i] == "linear_attention")
+            if is_linear:
+                # Recurrent state for Gated Delta Rule: [B, H, D, D]
+                kv_shape = (dummy_batch_size, unified_heads, unified_dim, unified_dim)
+            else:
+                # Standard KV cache: [B, 2, H, S, D]
+                kv_shape = (dummy_batch_size, 2, unified_heads, max_kv_cache_capacity, unified_dim)
             
             kv_caches.append(torch.zeros(kv_shape, dtype=torch.float16, device=device))
             kv_caches_names.append(f'kv_cache_{i}')

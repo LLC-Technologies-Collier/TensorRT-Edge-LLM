@@ -253,6 +253,11 @@ public:
     //! @throws std::runtime_error if a CUDA driver error occurs
     void loadFMHAKernels()
     {
+#ifdef EXCLUDE_SM_89
+        fprintf(stderr, "[DEBUG] loadFMHAKernels: EXCLUDE_SM_89 is DEFINED\n");
+#else
+        fprintf(stderr, "[DEBUG] loadFMHAKernels: EXCLUDE_SM_89 is NOT defined\n");
+#endif
         fprintf(stderr, "[DEBUG] loadFMHAKernels: sm=%d, dataType=%d, count=%d\n", (int)mSMVersion, (int)mDataType, (int)mKernelMetaCount);
         if (!mFunctions.empty())
         {
@@ -294,9 +299,9 @@ public:
                 if (status != CUDA_SUCCESS) {
                     const char* errStr;
                     cuGetErrorString(status, &errStr);
-                    fprintf(stderr, "[FATAL] ContextFMHARunner::loadFMHAKernels: Failed to load cubin for %s (smVersion=%d, status=%d: %s)\n",
+                    fprintf(stderr, "[WARNING] ContextFMHARunner::loadFMHAKernels: Failed to load cubin for %s (smVersion=%d, status=%d: %s). Skipping.\n",
                             kernelMeta.mFuncName, (int)mSMVersion, (int)status, errStr);
-                    throw std::runtime_error("CUDA driver API error in cuModuleLoadData");
+                    continue;
                 }
                 fprintf(stderr, "[DEBUG] loadFMHAKernels: Successfully loaded module for %s\n", kernelMeta.mFuncName);
                 mModules.insert(std::make_pair(kernelMeta.mCubin, hModule));
@@ -556,7 +561,8 @@ bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t 
 bool ContextFMHARunner::loadContextFMHAKernels(int32_t smVersion, nvinfer1::DataType dataType)
 {
     int32_t searchSmVersion = smVersion;
-    if (searchSmVersion == 110) searchSmVersion = 101;
+    if (searchSmVersion == 110) searchSmVersion = 100;
+
     else if (searchSmVersion > 101 && searchSmVersion < 120) searchSmVersion = 101;
     else if (searchSmVersion >= 120) searchSmVersion = 120;
     else if (searchSmVersion >= 100 && searchSmVersion <= 101) searchSmVersion = searchSmVersion; // Keep native
@@ -598,14 +604,12 @@ void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& para
         unrollKey = true; // Flash kernels have mUnrollStep != 0
 
         // TMA alignment: Blackwell hardware swizzling REQUIRES tensor_size to be multiple of 8.
-        // If the actual buffer (total_s) is not aligned, we MUST fall back to non-TMA kernels
-        // (Tiled=0) which use standard global memory access to avoid IMA.
-        if ((mSmVersion == 100 || mSmVersion == 101 || mSmVersion == 110) && (total_s % 8 != 0)) {
-            fprintf(stderr, "[DEBUG] total_s=%lu is not multiple of 8, forcing non-TMA (Tiling=0) for Blackwell safety\n", total_s);
+        // Force non-TMA kernels (Tiled=0) for Blackwell ALWAYS to avoid IMA and misaligned address errors.
+        if (mSmVersion == 100 || mSmVersion == 101 || mSmVersion == 110) {
+            fprintf(stderr, "[DEBUG] Forcing non-TMA (Tiling=0) for Blackwell ALWAYS safety (total_s=%lu)\n", total_s);
             fflush(stderr);
             tiledKey = false;
         }
-
         // Tiled kernels (64_128 or 128_128) use FP32 accumulation
         // Non-tiled kernels (64_32 or 64_64) use FP16 accumulation
         if (tiledKey) {
@@ -772,12 +776,23 @@ void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& para
         ));
     }
     
-    void* kernelParams[] = {&params, nullptr};
+    alignas(16) void* kernelParams[] = {&params, nullptr};
     // Right now we onlu use flash attention kernel
     // flash attention supports any sequence length (0 in kernel meta)
     int32_t unroll = (params.s + kernelInfo.mUnrollStep - 1) / kernelInfo.mUnrollStep;
     // on Ampere/Ada flash attention, we launch blocks (steps, h, b)
     // TODO: Generalize the logic for more architectures.
+    
+    if (params.cu_q_seqlens != nullptr) {
+        fprintf(stderr, "  params.cu_q_seqlens = %p\n", (void*)params.cu_q_seqlens);
+        // Explicitly synchronize before copying to ensure GPU data is valid
+        cudaStreamSynchronize(stream);
+        int32_t host_cu_q[2], host_cu_kv[2];
+        cudaMemcpy(host_cu_q, params.cu_q_seqlens, 2 * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(host_cu_kv, params.cu_kv_seqlens, 2 * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "  cuQ: [%d, %d], cuKV: [%d, %d], s=%d, b=%d, h=%d\n",
+                host_cu_q[0], host_cu_q[1], host_cu_kv[0], host_cu_kv[1], params.s, params.b, params.h);
+    }
     
     fprintf(stderr, "[DEBUG] Pre cuLaunchKernel... \n");
     fflush(stderr);

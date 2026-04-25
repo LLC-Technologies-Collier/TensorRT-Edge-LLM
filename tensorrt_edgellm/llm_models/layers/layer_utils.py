@@ -37,12 +37,15 @@ class EdgeLLMQKVProj(nn.Module):
         config = getattr(attention_module, "config", None)
         
         if config is not None:
-            num_attention_heads: int = config.num_attention_heads
-            num_key_value_heads: int = config.num_key_value_heads
-            if hasattr(config, 'head_dim'):
-                head_dim: int = config.head_dim
+            cfg = config
+            if hasattr(cfg, "text_config"):
+                cfg = cfg.text_config
+            num_attention_heads: int = cfg.num_attention_heads
+            num_key_value_heads: int = cfg.num_key_value_heads
+            if hasattr(cfg, 'head_dim'):
+                head_dim: int = cfg.head_dim
             else:
-                head_dim: int = config.hidden_size // num_attention_heads
+                head_dim: int = cfg.hidden_size // num_attention_heads
         else:
             # Fallback for modules like Qwen3_5MoeGatedDeltaNet that don't store config
             # Qwen3.5 MoE GatedDeltaNet uses num_k_heads, num_v_heads, head_k_dim, head_v_dim

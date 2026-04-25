@@ -14,97 +14,32 @@
 # limitations under the License.
 """
 TensorRT Edge-LLM - A Python package for quantizing and exporting LLMs for edge deployment.
-
-This package provides utilities for quantizing large language models using NVIDIA ModelOpt
-and preparing them for ONNX export and edge deployment. It supports various quantization
-schemes including FP8, INT4 AWQ, and NVFP4 for efficient inference on edge devices.
-
-Key Features:
-    - LLM quantization with calibration support
-    - Multiple quantization schemes (FP8, INT4 AWQ, NVFP4)
-    - Automatic model type detection
-    - HuggingFace model compatibility
-    - Quantization configuration management
-    - ONNX export for LLM and visual models
-    - LoRA pattern insertion and weight processing
-
-Example Usage:
-    .. code-block:: python
-
-        from tensorrt_edgellm import (
-            quantize_and_save_llm,
-            quantize_and_save_draft,
-            export_llm_model,
-            export_draft_model,
-            visual_export,
-            insert_lora_and_save,
-            process_lora_weights_and_save
-        )
-        
-        # Quantize and save a standard LLM model
-        quantize_and_save_llm(
-            model_dir="path/to/model",
-            output_dir="path/to/output",
-            quantization="fp8",
-            dtype="fp16",
-            dataset_dir="cnn_dailymail"
-        )
-
-        # Quantize and save an EAGLE draft model
-        quantize_and_save_draft(
-            base_model_dir="path/to/base_model",
-            draft_model_dir="path/to/draft_model",
-            output_dir="path/to/output",
-            quantization="fp8",
-            dtype="fp16",
-            dataset_dir="cnn_dailymail"
-        )
-        
-        # Export standard LLM to ONNX
-        export_llm_model(
-            model_dir="path/to/model",
-            output_dir="path/to/output",
-            device="cuda"
-        )
-        
-        # Export EAGLE base model to ONNX
-        export_llm_model(
-            model_dir="path/to/model",
-            output_dir="path/to/output",
-            is_eagle_base=True
-        )
-        
-        # Export EAGLE draft model to ONNX
-        export_draft_model(
-            draft_model_dir="path/to/draft_model",
-            output_dir="path/to/output",
-            base_model_dir="path/to/base_model",
-        )
-        
-        # Export visual model to ONNX
-        visual_export(
-            model_dir="path/to/model",
-            output_dir="path/to/output",
-            dtype="fp16"
-        )
-        
-        # Insert LoRA patterns into ONNX models
-        insert_lora_and_save(
-            onnx_dir="path/to/onnx_model"
-        )
-        
-        # Process LoRA weights
-        process_lora_weights_and_save(
-            input_dir="path/to/adapter",
-            output_dir="path/to/output"
-        )
-        # Reduce vocabulary
-        reduce_vocab_size(
-            model_dir="path/to/model",
-            output_dir="path/to/output",
-            reduced_vocab_size=30000
-        )
 """
+
+def patch_qwen3_5_config():
+    """Monkey-patch Qwen3.5 config classes to expose text_config attributes directly."""
+    try:
+        import transformers
+        # Try to patch Qwen3_5Config if it exists
+        if hasattr(transformers, "Qwen3_5Config"):
+            cls = transformers.Qwen3_5Config
+            for attr in ["hidden_size", "num_attention_heads", "num_key_value_heads", 
+                        "max_position_embeddings", "num_hidden_layers", "rms_norm_eps", "vocab_size"]:
+                if not hasattr(cls, attr):
+                    setattr(cls, attr, property(lambda self, a=attr: getattr(self.text_config, a)))
+        
+        # Try to patch Qwen3_5MoeConfig if it exists
+        if hasattr(transformers, "Qwen3_5MoeConfig"):
+            cls = transformers.Qwen3_5MoeConfig
+            for attr in ["hidden_size", "num_attention_heads", "num_key_value_heads", 
+                        "max_position_embeddings", "num_hidden_layers", "rms_norm_eps", "vocab_size"]:
+                if not hasattr(cls, attr):
+                    setattr(cls, attr, property(lambda self, a=attr: getattr(self.text_config, a)))
+    except ImportError:
+        pass
+
+# Apply the patch immediately upon import
+patch_qwen3_5_config()
 
 from .onnx_export.audio_export import audio_export
 from .onnx_export.llm_export import export_draft_model, export_llm_model

@@ -83,8 +83,8 @@ inline void* loadEdgellmPluginLib(void) noexcept
     auto initPlugins = reinterpret_cast<InitPluginsFn>(dlsym(persistentHandle, "initEdgellmPlugins"));
     if (initPlugins)
     {
-        LOG_DEBUG("loadEdgellmPluginLib(): Calling initEdgellmPlugins with trt namespace");
-        initPlugins(static_cast<nvinfer1::ILogger*>(&gLogger), "trt");
+        LOG_DEBUG("loadEdgellmPluginLib(): Calling initEdgellmPlugins with global namespace");
+        initPlugins(static_cast<nvinfer1::ILogger*>(&gLogger), "");
         gLogger.setLevel(gLogger.getLevel());
     }
 

@@ -63,11 +63,7 @@ import traceback
 def main() -> None:
     from tensorrt_edgellm.onnx_export.llm_export import export_llm_model
     import tensorrt_edgellm
-    import sys
-    print(f"DEBUG: sys.path={sys.path}")
-    print(f"DEBUG: tensorrt_edgellm location={tensorrt_edgellm.__file__}")
-    sys.stdout.flush()
-
+    
     parser = argparse.ArgumentParser(
         description="Export standard/Eagle3 base LLM model to ONNX format")
     parser.add_argument(
@@ -151,10 +147,7 @@ def main() -> None:
         help="Whether to apply Qwen 3.5 grouped-interleaved weight packing for hybrid layers"
     )
 
-    print("DEBUG: About to parse arguments...")
-    sys.stdout.flush()
     args = parser.parse_args()
-    print("DEBUG: Arguments parsed.")
 
     try:
         # Export model(s)

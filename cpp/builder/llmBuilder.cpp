@@ -50,7 +50,9 @@ LLMBuilder::~LLMBuilder() noexcept
 
 bool LLMBuilder::build()
 {
-    printf("[Builder] LLMBuilder::build() entered\n");
+    printf("================================================================================\n");
+    printf("[Builder] LLMBuilder::build() ENTERED (VERSION_MARKER_V105)\n");
+    printf("================================================================================\n");
     // Load plugin library
     void* pluginHandles = loadEdgellmPluginLib();
     if (!pluginHandles)
@@ -103,11 +105,25 @@ bool LLMBuilder::build()
         printf("[Builder] Parsing ONNX model: %s\n", onnxFilePath.c_str());
     }
 
-    // Parse ONNX model
-    auto parser = parseOnnxModel(network.get(), onnxFilePath);
+    // Set up parser
+    auto parser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, trt_edgellm::gLogger));
     if (!parser)
     {
-        printf("[Builder] FAILED to parse ONNX model\n");
+        printf("[Builder] FAILED to create ONNX parser\n");
+        return false;
+    }
+
+    printf("[Builder] ONNX parser created. Starting parseFromFile for %s\n", onnxFilePath.c_str());
+    
+    // Attempt to catch parser internal issues before SEGV
+    if (!parser->parseFromFile(onnxFilePath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kVERBOSE)))
+    {
+        for (int32_t i = 0; i < parser->getNbErrors(); ++i)
+        {
+            auto* error = parser->getError(i);
+            printf("[Builder]   Parser Error [%d]: (code %d) %s at %s:%d\n", 
+                   i, static_cast<int>(error->code()), error->desc(), error->file(), error->line());
+        }
         return false;
     }
     printf("[Builder] ONNX model parsed successfully\n");
@@ -134,6 +150,30 @@ bool LLMBuilder::build()
         return false;
     }
     printf("[Builder] Optimization profiles setup successfully\n");
+
+    // Network diagnostic dump
+    printf("[Builder] Network Diagnostic Dump:\n");
+    for (int32_t i = 0; i < network->getNbLayers(); ++i)
+    {
+        auto* layer = network->getLayer(i);
+        printf("  Layer %d: name=%s, type=%d\n", i, layer->getName(), static_cast<int>(layer->getType()));
+        for (int32_t j = 0; j < layer->getNbInputs(); ++j)
+        {
+            auto* input = layer->getInput(j);
+            if (input == nullptr) {
+                printf("    Input %d: NULL!\n", j);
+            } else {
+                printf("    Input %d: name=%s, dtype=%d, dims=%s\n", 
+                       j, input->getName(), static_cast<int>(input->getType()), dimsToString(input->getDimensions()).c_str());
+            }
+        }
+        for (int32_t j = 0; j < layer->getNbOutputs(); ++j)
+        {
+            auto* output = layer->getOutput(j);
+            printf("    Output %d: name=%s, dtype=%d, dims=%s\n", 
+                   j, output->getName(), static_cast<int>(output->getType()), dimsToString(output->getDimensions()).c_str());
+        }
+    }
 
     // Create engine directory
     if (!std::filesystem::exists(mEngineDir))
@@ -257,6 +297,10 @@ bool LLMBuilder::parseConfig()
     {
         mRotaryDim = mHeadSize;
     }
+    
+    // Ensure mModelConfig has the final values
+    mModelConfig["head_dim"] = static_cast<int32_t>(mHeadSize);
+    mModelConfig["num_key_value_heads"] = static_cast<int32_t>(mNumKVHeads);
 
     mNumMambaLayers = mModelConfig.value("num_mamba_layers", 0);
     mMambaNumHeads = mModelConfig.value("mamba_num_heads", 0);
@@ -287,7 +331,7 @@ bool LLMBuilder::parseConfig()
 bool LLMBuilder::setupLLMOptimizationProfiles(
     nvinfer1::IBuilder& builder, nvinfer1::IBuilderConfig& config, nvinfer1::INetworkDefinition const& network)
 {
-    std::cerr << "DEBUG: setupLLMOptimizationProfiles started (v73_fix_applied_cerr)" << std::endl;
+    printf("[Builder] setupLLMOptimizationProfiles: Using DUAL profiles (Context=0, Generation=1)...\n");
     auto* contextProfile = builder.createOptimizationProfile();
     auto* generationProfile = builder.createOptimizationProfile();
 
@@ -311,11 +355,16 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     {
         auto* input = network.getInput(i);
         const char* name = input->getName();
+        nvinfer1::Dims dims = input->getDimensions();
+        printf("[Builder] setupLLMOptimizationProfiles: Input %d: %s, dims=%s\n", (int)i, name, dimsToString(dims).c_str());
         
-        // If profile doesn't have it, add a static one based on its current dims
-        if (contextProfile->getDimensions(name, nvinfer1::OptProfileSelector::kMIN).nbDims < 0)
+        // Check both profiles
+        bool inContext = (contextProfile->getDimensions(name, nvinfer1::OptProfileSelector::kMIN).nbDims >= 0);
+        bool inGeneration = (generationProfile->getDimensions(name, nvinfer1::OptProfileSelector::kMIN).nbDims >= 0);
+
+        if (!inContext || !inGeneration)
         {
-            LOG_DEBUG("Adding catch-all static profile for missing input: %s", name);
+            LOG_DEBUG("Adding catch-all static profile for input: %s (Context=%d, Gen=%d)", name, inContext, inGeneration);
             nvinfer1::Dims dims = input->getDimensions();
             nvinfer1::Dims minDims = dims;
             nvinfer1::Dims optDims = dims;
@@ -326,18 +375,21 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
                 if (dims.d[j] < 0)
                 {
                     minDims.d[j] = 1;
-                    optDims.d[j] = (j == 1 || j == 3) ? 128 : 1;
+                    optDims.d[j] = (j == 1 || j == 3) ? mHeadSize : 1;
                     maxDims.d[j] = (j == 1 || j == 3) ? mBuilderConfig.maxKVCacheCapacity : 1;
                 }
             }
 
-            contextProfile->setDimensions(name, nvinfer1::OptProfileSelector::kMIN, minDims);
-            contextProfile->setDimensions(name, nvinfer1::OptProfileSelector::kOPT, optDims);
-            contextProfile->setDimensions(name, nvinfer1::OptProfileSelector::kMAX, maxDims);
-            
-            generationProfile->setDimensions(name, nvinfer1::OptProfileSelector::kMIN, minDims);
-            generationProfile->setDimensions(name, nvinfer1::OptProfileSelector::kOPT, optDims);
-            generationProfile->setDimensions(name, nvinfer1::OptProfileSelector::kMAX, maxDims);
+            if (!inContext) {
+                contextProfile->setDimensions(name, nvinfer1::OptProfileSelector::kMIN, minDims);
+                contextProfile->setDimensions(name, nvinfer1::OptProfileSelector::kOPT, optDims);
+                contextProfile->setDimensions(name, nvinfer1::OptProfileSelector::kMAX, maxDims);
+            }
+            if (!inGeneration) {
+                generationProfile->setDimensions(name, nvinfer1::OptProfileSelector::kMIN, minDims);
+                generationProfile->setDimensions(name, nvinfer1::OptProfileSelector::kOPT, optDims);
+                generationProfile->setDimensions(name, nvinfer1::OptProfileSelector::kMAX, maxDims);
+            }
         }
     }
 
@@ -359,11 +411,12 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         return false;
     }
 
-    LOG_DEBUG("%s", printOptimizationProfile(contextProfile, "context_profile", &network).c_str());
-    LOG_DEBUG("%s", printOptimizationProfile(generationProfile, "generation_profile", &network).c_str());
-
-    config.addOptimizationProfile(contextProfile);
-    config.addOptimizationProfile(generationProfile);
+    // CRITICAL: Order matters! Runtime expects Context at index 0 and Generation at index 1.
+    int32_t ctxIdx = config.addOptimizationProfile(contextProfile);
+    int32_t genIdx = config.addOptimizationProfile(generationProfile);
+    
+    printf("[Builder] setupLLMOptimizationProfiles: Added Context profile at index %d, Generation profile at index %d\n", ctxIdx, genIdx);
+    LOG_INFO("Added Context profile at index %d, Generation profile at index %d", ctxIdx, genIdx);
 
     return true;
 }
@@ -417,13 +470,27 @@ bool LLMBuilder::setupVanillaProfiles(nvinfer1::IOptimizationProfile& contextPro
 {
     bool result = true;
 
-    // Input embeddings - always dynamic
-    result &= setOptimizationProfile(&contextProfile, network, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
-    result &= setOptimizationProfile(&generationProfile, network, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}));
+    // Input embeddings - match fixed hidden dimension for strongly typed networks
+    int32_t embedsIdx = -1;
+    for (int32_t i = 0; i < network.getNbInputs(); ++i) {
+        if (std::string(network.getInput(i)->getName()) == binding_names::kInputsEmbeds) {
+            embedsIdx = i;
+            break;
+        }
+    }
+    
+    int32_t hiddenDim = mHiddenSize;
+    if (embedsIdx != -1) {
+        auto dims = network.getInput(embedsIdx)->getDimensions();
+        if (dims.d[2] >= 0) hiddenDim = dims.d[2];
+    }
+
+    nvinfer1::Dims minEmbeds = createDims({1, 1, hiddenDim});
+    nvinfer1::Dims optEmbeds = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, hiddenDim});
+    nvinfer1::Dims maxEmbeds = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, hiddenDim});
+
+    result &= setOptimizationProfile(&contextProfile, network, binding_names::kInputsEmbeds, minEmbeds, optEmbeds, maxEmbeds);
+    result &= setOptimizationProfile(&generationProfile, network, binding_names::kInputsEmbeds, minEmbeds, optEmbeds, maxEmbeds);
 
     // Last token IDs
     result &= setOptimizationProfile(&contextProfile, network, binding_names::kLastTokenIds, createDims({1, 1}),
@@ -442,13 +509,27 @@ bool LLMBuilder::setupEagleProfiles(nvinfer1::IOptimizationProfile& contextProfi
     int const maxTokens
         = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
 
-    // Input embeddings
-    result &= setOptimizationProfile(&contextProfile, network, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
-    result &= setOptimizationProfile(&generationProfile, network, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
+    // Input embeddings - match fixed hidden dimension for strongly typed networks
+    int32_t embedsIdx = -1;
+    for (int32_t i = 0; i < network.getNbInputs(); ++i) {
+        if (std::string(network.getInput(i)->getName()) == binding_names::kInputsEmbeds) {
+            embedsIdx = i;
+            break;
+        }
+    }
+    
+    int32_t hiddenDim = mHiddenSize;
+    if (embedsIdx != -1) {
+        auto dims = network.getInput(embedsIdx)->getDimensions();
+        if (dims.d[2] >= 0) hiddenDim = dims.d[2];
+    }
+
+    result &= setOptimizationProfile(&contextProfile, network, binding_names::kInputsEmbeds, createDims({1, 1, hiddenDim}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, hiddenDim}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, hiddenDim}));
+    result &= setOptimizationProfile(&generationProfile, network, binding_names::kInputsEmbeds, createDims({1, 1, hiddenDim}),
+        createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, hiddenDim}),
+        createDims({mBuilderConfig.maxBatchSize, maxTokens, hiddenDim}));
 
     // Last token IDs - 2D shape [batch_size, num_selected_tokens]
     result &= setOptimizationProfile(&contextProfile, network, binding_names::kLastTokenIds, createDims({1, 1}),
@@ -726,49 +807,110 @@ bool LLMBuilder::setupKVCacheProfiles(nvinfer1::IOptimizationProfile& contextPro
         if (mBuilderConfig.useTrtNativeOps)
         {
             if (isCombinedKV) {
-                // TRT attention with combined KV cache (exported via tuple)
-                // Shape: [batch, 2, num_kv_heads, seq_len, head_dim]
-                nvinfer1::Dims minKVCacheShape = createDims({1, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
-                nvinfer1::Dims optKVCacheShape = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
-                nvinfer1::Dims maxKVCacheShape = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
+                // Determine if it's Standard 5D [B, 2, H, S, D] or Recurrent 4D [B, H, D, D]
+                auto dims = network.getInput(kInputIdx)->getDimensions();
+                if (dims.nbDims == 4) {
+                    // Recurrent state for Gated Delta Rule
+                    int32_t heads = dims.d[1];
+                    int32_t headSize = dims.d[2];
+                    nvinfer1::Dims kvShape = createDims({1, heads, headSize, headSize});
+                    nvinfer1::Dims maxKvShape = createDims({mBuilderConfig.maxBatchSize, heads, headSize, headSize});
+                    
+                    printf("[Builder] Setting 4D profile for %s: heads=%d, headSize=%d\n", kName.c_str(), heads, headSize);
+                    
+                    result &= setOptimizationProfile(&contextProfile, network, kName.c_str(),
+                        kvShape, maxKvShape, maxKvShape);
+                    result &= setOptimizationProfile(&generationProfile, network, kName.c_str(),
+                        kvShape, maxKvShape, maxKvShape);
+                } else {
+                    // Standard TRT attention with combined KV cache (exported via tuple)
+                    // Shape: [batch, 2, num_kv_heads, seq_len, head_dim]
+                    int32_t heads = dims.d[2];
+                    int32_t headSize = dims.d[4];
+                    int32_t seqLen = dims.d[3];
+                    
+                    // Strongly typed networks require profile bounds to match fixed dimensions exactly.
+                    // If seqLen is not dynamic (-1), we must use its actual value for min/opt/max.
+                    int32_t minSeq = (seqLen < 0) ? 1 : seqLen;
+                    int32_t optSeq = (seqLen < 0) ? mBuilderConfig.maxInputLen / 2 : seqLen;
+                    int32_t maxSeq = (seqLen < 0) ? mBuilderConfig.maxKVCacheCapacity : seqLen;
+                    
+                    if (seqLen >= 0) {
+                        minSeq = optSeq = maxSeq = seqLen;
+                    }
 
-                result &= setOptimizationProfile(&contextProfile, network, kName.c_str(),
-                    minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-                result &= setOptimizationProfile(&generationProfile, network, kName.c_str(),
-                    minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+                    nvinfer1::Dims minKVCacheShape = createDims({1, 2, heads, minSeq, headSize});
+                    nvinfer1::Dims optKVCacheShape = createDims({mBuilderConfig.maxBatchSize, 2, heads, optSeq, headSize});
+                    nvinfer1::Dims maxKVCacheShape = createDims({mBuilderConfig.maxBatchSize, 2, heads, maxSeq, headSize});
+
+                    printf("[Builder] Setting 5D profile for %s: heads=%d, headSize=%d, seq=[%d,%d,%d]\n", 
+                           kName.c_str(), heads, headSize, minSeq, optSeq, maxSeq);
+
+                    result &= setOptimizationProfile(&contextProfile, network, kName.c_str(),
+                        minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+                    
+                    result &= setOptimizationProfile(&generationProfile, network, kName.c_str(),
+                        minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+                }
             } else {
                 // TRT attention: separate K and V caches
                 // Shape: [batch, num_kv_heads, seq_len, head_dim]
                 int32_t kHeads = mNumKVHeads;
                 int32_t kHeadSize = mHeadSize;
+                int32_t kSeqLen = mBuilderConfig.maxKVCacheCapacity;
                 if (kInputIdx != -1)
                 {
                     auto dims = network.getInput(kInputIdx)->getDimensions();
                     kHeads = dims.d[1];
                     kHeadSize = dims.d[3];
+                    kSeqLen = dims.d[2];
                 }
 
                 int32_t vHeads = mNumKVHeads;
                 int32_t vHeadSize = mHeadSize;
+                int32_t vSeqLen = mBuilderConfig.maxKVCacheCapacity;
                 if (vInputIdx != -1)
                 {
                     auto dims = network.getInput(vInputIdx)->getDimensions();
                     vHeads = dims.d[1];
                     vHeadSize = dims.d[3];
+                    vSeqLen = dims.d[2];
                 }
 
-                nvinfer1::Dims minKCacheShape = createDims({1, kHeads, mBuilderConfig.maxKVCacheCapacity, kHeadSize});
-                nvinfer1::Dims optKCacheShape = createDims({mBuilderConfig.maxBatchSize, kHeads, mBuilderConfig.maxKVCacheCapacity, kHeadSize});
-                nvinfer1::Dims maxKCacheShape = createDims({mBuilderConfig.maxBatchSize, kHeads, mBuilderConfig.maxKVCacheCapacity, kHeadSize});
+                // Match fixed dimensions for strongly typed networks
+                int32_t minKSeq = (kSeqLen < 0) ? 1 : kSeqLen;
+                int32_t optKSeq = (kSeqLen < 0) ? mBuilderConfig.maxKVCacheCapacity / 2 : kSeqLen;
+                int32_t maxKSeq = (kSeqLen < 0) ? mBuilderConfig.maxKVCacheCapacity : kSeqLen;
+
+                int32_t minVSeq = (vSeqLen < 0) ? 1 : vSeqLen;
+                int32_t optVSeq = (vSeqLen < 0) ? mBuilderConfig.maxKVCacheCapacity / 2 : vSeqLen;
+                int32_t maxVSeq = (vSeqLen < 0) ? mBuilderConfig.maxKVCacheCapacity : vSeqLen;
+
+                if (kSeqLen >= 0) {
+                    minKSeq = optKSeq = maxKSeq = kSeqLen;
+                }
+                if (vSeqLen >= 0) {
+                    minVSeq = optVSeq = maxVSeq = vSeqLen;
+                }
+
+                nvinfer1::Dims minKCacheShape = createDims({1, kHeads, minKSeq, kHeadSize});
+                nvinfer1::Dims optKCacheShape = createDims({mBuilderConfig.maxBatchSize, kHeads, optKSeq, kHeadSize});
+                nvinfer1::Dims maxKCacheShape = createDims({mBuilderConfig.maxBatchSize, kHeads, maxKSeq, kHeadSize});
+
+                printf("[Builder] Setting separate K profile for %s: heads=%d, headSize=%d, seq=[%d,%d,%d]\n", 
+                       kName.c_str(), kHeads, kHeadSize, minKSeq, optKSeq, maxKSeq);
 
                 result &= setOptimizationProfile(&contextProfile, network, kName.c_str(),
                     minKCacheShape, optKCacheShape, maxKCacheShape);
                 result &= setOptimizationProfile(&generationProfile, network, kName.c_str(),
                     minKCacheShape, optKCacheShape, maxKCacheShape);
 
-                nvinfer1::Dims minVCacheShape = createDims({1, vHeads, mBuilderConfig.maxKVCacheCapacity, vHeadSize});
-                nvinfer1::Dims optVCacheShape = createDims({mBuilderConfig.maxBatchSize, vHeads, mBuilderConfig.maxKVCacheCapacity, vHeadSize});
-                nvinfer1::Dims maxVCacheShape = createDims({mBuilderConfig.maxBatchSize, vHeads, mBuilderConfig.maxKVCacheCapacity, vHeadSize});
+                nvinfer1::Dims minVCacheShape = createDims({1, vHeads, minVSeq, vHeadSize});
+                nvinfer1::Dims optVCacheShape = createDims({mBuilderConfig.maxBatchSize, vHeads, optVSeq, vHeadSize});
+                nvinfer1::Dims maxVCacheShape = createDims({mBuilderConfig.maxBatchSize, vHeads, maxVSeq, vHeadSize});
+
+                printf("[Builder] Setting separate V profile for %s: heads=%d, headSize=%d, seq=[%d,%d,%d]\n", 
+                       vName.c_str(), vHeads, vHeadSize, minVSeq, optVSeq, maxVSeq);
 
                 result &= setOptimizationProfile(&contextProfile, network, vName.c_str(),
                     minVCacheShape, optVCacheShape, maxVCacheShape);
@@ -781,10 +923,6 @@ bool LLMBuilder::setupKVCacheProfiles(nvinfer1::IOptimizationProfile& contextPro
         {
             // Plugin path: combined KV cache with "2" dimension
             // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
-            
-            // Forced Super-Super-Shape Unification
-            int32_t heads = 64;
-            int32_t headSize = 256;
             
             // Use the consistent kv_cache_ naming convention from ONNX export
             std::string kvName = "kv_cache_" + std::to_string(i);
@@ -809,22 +947,44 @@ bool LLMBuilder::setupKVCacheProfiles(nvinfer1::IOptimizationProfile& contextPro
 
             // Extract actual heads and headSize from the network input to be safe
             auto dims = network.getInput(inputIdx)->getDimensions();
-            if (dims.nbDims == 5) {
-                heads = dims.d[2];
-                headSize = dims.d[4];
+
+            // Determine if it's Recurrent 4D [B, H, D, D] or Standard 5D [B, 2, H, S, D]
+            if (dims.nbDims == 4) {
+                int32_t heads = dims.d[1];
+                int32_t headSize = dims.d[2];
+                nvinfer1::Dims kvShape = createDims({1, heads, headSize, headSize});
+                nvinfer1::Dims maxKvShape = createDims({mBuilderConfig.maxBatchSize, heads, headSize, headSize});
+
+                printf("[Builder] Setting 4D plugin profile for %s: heads=%d, headSize=%d\n", kvName.c_str(), heads, headSize);
+
+                result &= setOptimizationProfile(&contextProfile, network, kvName.c_str(),
+                    kvShape, maxKvShape, maxKvShape);
+                result &= setOptimizationProfile(&generationProfile, network, kvName.c_str(),
+                    kvShape, maxKvShape, maxKvShape);
+            } else {
+                int32_t heads = dims.d[2];
+                int32_t headSize = dims.d[4];
+                int32_t seqLen = dims.d[3];
+
+                int32_t minSeq = (seqLen < 0) ? 1 : seqLen;
+                int32_t optSeq = (seqLen < 0) ? mBuilderConfig.maxInputLen / 2 : seqLen;
+                int32_t maxSeq = (seqLen < 0) ? mBuilderConfig.maxKVCacheCapacity : seqLen;
+
+                if (seqLen >= 0) minSeq = optSeq = maxSeq = seqLen;
+
+                nvinfer1::Dims minKVCacheShape = createDims({1, 2, heads, minSeq, headSize});
+                nvinfer1::Dims optKVCacheShape = createDims({mBuilderConfig.maxBatchSize, 2, heads, optSeq, headSize});
+                nvinfer1::Dims maxKVCacheShape = createDims({mBuilderConfig.maxBatchSize, 2, heads, maxSeq, headSize});
+
+                printf("[Builder] Setting 5D plugin profile for %s: heads=%d, headSize=%d, seq=[%d,%d,%d]\n", 
+                       kvName.c_str(), heads, headSize, minSeq, optSeq, maxSeq);
+
+                result &= setOptimizationProfile(&contextProfile, network, kvName.c_str(),
+                    minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+                result &= setOptimizationProfile(&generationProfile, network, kvName.c_str(),
+                    minKVCacheShape, optKVCacheShape, maxKVCacheShape);
             }
 
-            // Use 1 instead of 0 for min sequence length to avoid sanitizeDims defaulting to 1 in a way that breaks profiles
-            nvinfer1::Dims minKVCacheShape = createDims({1, 2, heads, 1, headSize});
-            nvinfer1::Dims optKVCacheShape
-                = createDims({mBuilderConfig.maxBatchSize, 2, heads, mBuilderConfig.maxKVCacheCapacity, headSize});
-            nvinfer1::Dims maxKVCacheShape
-                = createDims({mBuilderConfig.maxBatchSize, 2, heads, mBuilderConfig.maxKVCacheCapacity, headSize});
-
-            result &= setOptimizationProfile(&contextProfile, network, kvName.c_str(),
-                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-            result &= setOptimizationProfile(&generationProfile, network, kvName.c_str(),
-                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
         }
     }
 
@@ -910,6 +1070,9 @@ bool LLMBuilder::copyConfig()
     // Create a copy of mModelConfig and add builder config
     Json configWithBuilder = mModelConfig;
     configWithBuilder["builder_config"] = mBuilderConfig.toJson();
+    
+    // Ensure maxSupportedInputLength is consistent for runtime
+    configWithBuilder["max_supported_input_length"] = static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity);
 
     // Add detected num_deepstack_features if present (Qwen3VL models)
     configWithBuilder["num_deepstack_features"] = mNumDeepstackFeatures;
@@ -921,7 +1084,15 @@ bool LLMBuilder::copyConfig()
         LOG_ERROR("Failed to open target config file: %s", targetConfigPath.c_str());
         return false;
     }
+    
+    printf("[Builder] copyConfig: Exporting head_dim=%d, numKVHeads=%d, maxInputLen=%d to %s\n",
+           configWithBuilder["head_dim"].get<int32_t>(),
+           configWithBuilder["num_key_value_heads"].get<int32_t>(),
+           configWithBuilder["max_supported_input_length"].get<int32_t>(),
+           targetConfigPath.c_str());
+
     targetConfigFile << configWithBuilder.dump(2);
+    targetConfigFile.flush();
     targetConfigFile.close();
 
     LOG_INFO("Copied config.json with builder config to %s", targetConfigPath.c_str());
