@@ -1,0 +1,4 @@
+int64_t    T_IV
+C9h_LLM_Runtime    T_PTROBJ
+C9h_LLM_Session    T_PTROBJ
+C9h_LLM_Coral_Interpreter    T_PTROBJ
