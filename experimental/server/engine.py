@@ -377,10 +377,11 @@ class LLM:
                                      max_kv_cache_capacity)
         artifacts = _artifacts_dir_for_model(onnx_dir)
 
-        eagle = self._eagle_engine_dir
-        self._engine_dir = (eagle if eagle else os.path.join(
-            artifacts, "engine", cfg_tag, "llm"))
-        if not eagle and not os.path.exists(
+        spec_decode_engine_dir = self._eagle_engine_dir
+        self._engine_dir = (spec_decode_engine_dir
+                            if spec_decode_engine_dir else os.path.join(
+                                artifacts, "engine", cfg_tag, "llm"))
+        if not spec_decode_engine_dir and not os.path.exists(
                 os.path.join(self._engine_dir, "llm.engine")):
             self._build_engine()
         else:
@@ -450,10 +451,10 @@ class LLM:
         if self._visual_engine_dir:
             logger.info("Loading visual engine from %s ...",
                         self._visual_engine_dir)
-        eagle = self._eagle_engine_dir
-        if eagle:
+        spec_decode_engine_dir = self._eagle_engine_dir
+        if spec_decode_engine_dir:
             logger.info(
-                "Eagle spec-decode enabled (top_k=%d, step=%d, tree=%d)",
+                "Speculative decoding enabled (top_k=%d, step=%d, tree=%d)",
                 self._draft_top_k,
                 self._draft_step,
                 self._verify_tree_size,
@@ -688,9 +689,12 @@ class LLM:
                 enable_thinking=params.enable_thinking,
             ))
 
+        audio_buffers = _load_audio_buffers(self._rt, messages)
+
         request = self._rt.LLMGenerationRequest()
         req = self._rt.Request(messages=cpp_messages)
         req.image_buffers = image_buffers
+        req.audio_buffers = audio_buffers
         req.stop_strings = params.stop
         request.requests = [req]
         if stream_channel is not None:
@@ -960,6 +964,16 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
                                 "image",
                                 item.get("image", ""),
                             ))
+                    elif ct in ("audio", "input_audio", "audio_url"):
+                        # Audio bytes are decoded out-of-band by
+                        # `_load_audio_buffers`; the chat template just emits
+                        # an opaque audio placeholder here. The per-model
+                        # audio runner expands that into model-specific
+                        # special tokens (Qwen3: <|audio_start|> +
+                        # N×<|audio_pad|> + <|audio_end|>; Nemotron-Omni:
+                        # N×<so_embedding>).
+                        contents_list.append(
+                            rt_module.MessageContent("audio", ""))
                     else:
                         raise ValueError(f"Unsupported content type: {ct}")
         cpp_msg.contents = contents_list
@@ -982,3 +996,13 @@ def _load_image_buffers(rt_module, messages: List[Dict[str, Any]]):
                 if path and os.path.isfile(path):
                     images.append(rt_module.load_image_from_path(path))
     return images
+
+
+def _load_audio_buffers(rt_module, messages: List[Dict[str, Any]]):
+    """Load audio content from messages into AudioData buffers.
+
+    Returns an empty list when no audio is present, keeping the byte-identical
+    fast path for text-only and image-only requests.
+    """
+    from .audio_preprocess import load_audio_buffers
+    return load_audio_buffers(rt_module, messages)

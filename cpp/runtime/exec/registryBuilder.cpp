@@ -29,6 +29,23 @@ namespace rt
 // is no longer needed — every symbolic reference is a pointer-to-member of
 // `InferenceDims`, so the set of dims exists by construction of the type.
 
+void addRopeTensorSpecs(TensorRegistry& reg, LLMEngineConfig const& cfg)
+{
+    auto addRopeTensor = [&](char const* name, int32_t rotaryDim) {
+        reg.addTensor({name, TensorIO::kInput, nvinfer1::DataType::kFLOAT,
+            {sym(&InferenceDims::ropeBatch), sym(&InferenceDims::kvLen), fixed(rotaryDim)}});
+    };
+
+    if (cfg.useDualRope)
+    {
+        addRopeTensor(binding_names::kRopeCosSinSliding, cfg.slidingRotaryDim);
+        addRopeTensor(binding_names::kRopeCosSinFull, cfg.fullRotaryDim);
+        return;
+    }
+
+    addRopeTensor(binding_names::kRopeCosSin, cfg.rotaryDim);
+}
+
 TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int32_t> specDecodeBaseOutputHiddenDim)
 {
     TensorRegistry reg;
@@ -66,10 +83,10 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
 
-    // rope_rotary_cos_sin: [rope_batch, kv_len, rotaryDim] FLOAT
+    // RoPE cache inputs: single binding for single-RoPE models, explicit
+    // sliding/full bindings for mixed-attention dual-RoPE models.
     // For non-MRope, rope_batch is always 1 (TRT broadcasts); for MRope, rope_batch = activeBatchSize.
-    reg.addTensor({binding_names::kRopeCosSin, TensorIO::kInput, nvinfer1::DataType::kFLOAT,
-        {sym(&InferenceDims::ropeBatch), sym(&InferenceDims::kvLen), fixed(cfg.rotaryDim)}});
+    addRopeTensorSpecs(reg, cfg);
 
     // ---------------------------------------------------------------
     // Per-layer KV / recurrent / conv state (hybrid routing by layer_types)
@@ -128,13 +145,13 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
             addMambaTensor(binding_names::kConvStateTemplate, TensorIO::kInput, cfg.convStateDtype, convShape);
             addMambaTensor(binding_names::kPresentConvStateTemplate, TensorIO::kOutput, cfg.convStateDtype, convShape);
 
-            // MTP base only: per-layer intermediate state outputs the engine
-            // writes during prefill/tree-verify. The builder emits these only
-            // when `model_type == "mtp_base"`.
+            // Hybrid MTP/DFlash base only: per-layer intermediate state outputs
+            // written during prefill/verification so accepted recurrent/conv
+            // state snapshots can be committed after speculative verification.
             //
             // intermediate_recurrent_state_%d: [batch, seqLen, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
             // intermediate_conv_state_%d:      [batch, seqLen, convDim, convKernel]
-            if (cfg.specDecodeType == SpecDecodeMode::kMTP)
+            if (cfg.specDecodeType == SpecDecodeMode::kMTP || cfg.specDecodeType == SpecDecodeMode::kDFlash)
             {
                 std::vector<ShapeDim> const interRecShape{sym(&InferenceDims::batch), sym(&InferenceDims::seqLen),
                     fixed(cfg.recurrentStateNumHeads), fixed(cfg.recurrentStateHeadDim), fixed(cfg.recurrentStateSize)};
@@ -244,9 +261,9 @@ TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle)
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
 
-    // rope_rotary_cos_sin: [rope_batch, kv_len, rotaryDim] FLOAT
-    reg.addTensor({binding_names::kRopeCosSin, TensorIO::kInput, nvinfer1::DataType::kFLOAT,
-        {sym(&InferenceDims::ropeBatch), sym(&InferenceDims::kvLen), fixed(cfg.rotaryDim)}});
+    // RoPE cache inputs: single binding for single-RoPE models, explicit
+    // sliding/full bindings for mixed-attention dual-RoPE models.
+    addRopeTensorSpecs(reg, cfg);
 
     // attention_mask: [batch, attn_seq_len, packed_mask_len] INT32 — tree decoding mask
     // packed_mask_len = divUp(attn_seq_len, 32): each INT32 stores 32 mask bits.
@@ -289,6 +306,77 @@ TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle)
                 // Current draft engines are not expected to contain Mamba layers. If a
                 // future config exercises this branch it's a config error, not a
                 // registry-builder concern.
+                continue;
+            }
+            auto const& lc = cfg.kvLayerConfigs[localAttnIdx];
+            std::vector<ShapeDim> const shape{sym(&InferenceDims::batch), fixed(2), fixed(lc.numKVHeads),
+                sym(&InferenceDims::kvLen), fixed(lc.headDim)};
+            auto addKVCacheTensor = [&](char const* tmpl, TensorIO io) {
+                reg.addTensor({std::string(tmpl) + "_" + std::to_string(localAttnIdx), io, cfg.kvCacheDtype, shape});
+            };
+            addKVCacheTensor(binding_names::kPastKeyValuesTemplate, TensorIO::kInput);
+            addKVCacheTensor(binding_names::kPresentKeyValuesTemplate, TensorIO::kOutput);
+            ++localAttnIdx;
+        }
+    }
+
+    return reg;
+}
+
+TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle)
+{
+    check::check(bundle.draft.has_value(), "buildRegistryForDFlashDraft: bundle.draft must be set");
+    check::check(bundle.specConfig.has_value(), "buildRegistryForDFlashDraft: bundle.specConfig must be set");
+
+    TensorRegistry reg;
+    LLMEngineConfig const& cfg = *bundle.draft;
+    int32_t const draftHiddenSize = bundle.specConfig->draftHiddenSize;
+    int32_t const baseOutputHiddenDim = bundle.specConfig->baseOutputHiddenDim;
+    int32_t const draftVocabSize = cfg.outputVocabSize;
+
+    // inputs_embeds: [batch, seq_len, draftHiddenSize] HALF
+    reg.addTensor({binding_names::kInputsEmbeds, TensorIO::kInput, nvinfer1::DataType::kHALF,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(draftHiddenSize)}});
+
+    // dflash_target_hidden_concat: [batch, selectLen, baseOutputHiddenDim] HALF — target hidden delta
+    reg.addTensor({binding_names::kDFlashTargetHiddenConcat, TensorIO::kInput, nvinfer1::DataType::kHALF,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen), fixed(baseOutputHiddenDim)}});
+
+    // logits: [batch, seq_len, draftVocabSize] FLOAT
+    reg.addTensor({binding_names::kLogits, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(draftVocabSize)}});
+
+    // context_lengths: [batch] INT32
+    reg.addTensor(
+        {binding_names::kContextLengths, TensorIO::kInput, nvinfer1::DataType::kINT32, {sym(&InferenceDims::batch)}});
+
+    // kvcache_start_index: [startIndexLen] INT32
+    reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::startIndexLen)}});
+
+    // dflash_delta_lengths: [batch] INT32 — per-batch delta lengths for multi-batch
+    reg.addTensor({binding_names::kDFlashDeltaLengths, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch)}});
+
+    // rope_rotary_cos_sin: [ropeBatch, kvLen, rotaryDim] FLOAT
+    reg.addTensor({binding_names::kRopeCosSin, TensorIO::kInput, nvinfer1::DataType::kFLOAT,
+        {sym(&InferenceDims::ropeBatch), sym(&InferenceDims::kvLen), fixed(cfg.rotaryDim)}});
+
+    // attention_mask: [batch, attnMaskSeqLen, packedMaskLen] INT32
+    reg.addTensor({binding_names::kAttentionMask, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::attnMaskSeqLen), sym(&InferenceDims::packedMaskLen)}});
+
+    // attention_pos_id: [batch, attnMaskSeqLen] INT32
+    reg.addTensor({binding_names::kAttentionPosId, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::attnMaskSeqLen)}});
+
+    // Per-layer KV cache (plugin path: combined KV)
+    {
+        int32_t localAttnIdx = 0;
+        for (int32_t absIdx = 0; absIdx < static_cast<int32_t>(cfg.layerTypes.size()); ++absIdx)
+        {
+            if (cfg.layerTypes[absIdx] != rt::HybridCacheManager::LayerType::kAttention)
+            {
                 continue;
             }
             auto const& lc = cfg.kvLayerConfigs[localAttnIdx];

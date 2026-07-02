@@ -28,7 +28,8 @@
 # ENABLE_CUTE_DSL cache variable controls which kernel groups are linked:
 #   OFF      — disable entirely (default)
 #   ALL      — enable all groups found in metadata.json
-#   fmha     — enable only the FMHA group
+#   fmha     — enable only the Blackwell FMHA group
+#   ffpa     — enable only the Ampere FFPA FMHA group
 #   gdn      — enable only the GDN group
 #   fmha;gdn — semicolon-separated list of groups (CMake list syntax)
 #
@@ -41,6 +42,7 @@
 #
 # Per-group compile definitions set on each target:
 #   CUTE_DSL_FMHA_ENABLED  — set when the fmha group is active
+#   CUTE_DSL_FFPA_ENABLED  — set when the ffpa group is active
 #   CUTE_DSL_GDN_ENABLED   — set when the gdn group is active
 #   CUTE_DSL_SSD_ENABLED   — set when the ssd group is active
 #   CUTE_DSL_GEMM_ENABLED  — set when any gemm variant is active
@@ -350,11 +352,13 @@ function(cute_dsl_setup)
     set(_cute_dsl_cuda_ver "")
   endif()
 
-  if(NOT _cute_dsl_cuda_ver STREQUAL "" AND _cute_dsl_cuda_ver VERSION_LESS
-                                            12.0)
+  # CUDA 11.4 is allowed only for special CuTe DSL package deliveries.
+  if(NOT _cute_dsl_cuda_ver STREQUAL ""
+     AND NOT _cute_dsl_cuda_ver VERSION_EQUAL 11.4
+     AND _cute_dsl_cuda_ver VERSION_LESS 12.6)
     message(
       FATAL_ERROR
-        "CuTe DSL requires CUDA Toolkit 12.0+ (detected ${_cute_dsl_cuda_ver}). "
+        "CuTe DSL requires CUDA Toolkit 12.6+ (detected ${_cute_dsl_cuda_ver}). "
         "Use -DENABLE_CUTE_DSL=OFF or set -DCUDA_CTK_VERSION to a supported toolkit."
     )
   endif()
@@ -367,8 +371,9 @@ function(cute_dsl_setup)
       "${CMAKE_SOURCE_DIR}/cpp/kernels/gdnKernels/cutedsl_cuda_runtime_library_shim.c"
   )
   if(NOT TARGET trt_edgellm_cutedsl_cudart_shim)
-    if(NOT _cute_dsl_cuda_ver STREQUAL "" AND _cute_dsl_cuda_ver
-                                              VERSION_GREATER_EQUAL 12.8)
+    if(_cute_dsl_cuda_ver STREQUAL ""
+       OR _cute_dsl_cuda_ver VERSION_LESS 12.0
+       OR _cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.8)
       add_library(trt_edgellm_cutedsl_cudart_shim INTERFACE)
     else()
       if(NOT EXISTS "${_cutedsl_cudart_shim_src}")
@@ -423,6 +428,30 @@ function(cute_dsl_setup)
       target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_${_gu}_ENABLED")
     endforeach()
   endforeach()
+
+  # Per-variant defines for FFPA GQA kernels (native grouped-query attention
+  # without K/V head expansion). Each GQA group size is a separate AOT cubin.
+  list(FIND _variants "ffpa_d512_causal_gqa4" _ffpa_gqa4_idx)
+  if(NOT ${_ffpa_gqa4_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA4_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: ffpa_d512_causal_gqa4 variant found — CUTE_DSL_FFPA_GQA4_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "ffpa_d512_causal_gqa8" _ffpa_gqa8_idx)
+  if(NOT ${_ffpa_gqa8_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA8_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: ffpa_d512_causal_gqa8 variant found — CUTE_DSL_FFPA_GQA8_ENABLED set"
+    )
+  endif()
 
   # Check for Blackwell GDN variant specifically and set a clean define.
   list(FIND _variants "gdn_prefill_blackwell" _bw_idx)
@@ -736,6 +765,77 @@ function(cute_dsl_setup)
     )
   endif()
 
+  # Warp-specialised NVFP4 GEMM variants. The umbrella
+  # CUTE_DSL_GEMM_NVFP4_ENABLED comes for free from the per-group loop (active
+  # when ``gemm_nvfp4`` is in metadata.json "groups"). Per-variant defines
+  # follow the CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_<OUT_DTYPE>_TN<N>_ENABLED
+  # pattern so callers can compile the FP16-output and FP8-output paths
+  # independently.
+  list(FIND _variants "gemm_blackwell_nvfp4_ws_fp16_tn64"
+       _gemm_bw_nvfp4_ws_fp16_tn64_idx)
+  if(NOT ${_gemm_bw_nvfp4_ws_fp16_tn64_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN64_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_ws_fp16_tn64 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN64_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_ws_fp16_tn128"
+       _gemm_bw_nvfp4_ws_fp16_tn128_idx)
+  if(NOT ${_gemm_bw_nvfp4_ws_fp16_tn128_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN128_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_ws_fp16_tn128 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN128_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_ws_fp16_tn256"
+       _gemm_bw_nvfp4_ws_fp16_tn256_idx)
+  if(NOT ${_gemm_bw_nvfp4_ws_fp16_tn256_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN256_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_ws_fp16_tn256 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN256_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_ws_fp8_tn64"
+       _gemm_bw_nvfp4_ws_fp8_tn64_idx)
+  if(NOT ${_gemm_bw_nvfp4_ws_fp8_tn64_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN64_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_ws_fp8_tn64 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN64_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_ws_fp8_tn128"
+       _gemm_bw_nvfp4_ws_fp8_tn128_idx)
+  if(NOT ${_gemm_bw_nvfp4_ws_fp8_tn128_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN128_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_ws_fp8_tn128 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN128_ENABLED set"
+    )
+  endif()
+
   # Umbrella CUTE_DSL_GEMM_ENABLED — set if ANY gemm variant was found. Source
   # files guard the entire GEMM path with this define.
   set(_any_gemm FALSE)
@@ -783,10 +883,11 @@ function(cute_dsl_setup)
     if(CUDA_DRIVER_LIB AND NOT CUDA_DRIVER_LIB MATCHES "-NOTFOUND$")
       target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LIB}")
     endif()
-    # CUDA < 12.8: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
-    # JetPack 6).
-    if(NOT _cute_dsl_cuda_ver STREQUAL "" AND _cute_dsl_cuda_ver VERSION_LESS
-                                              12.8)
+    # CUDA 12.0–12.6: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
+    # JetPack 6). CUDA 11.x artifacts use CUmodule ABI instead.
+    if(NOT _cute_dsl_cuda_ver STREQUAL ""
+       AND _cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0
+       AND _cute_dsl_cuda_ver VERSION_LESS 12.8)
       target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
     endif()
   endforeach()

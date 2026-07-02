@@ -26,6 +26,7 @@ Visual encoders — I/O spec via ``model.get_onnx_export_args(config, device)``:
     - InternVL3        (model_type ``internvl_chat``)
     - InternVL3 HF     (model_type ``internvl``)
     - Phi-4 Multimodal (model_type ``phi4mm``, ``phi4_multimodal``)
+    - Gemma4            (model_type ``gemma4``)
     - Nemotron-Omni    (model_type ``NemotronH_Nano_VL_V2`` or
       ``NemotronH_Nano_Omni_Reasoning_V3``)
 
@@ -77,7 +78,12 @@ _NEMOTRON_OMNI_MODEL_TYPES: frozenset[str] = frozenset([
 # Maps model_type → internal family name
 _VISUAL_REGISTRY: dict[str, str] = {
     "qwen3_vl": "qwen3_vl",
-    "qwen3_omni": "qwen3_vl",
+    # Qwen3-Omni (dense and MoE) reuses Qwen3-VL's computation graph but
+    # uses HF Qwen3-Omni parameter naming (``thinker.visual.merger.ln_q``,
+    # ``mlp.0/2``, ``merger_list``).  Dispatch to a dedicated family that
+    # translates ckpt keys before delegating to build_qwen3_vl_visual.
+    "qwen3_omni": "qwen3_omni",
+    "qwen3_omni_moe": "qwen3_omni",
     "qwen3_5": "qwen3_5",
     "qwen3_5_moe": "qwen3_5",
     "qwen2_5_vl": "qwen2_5_vl",
@@ -85,6 +91,7 @@ _VISUAL_REGISTRY: dict[str, str] = {
     "internvl": "internvl3_5",
     "phi4mm": "phi4mm",
     "phi4_multimodal": "phi4mm",
+    "gemma4": "gemma4",
     "NemotronH_Nano_VL_V2": "nemotron_omni",
     "NemotronH_Nano_Omni_Reasoning_V3": "nemotron_omni",
 }
@@ -93,6 +100,8 @@ _VISUAL_REGISTRY: dict[str, str] = {
 _VISUAL_FAMILY_MODULE: dict[str, str] = {
     "qwen3_vl":
     "tensorrt_edgellm.models.qwen3_vl.modeling_qwen3_vl_visual",
+    "qwen3_omni":
+    "tensorrt_edgellm.models.qwen3_omni.modeling_qwen3_omni_visual",
     "qwen3_5":
     "tensorrt_edgellm.models.qwen3_5.modeling_qwen3_5_visual",
     "qwen2_5_vl":
@@ -103,6 +112,8 @@ _VISUAL_FAMILY_MODULE: dict[str, str] = {
     "tensorrt_edgellm.models.internvl3_5.modeling_internvl3_5_visual",
     "phi4mm":
     "tensorrt_edgellm.models.phi4mm.modeling_phi4mm_visual",
+    "gemma4":
+    "tensorrt_edgellm.models.gemma4.modeling_gemma4_visual",
     "nemotron_omni":
     "tensorrt_edgellm.models.nemotron_omni.modeling_nemotron_omni_visual",
 }
@@ -110,11 +121,13 @@ _VISUAL_FAMILY_MODULE: dict[str, str] = {
 # Maps family → build function name in that module
 _VISUAL_FAMILY_BUILD_FN: dict[str, str] = {
     "qwen3_vl": "build_qwen3_vl_visual",
+    "qwen3_omni": "build_qwen3_omni_visual",
     "qwen3_5": "build_qwen3_5_visual",
     "qwen2_5_vl": "build_qwen25_vl_visual",
     "internvl3": "build_internvl_visual",
     "internvl3_5": "build_internvl3_5_visual",
     "phi4mm": "build_phi4mm_visual",
+    "gemma4": "build_gemma4_visual",
     "nemotron_omni": "build_nemotron_omni_visual",
 }
 
@@ -126,6 +139,8 @@ _AUDIO_MODEL_TYPES: frozenset[str] = frozenset([
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
+    "qwen3_omni_moe",
+    "qwen3_omni_moe_thinker",
     *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
 ])
@@ -137,6 +152,8 @@ _AUDIO_KEY_PREFIX: dict[str, str] = {
     "qwen3_asr": "thinker.audio_tower.",
     "qwen3_omni": "thinker.audio_tower.",
     "qwen3_omni_thinker": "thinker.audio_tower.",
+    "qwen3_omni_moe": "thinker.audio_tower.",
+    "qwen3_omni_moe_thinker": "thinker.audio_tower.",
 }
 
 # ---------------------------------------------------------------------------
@@ -146,16 +163,17 @@ _AUDIO_KEY_PREFIX: dict[str, str] = {
 
 def _get_visual_config(model_type: str, config: dict) -> dict:
     """Extract visual encoder sub-config from the full model config."""
-    if model_type in ("qwen3_vl", "qwen3_omni", "qwen3_5", "qwen3_5_moe",
-                      "qwen2_5_vl"):
-        # Qwen3-Omni stores vision_config nested under thinker_config; other
-        # Qwen VL variants keep it at the root.
+    if model_type in ("qwen3_vl", "qwen3_omni", "qwen3_omni_moe", "qwen3_5",
+                      "qwen3_5_moe", "qwen2_5_vl"):
+        # Qwen3-Omni (dense + MoE) stores vision_config nested under
+        # thinker_config; other Qwen VL variants keep it at the root.
         return (config.get("vision_config")
                 or config.get("thinker_config", {}).get("vision_config")
                 or config)
-    if (model_type in ("internvl", "internvl_chat")
+    if (model_type in ("internvl", "internvl_chat", "gemma4")
             or model_type in _NEMOTRON_OMNI_MODEL_TYPES):
-        # InternVL / Nemotron-Omni need the full config (vision + text + downsample_ratio)
+        # InternVL / Gemma4 / Nemotron-Omni need the full config
+        # (vision + text + projection/runtime fields).
         return config
     if model_type in ("phi4mm", "phi4_multimodal"):
         # Phi-4mm visual config is hardcoded (not in config.json).
@@ -204,7 +222,7 @@ def _run_dynamo_export(
             external_data=True,
             optimize=True,
         )
-    prog.save(output_path)
+    prog.save(output_path, external_data=True)
     with open(output_path, "rb") as _f:
         os.fsync(_f.fileno())
     logger.info("Export complete: %s", output_path)

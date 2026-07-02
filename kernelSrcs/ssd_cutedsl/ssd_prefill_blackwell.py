@@ -402,11 +402,11 @@ class SSDKernel:
     @cute.jit
     def __call__(
         self,
-        x: cute.Tensor,  # (D, L, C, EH, B) - D stride 1
+        x: cute.Tensor,  # (D, S, EH, B) - D stride 1
         cumsum_delta: cute.Tensor,  # (L, C, EH, B) - L stride 1
         delta: cute.Tensor,  # (L, C, EH, B) - L stride 1
-        b: cute.Tensor,  # (L, N, C, G, B) - L stride 1
-        c: cute.Tensor,  # (L, N, C, G, B) - L stride 1
+        b: cute.Tensor,  # (S, N, G, B) - N stride 1
+        c: cute.Tensor,  # (S, N, G, B) - N stride 1
         y: cute.Tensor,  # (L, D, C, EH, B) - L stride 1 (output)
         init_states: cute.Tensor,  # (D, N, EH, B) - D stride 1 (optional)
         fstate: cute.Tensor,  # (D, N, EH, B) - D stride 1 (output)
@@ -804,7 +804,7 @@ class SSDKernel:
 
         # Static consts (CuTe DSL tracing needs these even if unused by Python)
         D = cute.size(tma_tensor_x, mode=[0])  # noqa: F841
-        L = cute.size(tma_tensor_x, mode=[1])
+        L = self.tile_shape[0]
         N = cute.size(tma_tensor_b, mode=[1])  # noqa: F841
         # Dynamic values
         # In varlen mode, C/first_chunk are set per-tile from seq_chunk_cumsum.
@@ -812,9 +812,9 @@ class SSDKernel:
         C = num_logical_chunks
         first_chunk = cutlass.Int32(0)  # noqa: F841
         seq_id = cutlass.Int32(0)  # noqa: F841
-        EH = cute.size(tma_tensor_x, mode=[3])
-        B = cute.size(tma_tensor_x, mode=[4])  # noqa: F841
-        G = cute.size(tma_tensor_b, mode=[3])
+        EH = cute.size(tma_tensor_x, mode=[2])
+        B = cute.size(tma_tensor_x, mode=[3])  # noqa: F841
+        G = cute.size(tma_tensor_b, mode=[2])
         NGROUP_RATIO = EH // G  # noqa: F841
 
         # Make TiledMma
@@ -1715,7 +1715,7 @@ class SSDKernel:
 
             if local_warp_idx == 0:
                 # TMA store fstate (state_dtype)
-                if cutlass.const_expr(self.has_init_states and self.has_varlen):
+                if cutlass.const_expr(self.has_varlen):
                     bSG_gP_final = bSG_gP_pre_slice[(None, 0, 0, eh_idx, seq_id)]
                 else:
                     bSG_gP_final = bSG_gP
@@ -1724,8 +1724,8 @@ class SSDKernel:
                     bSG_sP[(None, inter2_p_producer_state.index)],
                     bSG_gP_final,
                 )
-                tma_p_pipeline.producer_commit()
-                tma_p_pipeline.producer_acquire()
+            tma_p_pipeline.producer_commit()
+            tma_p_pipeline.producer_acquire()
 
             cute.arch.barrier(
                 barrier_id=self.pre_inter_sync_bar_id,
@@ -2819,7 +2819,7 @@ class SSDKernel:
 
             # Slice global tensor to current tile idx
             # ((ATOM_V, REST_V), C)
-            tXgX = tXgX_pre_slice[None, 0, 0, None, eh_idx, b_idx]
+            tXgX = tXgX_pre_slice[None, 0, None, eh_idx, b_idx]
             tDeltagDelta = tDeltagDelta_pre_slice[None, 0, None, eh_idx, b_idx]
             tDeltagCumsumDelta = tDeltagCumsumDelta_pre_slice[
                 None, 0, None, eh_idx, b_idx
@@ -2994,9 +2994,10 @@ class SSDKernel:
         seq_chunk_cumsum,
     ):
         # ((ATOM_V, REST_V), INPUT_STAGE)
-        # ((ATOM_V, REST_V), 1, 1, C, G, B)
-        # B tensor global is (L, N, C, G, B); INTRA1 tile_shape_mnk = (L, L, N)
-        # B operand tile: (N, K) from mnk → local_tile with (L, N) = tile_shape_mnk[1], tile_shape_mnk[2]
+        # ((ATOM_V, REST_V), C, 1, G, B)
+        # B tensor global is (S, N, G, B); INTRA1 tile_shape_mnk = (L, L, N)
+        # B operand tile: (N, K) from mnk -> local_tile with
+        # (L, N) = tile_shape_mnk[1], tile_shape_mnk[2].
         tBsB, tBgB_pre_slice = self.tma_partition_for_mma_b_operand(
             tma_atom_b,
             tma_tensor_b,
@@ -3009,7 +3010,7 @@ class SSDKernel:
         )
 
         # ((ATOM_V, REST_V), INPUT_STAGE)
-        # ((ATOM_V, REST_V), 1, 1, C, G, B)
+        # ((ATOM_V, REST_V), C, 1, G, B)
         tCsC, tCgC_pre_slice = self.tma_partition_for_mma_a_operand(
             tma_atom_c,
             tma_tensor_c,
@@ -3035,8 +3036,8 @@ class SSDKernel:
 
             # Slice global tensor to current tile idx
             # ((ATOM_V, REST_V), C)
-            tBgB = tBgB_pre_slice[None, 0, 0, None, g_idx, b_idx]
-            tCgC = tCgC_pre_slice[None, 0, 0, None, g_idx, b_idx]
+            tBgB = tBgB_pre_slice[None, None, 0, g_idx, b_idx]
+            tCgC = tCgC_pre_slice[None, None, 0, g_idx, b_idx]
 
             # Reset count for pipeline state
             b_producer_state.reset_count()
@@ -3285,7 +3286,7 @@ class SSDKernel:
     def _compute_grid(self, y, b, max_active_clusters, num_seqs=0):
         B = cute.size(y, mode=[4])
         EH = cute.size(y, mode=[3])
-        G = cute.size(b, mode=[3])
+        G = cute.size(b, mode=[2])
         NGROUP_RATIO = EH // G
         # In varlen mode, launch num_seqs * EH CTAs so each CTA handles
         # one (sequence, head) pair instead of all sequences serially.
@@ -3667,12 +3668,12 @@ class SSDKernel:
         tile_shape_nk=None,
     ):
         # Local_tile partition global tensors
-        # Default: (D, L) from intra2 tile — override with tile_shape_nk for other MMAs.
+        # Default: (D, L) from intra2 tile -- override with tile_shape_nk for other MMAs.
         local_tile_shape = tile_shape_nk if tile_shape_nk is not None else self.tile_shape_mnk_intra2[1:]
         gX = cute.local_tile(
             tma_tensor_x,
             local_tile_shape,
-            (None, None, None, None, None),
+            (None,) * cute.rank(tma_tensor_x),
         )
         # Partition global tensor with regard to TiledMMA
         thr_mma_intra2 = tiled_mma_intra2.get_slice(mma_tile_coord_v)
@@ -3705,17 +3706,17 @@ class SSDKernel:
         block_in_cluster_coord_vmnk,
     ):
         # Local_tile partition global tensors
-        # C global layout is (L, N, C, G, B) with N stride 1 (K-major for MMA A operand)
+        # C global layout is (S, N, G, B) with N stride 1 (K-major for MMA A operand)
         # Modes 0,1 are (M, K) = (L, N) matching make_tiled_tma_atom_A expectations
-        # (L, N, 1, 1, C, G, B)
+        # (L, N, C, 1, G, B)
         gC = cute.local_tile(
             tma_tensor_c,
             cute.slice_(self.tile_shape_mnk_intra1, (None, 0, None)),
-            (None, None, None, None, None),
+            (None,) * cute.rank(tma_tensor_c),
         )
         # Partition global tensor with regard to TiledMMA
         thr_mma_intra1 = tiled_mma_intra1.get_slice(mma_tile_coord_v)
-        # (MMA, MMA_M, MMA_K, 1, 1, C, G, B)
+        # (MMA, MMA_M, MMA_K, C, 1, G, B)
         tCgC = thr_mma_intra1.partition_A(gC)
 
         # Partition global/shared tensor for TMA C
@@ -3723,7 +3724,7 @@ class SSDKernel:
             cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
         )
         # ((ATOM_V, REST_V), INPUT_STAGE)
-        # ((ATOM_V, REST_V), 1, 1, C, G, B)
+        # ((ATOM_V, REST_V), C, 1, G, B)
         tCsC, tCgC_pre_slice = cpasync.tma_partition(
             tma_atom_c,
             block_in_cluster_coord_vmnk[1],
@@ -3896,14 +3897,16 @@ class SSDKernel:
     ):
         """Compute how far into the physical chunk this logical chunk extends.
 
-        Returns chunk_size_limit (= L when the logical chunk owns the full
-        physical chunk, < L when masked).
+        Returns chunk_size_limit, the exclusive end coordinate in the
+        physical chunk's L dimension (= L when the logical chunk owns the
+        full physical chunk, < L when masked).
 
         Two masking sources combined (both gated by has_varlen):
         - flashinfer chunk-pack: next logical chunk shares this physical
           chunk -> chunk_size_limit = chunk_offsets[next].
         - padded_mode end-of-seq clamp (Edge-LLM plugin padded layout):
-          if this is seq's partial chunk, clamp to remaining valid tokens.
+          if this is seq's partial chunk, clamp to the physical-chunk
+          coordinate just past the final valid token.
           valid_lens / seq_id / first_chunk_in_seq are ignored when
           padded_mode is False.
         """
@@ -3914,14 +3917,19 @@ class SSDKernel:
                 if next_chunk == chunk:
                     chunk_size_limit = chunk_offsets[physical_chunk + 1]
             if cutlass.const_expr(self.padded_mode):
-                local_chunk = physical_chunk - first_chunk_in_seq
-                chunk_start_in_seq = local_chunk * L
+                first_chunk = chunk_indices[first_chunk_in_seq]
+                first_chunk_offset = chunk_offsets[first_chunk_in_seq]
+                chunk_start_in_seq = (
+                    (chunk - first_chunk) * L + chunk_offsets[physical_chunk]
+                    - first_chunk_offset
+                )
                 valid_in_chunk = valid_lens[seq_id] - chunk_start_in_seq
-                if valid_in_chunk < chunk_size_limit:
-                    if valid_in_chunk < 0:
-                        chunk_size_limit = cutlass.Int32(0)
-                    else:
-                        chunk_size_limit = valid_in_chunk
+                if valid_in_chunk < 0:
+                    chunk_size_limit = cutlass.Int32(0)
+                else:
+                    valid_end_in_chunk = chunk_offsets[physical_chunk] + valid_in_chunk
+                    if valid_end_in_chunk < chunk_size_limit:
+                        chunk_size_limit = valid_end_in_chunk
         return chunk_size_limit
 
     def pre_intra_tmem_load_and_partition_q(self, tIntra1, local_tidx):
@@ -4405,8 +4413,8 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
         dt_in: cute.Tensor,       # [B, S, EH] fp16
         A: cute.Tensor,            # [EH] fp32
         dt_bias: cute.Tensor,      # [EH] fp16
-        dA_cumsum: cute.Tensor,    # [B, EH, C, L] fp32
-        dt_proc: cute.Tensor,      # [B, EH, C, L] fp16
+        dA_cumsum: cute.Tensor,    # [B, C, EH, L] fp32
+        dt_proc: cute.Tensor,      # [B, C, EH, L] fp16
         seq_len: cutlass.Int32,
         dt_softplus: cutlass.Constexpr[bool],
     ):
@@ -4424,8 +4432,8 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
                     dtv = cute.log(cutlass.Float32(1.0) + cute.exp(dtv))
 
         # Write dt_proc
-        dA_cumsum[b, h, c, tidx] = cutlass.Float32(A[h]) * dtv
-        dt_proc[b, h, c, tidx] = cutlass.Float16(dtv)
+        dA_cumsum[b, c, h, tidx] = cutlass.Float32(A[h]) * dtv
+        dt_proc[b, c, h, tidx] = cutlass.Float16(dtv)
         cute.arch.barrier()
 
         # Parallel Hillis-Steele prefix scan over L=128 elements (log2(L) steps).
@@ -4433,10 +4441,10 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
         while stride < L:
             val = cutlass.Float32(0.0)
             if tidx >= stride:
-                val = dA_cumsum[b, h, c, tidx - stride]
+                val = dA_cumsum[b, c, h, tidx - stride]
             cute.arch.barrier()
             if tidx >= stride:
-                dA_cumsum[b, h, c, tidx] = dA_cumsum[b, h, c, tidx] + val
+                dA_cumsum[b, c, h, tidx] = dA_cumsum[b, c, h, tidx] + val
             cute.arch.barrier()
             stride = stride * 2
 
@@ -4446,12 +4454,12 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
 
     @cute.kernel
     def _transpose_y_kernel(
-        y_ws: cute.Tensor,     # [B, EH, D, C, L] fp16 -- L stride 1
+        y_ws: cute.Tensor,     # [B, C, EH, D, L] fp16 -- L stride 1
         output: cute.Tensor,   # [B, S, EH, D] fp16 -- D stride 1
         seq_len: cutlass.Int32,
         nchunks: cutlass.Int32,
     ):
-        """Smem-staged transpose y_ws[B,EH,D,C,L] -> output[B,S,EH,D].
+        """Smem-staged transpose y_ws[B,C,EH,D,L] -> output[B,S,EH,D].
 
         sY is [L, D_SPAD] with D stride 1. Phase 2 is a direct b128 transfer
         (smem D-contig -> gmem D-contig, no scratch). Phase 1's smem write is
@@ -4481,13 +4489,11 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
             16,
         )
 
-        # y_ws strides: (B_str, EH_str, DC_str, L=128 STATIC, 1 STATIC).
-        # All dynamic strides factor through L=128, so block_off is a multiple
-        # of L=128 fp16 = 256B -> 16B-aligned at runtime.
+        # y_ws is [B, C, EH, D, L]: stride[0]=B, [1]=C, [2]=EH, [3]=D, [4]=L=1.
         block_off = (b * y_ws.layout.stride[0]
-                     + eh * y_ws.layout.stride[1]
-                     + cutlass.Int32(c) * y_ws.layout.stride[3])
-        DC_str = y_ws.layout.stride[2]
+                     + cutlass.Int32(c) * y_ws.layout.stride[1]
+                     + eh * y_ws.layout.stride[2])
+        DC_str = y_ws.layout.stride[3]
 
         out_B = output.layout.stride[0]
         out_S = output.layout.stride[1]
@@ -4562,9 +4568,9 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
         output: cute.Tensor,         # [batch, seq_len, nheads, dim] fp16 (final output)
         state: cute.Tensor,          # [batch, nheads, dim, dstate] fp16 (matches plugin kIN_STATE_IDX type -- read init / write final in place)
         # Workspace buffers (pre-allocated by caller)
-        dA_cumsum: cute.Tensor,      # [batch, nheads, nchunks, L] fp32
-        dt_proc: cute.Tensor,        # [batch, nheads, nchunks, L] fp16
-        y_ws: cute.Tensor,           # [batch, nheads, dim, nchunks, L] fp16 (kernel's natural [B,EH,D,C,L] y layout -- transposed into output post-kernel)
+        dA_cumsum: cute.Tensor,      # [batch, nchunks, nheads, L] fp32
+        dt_proc: cute.Tensor,        # [batch, nchunks, nheads, L] fp16
+        y_ws: cute.Tensor,           # [batch, nchunks, nheads, dim, L] fp16 (kernel's natural [B,C,EH,D,L] y layout -- transposed into output post-kernel)
         # Varlen metadata (computed by caller from context_lengths)
         seq_idx: cute.Tensor,        # [batch, seq_len] int32 (b if t<cl[b] else -1)
         chunk_indices: cute.Tensor,  # [num_logical_chunks] int32
@@ -4591,34 +4597,34 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
                        dt_softplus).launch(
             grid=(n_c, n_eh, n_batch), block=[L, 1, 1], smem=0, stream=stream)
 
-        # Step 2: Create permuted tensor views for SSD kernel
-        x_perm = cute.make_tensor(x.iterator, cute.make_layout(
-            (D, L, n_c, n_eh, n_batch),
-            stride=(1, n_eh * D, L * n_eh * D, D, n_c * L * n_eh * D)))
+        # Step 2: Create SSD tensor views. X/B/C are real-bounded so TMA can
+        # zero-fill the final partial physical chunk instead of relying on a
+        # padded source allocation.
+        x_real = cute.make_tensor(x.iterator, cute.make_layout(
+            (D, seq_len_val, n_eh, n_batch),
+            stride=(1, n_eh * D, D, seq_len_val * n_eh * D)))
+        b_real = cute.make_tensor(B.iterator, cute.make_layout(
+            (seq_len_val, N, n_g, n_batch),
+            stride=(n_g * N, 1, N, seq_len_val * n_g * N)))
+        c_real = cute.make_tensor(C.iterator, cute.make_layout(
+            (seq_len_val, N, n_g, n_batch),
+            stride=(n_g * N, 1, N, seq_len_val * n_g * N)))
 
+        # cs/dt/y workspaces use [B, C, EH, ...] so stride[n_c]*n_c == stride[batch]
+        # (varlen flat-chunk-via-b=0 indexing, same pattern as y).
         cs_perm = cute.make_tensor(dA_cumsum.iterator, cute.make_layout(
             (L, n_c, n_eh, n_batch),
-            stride=(1, L, n_c * L, n_eh * n_c * L)))
+            stride=(1, n_eh * L, L, n_c * n_eh * L)))
 
         dt_perm = cute.make_tensor(dt_proc.iterator, cute.make_layout(
             (L, n_c, n_eh, n_batch),
-            stride=(1, L, n_c * L, n_eh * n_c * L)))
+            stride=(1, n_eh * L, L, n_c * n_eh * L)))
 
-        b_perm = cute.make_tensor(B.iterator, cute.make_layout(
-            (L, N, n_c, n_g, n_batch),
-            stride=(n_g * N, 1, L * n_g * N, N, n_c * L * n_g * N)))
-
-        c_perm = cute.make_tensor(C.iterator, cute.make_layout(
-            (L, N, n_c, n_g, n_batch),
-            stride=(n_g * N, 1, L * n_g * N, N, n_c * L * n_g * N)))
-
-        # y_perm aliases y_ws workspace ([B,EH,D,C,L] row-major; L stride 1 -- required
-        # by the kernel's smem swizzle / TMA descriptor). A post-kernel transpose
-        # (one launch, vectorized) maps y_ws[b,eh,d,c,l] -> output[b, c*L+l, eh, d]
-        # to satisfy the plugin's [B,S,EH,D] contract.
+        # y_perm aliases y_ws ([B,C,EH,D,L] row-major; L stride 1 required by
+        # smem swizzle / TMA descriptor). Post-kernel transpose remaps to [B,S,EH,D].
         y_perm = cute.make_tensor(y_ws.iterator, cute.make_layout(
             (L, D, n_c, n_eh, n_batch),
-            stride=(1, n_c * L, L, D * n_c * L, n_eh * D * n_c * L)))
+            stride=(1, L, n_eh * D * L, D * L, n_c * n_eh * D * L)))
 
         # fstate aliases caller's state buffer ([B,EH,D,N] fp16 row-major) reshaped
         # to (N,D,EH,B): kernel reads init at start, overwrites with final state in
@@ -4633,7 +4639,7 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
 
         # Step 3: Launch main SSD kernel (always-varlen, has_init_states, padded_mode).
         # This is flashinfer's persistent kernel.
-        _kernel(x_perm, cs_perm, dt_perm, b_perm, c_perm, y_perm,
+        _kernel(x_real, cs_perm, dt_perm, b_real, c_real, y_perm,
                 init_perm, fs_perm, d_perm, None,
                 seq_idx, chunk_indices, chunk_offsets, seq_chunk_cumsum,
                 valid_lens,
@@ -4678,10 +4684,10 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
     ph_dtb = ph_dtb.mark_compact_shape_dynamic(mode=0, stride_order=(0,))
     ph_out = _mark_nd(cp.zeros((batch, seq_len_ph, nheads, D), dtype=cp.float16), 3)
     ph_state = _mark_nd(cp.zeros((batch, nheads, D, N), dtype=cp.float16), 2)
-    # Workspace buffers: cumsum + dt_proc + y_ws (kernel's natural [B,EH,D,C,L] y layout).
-    ph_cumsum = _mark_nd(cp.zeros((batch, nheads, nchunks, L), dtype=cp.float32), 3)
-    ph_dtproc = _mark_nd(cp.zeros((batch, nheads, nchunks, L), dtype=cp.float16), 3)
-    ph_y = _mark_nd(cp.zeros((batch, nheads, D, nchunks, L), dtype=cp.float16), 4)
+    # Workspace buffers: cumsum + dt_proc + y_ws ([B, C, EH, ...] row-major).
+    ph_cumsum = _mark_nd(cp.zeros((batch, nchunks, nheads, L), dtype=cp.float32), 3)
+    ph_dtproc = _mark_nd(cp.zeros((batch, nchunks, nheads, L), dtype=cp.float16), 3)
+    ph_y = _mark_nd(cp.zeros((batch, nchunks, nheads, D, L), dtype=cp.float16), 4)
 
     # Varlen metadata placeholders (always-varlen AOT mode)
     # Upper-bound logical chunks at batch * nchunks (one chunk per (batch, c) cell).
@@ -4810,10 +4816,11 @@ def run_test(n, nheads, dim, dstate, ngroups, seq_len,
     cl_pattern: optional comma-separated per-batch context_lengths
         (e.g. "100,256,200,256" for n=4 mixed varlen). When None, uniform cl=seq_len.
     """
-    # Ceil-div for seq_len % CHUNK_SIZE != 0; pad inputs to nchunks*CHUNK_SIZE so
-    # the kernel sees aligned chunks (extra positions are masked out via cl-clamp).
+    # Edge-LLM's runtime row stride is exactly seq_len. The TMA source tensor keeps
+    # this real flattened bound so final partial physical chunks are OOB to TMA.
     nchunks_per_seq = (seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE
-    seq_len_padded = nchunks_per_seq * CHUNK_SIZE  # storage size; valid seq_len passed via cl
+    seq_len_padded = seq_len
+    chunks_per_seq_upper = nchunks_per_seq + (0 if seq_len % CHUNK_SIZE == 0 else 1)
     if cl_pattern is None:
         cl_arr = [seq_len] * n
         mode_str = "uniform"
@@ -4822,13 +4829,12 @@ def run_test(n, nheads, dim, dstate, ngroups, seq_len,
         assert len(cl_arr) == n, f"cl_pattern has {len(cl_arr)} entries, expected n={n}"
         assert all(1 <= cl <= seq_len for cl in cl_arr), f"cl entries must be in [1, {seq_len}]"
         mode_str = f"varlen(cl={cl_arr})"
-    print(f"[ssd_blackwell] n={n} h={nheads} d={dim} ds={dstate} g={ngroups} "
-          f"s={seq_len} (padded={seq_len_padded}) chunks/seq={nchunks_per_seq} "
-          f"total_chunks={n * nchunks_per_seq} mode={mode_str}")
-
-    # Packed-view dims (must match C++ CALL_SSD_PREFILL_BLACKWELL packing)
     total_seq = n * seq_len_padded
-    total_chunks = n * nchunks_per_seq
+    total_chunks = (total_seq + CHUNK_SIZE - 1) // CHUNK_SIZE
+    total_logical_slots = n * chunks_per_seq_upper
+    print(f"[ssd_blackwell] n={n} h={nheads} d={dim} ds={dstate} g={ngroups} "
+          f"s={seq_len} row_stride={seq_len_padded} chunks/seq={nchunks_per_seq} "
+          f"total_chunks={total_chunks} mode={mode_str}")
 
     np.random.seed(42)
     x_np = np.random.randn(n, seq_len_padded, nheads, dim).astype(np.float16)
@@ -4875,9 +4881,9 @@ def run_test(n, nheads, dim, dstate, ngroups, seq_len,
     state_g = cp.asarray(state_np)  # [n, H, D, N] fp16 -- read init / write final in place
 
     # Workspace buffers in packed view: outer dim = 1, total_chunks across all seqs.
-    cumsum_ws = cp.zeros((1, nheads, total_chunks, CHUNK_SIZE), dtype=cp.float32)
-    dt_proc_ws = cp.zeros((1, nheads, total_chunks, CHUNK_SIZE), dtype=cp.float16)
-    y_ws = cp.zeros((1, nheads, dim, total_chunks, CHUNK_SIZE), dtype=cp.float16)
+    cumsum_ws = cp.zeros((1, total_chunks, nheads, CHUNK_SIZE), dtype=cp.float32)
+    dt_proc_ws = cp.zeros((1, total_chunks, nheads, CHUNK_SIZE), dtype=cp.float16)
+    y_ws = cp.zeros((1, total_chunks, nheads, dim, CHUNK_SIZE), dtype=cp.float16)
 
     # Varlen metadata -- same layout as cuteDslSSDRunner.cpp builds via
     # buildSSDVarlenMetadata. seq_idx is [1, B*S] (flat super-batch) so the
@@ -4888,17 +4894,25 @@ def run_test(n, nheads, dim, dstate, ngroups, seq_len,
         seq_idx_np[b, cl_arr[b]:] = -1
     seq_idx_packed = seq_idx_np.reshape(1, total_seq)
 
-    # chunk_indices: prefix list of physical chunk ids that contain valid tokens.
-    # Each seq b contributes ceil(cl[b] / L) entries: chunk ids b*nchunks_per_seq..
-    # Trailing slack filled with sentinel -1.
-    chunk_indices_np = np.full((total_chunks,), -1, dtype=np.int32)
-    chunk_offsets_np = np.zeros((total_chunks,), dtype=np.int32)
+    # chunk_indices/chunk_offsets: prefix list of physical chunks that contain
+    # each sequence's valid tokens in the flattened [1, B*S, ...] view. A sequence
+    # can start partway through a physical chunk when S is not a multiple of L.
+    chunk_indices_np = np.full((total_logical_slots,), -1, dtype=np.int32)
+    chunk_offsets_np = np.zeros((total_logical_slots,), dtype=np.int32)
     cumsum_list = [0]
     for b in range(n):
-        nc_b = (cl_arr[b] + CHUNK_SIZE - 1) // CHUNK_SIZE
-        for c in range(nc_b):
-            chunk_indices_np[cumsum_list[-1] + c] = b * nchunks_per_seq + c
-        cumsum_list.append(cumsum_list[-1] + nc_b)
+        flat = b * seq_len_padded
+        remaining = cl_arr[b]
+        c = 0
+        while remaining > 0:
+            slot = cumsum_list[-1] + c
+            chunk_indices_np[slot] = flat // CHUNK_SIZE
+            chunk_offsets_np[slot] = flat % CHUNK_SIZE
+            chunk_tokens = min(CHUNK_SIZE - chunk_offsets_np[slot], remaining)
+            flat += chunk_tokens
+            remaining -= chunk_tokens
+            c += 1
+        cumsum_list.append(cumsum_list[-1] + c)
     seq_chunk_cumsum_np = np.array(cumsum_list, dtype=np.int32)
 
     seq_idx_g = cp.asarray(seq_idx_packed)
@@ -4926,9 +4940,9 @@ def run_test(n, nheads, dim, dstate, ngroups, seq_len,
         return (from_dlpack(arr, assumed_align=16)
                 .mark_compact_shape_dynamic(mode=0, stride_order=(0,)))
 
-    # num_logical_chunks is the *upper bound* (total_chunks); kernel handles
-    # trailing -1 sentinels in chunk_indices.
-    num_logical_chunks = total_chunks
+    # num_logical_chunks is the *upper bound*; kernel handles trailing -1
+    # sentinels in chunk_indices.
+    num_logical_chunks = total_logical_slots
     num_seqs = n
 
     # Match each tensor's dynamic-mode count to the AOT placeholder definition.

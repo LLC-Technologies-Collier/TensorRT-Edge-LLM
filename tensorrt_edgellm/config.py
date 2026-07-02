@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,6 +49,7 @@ shape in the checkpoint to break the circular dependency with ``n_groups``.
 """
 
 import json
+import math
 import os
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -75,19 +76,6 @@ QUANT_INT8_SQ = "int8_sq"
 # (dominant algo); per-layer differences live in ``layer_overrides``.
 QUANT_MIXED = "mixed_precision"
 
-# Deployment-target backend for NVFP4 MoE plugins. Even though both backends
-# read the same NVFP4 checkpoint, they emit *different* ONNX nodes
-# (``Nvfp4MoePlugin`` vs ``NvFP4MoEPluginGeforce``) with different input
-# contracts and weight layouts, so the backend must be picked at export
-# time. Surfaced through ``QuantConfig`` for convenience (it travels with
-# the rest of the export-time config); override via the checkpoint's
-# ``hf_quant_config.json`` / ``quantization_config`` block (key
-# ``nvfp4_moe_backend``) or by mutating ``config.quant.nvfp4_moe_backend``
-# before construction. Missing keys target the Thor plugin by default.
-NVFP4_MOE_BACKEND_THOR = "thor"  # CuTeDSL Nvfp4MoePlugin (SM100/101/110)
-NVFP4_MOE_BACKEND_GEFORCE = "geforce"  # NvFP4MoEPluginGeforce (SM120/121)
-_VALID_NVFP4_MOE_BACKENDS = (NVFP4_MOE_BACKEND_THOR, NVFP4_MOE_BACKEND_GEFORCE)
-
 # Default RoPE base frequency (used when config omits rope_theta)
 _DEFAULT_ROPE_THETA = 10000.0
 
@@ -97,6 +85,12 @@ LAYER_MAMBA = "mamba"
 LAYER_MLP = "mlp"
 LAYER_GDN = "gdn"  # GatedDeltaNet linear attention (Qwen3.5)
 LAYER_MOE = "moe"
+
+_VALID_ATTENTION_LAYER_TYPES = ("sliding_attention", "full_attention")
+
+
+def _is_gemma4_model_type(model_type: str) -> bool:
+    return str(model_type).startswith("gemma4")
 
 
 def _get_rope_theta(llm_dict: Dict[str, Any]) -> float:
@@ -110,9 +104,180 @@ def _get_rope_theta(llm_dict: Dict[str, Any]) -> float:
         return float(llm_dict["rope_theta"])
     for key in ("rope_scaling", "rope_parameters"):
         nested = llm_dict.get(key)
-        if isinstance(nested, dict) and nested.get("rope_theta") is not None:
+        if not isinstance(nested, dict):
+            continue
+        if nested.get("rope_theta") is not None:
             return float(nested["rope_theta"])
+        for attention_type in ("full_attention", "sliding_attention"):
+            attention_params = nested.get(attention_type)
+            if (isinstance(attention_params, dict)
+                    and attention_params.get("rope_theta") is not None):
+                return float(attention_params["rope_theta"])
     return _DEFAULT_ROPE_THETA
+
+
+def _normalize_rope_scaling_for_config(
+        rope_params: Optional[Dict[str, Any]]) -> Optional[dict]:
+    """Normalize one RoPE parameter block for runtime config export."""
+    if not isinstance(rope_params, dict):
+        return None
+    normalized = dict(rope_params)
+    rope_type = normalized.get("rope_type", normalized.get("type"))
+    if rope_type is not None:
+        normalized.setdefault("rope_type", rope_type)
+        normalized.setdefault("type", rope_type)
+    return normalized
+
+
+def _select_rope_scaling(llm_dict: Dict[str, Any]) -> Optional[dict]:
+    """Select the single-RoPE fallback block from raw config metadata."""
+    for key in ("rope_scaling", "rope_parameters"):
+        nested = llm_dict.get(key)
+        if not isinstance(nested, dict):
+            continue
+        if isinstance(nested.get("full_attention"), dict):
+            return _normalize_rope_scaling_for_config(nested["full_attention"])
+        if isinstance(nested.get("sliding_attention"), dict):
+            return _normalize_rope_scaling_for_config(
+                nested["sliding_attention"])
+        return _normalize_rope_scaling_for_config(nested)
+    return None
+
+
+def _runtime_rope_config_from_params(llm_dict: Dict[str, Any],
+                                     rope_params: Dict[str, Any]) -> dict:
+    """Build one runtime RoPE config block from raw checkpoint metadata."""
+    out = {
+        "rope_theta":
+        float(
+            rope_params.get("rope_theta",
+                            llm_dict.get("rope_theta", _DEFAULT_ROPE_THETA))),
+        "rope_scaling":
+        _normalize_rope_scaling_for_config(rope_params),
+        "partial_rotary_factor":
+        float(
+            rope_params.get("partial_rotary_factor",
+                            llm_dict.get("partial_rotary_factor", 1.0))),
+        "max_position_embeddings":
+        int(llm_dict.get("max_position_embeddings", 4096)),
+    }
+    return out
+
+
+def _get_dual_rope_configs(llm_dict: Dict[str, Any]) -> dict[str, dict]:
+    """Return explicit sliding/full runtime RoPE configs when present."""
+    rope_parameters = llm_dict.get("rope_parameters")
+    layer_types = {
+        str(layer_type)
+        for layer_type in llm_dict.get("layer_types", [])
+    }
+    if not isinstance(rope_parameters, dict):
+        return {}
+    if not {"sliding_attention", "full_attention"} <= layer_types:
+        return {}
+
+    sliding_params = rope_parameters.get("sliding_attention")
+    full_params = rope_parameters.get("full_attention")
+    if not isinstance(sliding_params, dict) or not isinstance(
+            full_params, dict):
+        return {}
+    return {
+        "sliding_rope_config":
+        _runtime_rope_config_from_params(llm_dict, sliding_params),
+        "full_rope_config":
+        _runtime_rope_config_from_params(llm_dict, full_params),
+    }
+
+
+def _parse_attention_layer_types(config: dict, num_hidden_layers: int,
+                                 model_type: str) -> List[str]:
+    """Preserve per-layer sliding/full attention labels for Gemma4 routing."""
+    raw = config.get("layer_types")
+    if not _is_gemma4_model_type(model_type):
+        return []
+
+    if not isinstance(raw, list):
+        raise ValueError(
+            "Gemma4 config requires layer_types with one sliding/full attention entry per layer."
+        )
+    if len(raw) != num_hidden_layers:
+        raise ValueError(
+            "Gemma4 layer_types length must match num_hidden_layers: "
+            f"{len(raw)} vs {num_hidden_layers}.")
+
+    attention_layer_types: List[str] = []
+    for layer_idx, layer_type in enumerate(raw):
+        layer_type = str(layer_type)
+        if layer_type not in _VALID_ATTENTION_LAYER_TYPES:
+            raise ValueError(
+                "Gemma4 layer_types entries must be sliding_attention or full_attention; "
+                f"got {layer_type!r} at layer {layer_idx}.")
+        attention_layer_types.append(layer_type)
+    return attention_layer_types
+
+
+def _get_attention_scaling(llm_dict: Dict[str, Any], model_type: str,
+                           head_dim: int) -> float:
+    """Return the scale applied to QK^T before softmax."""
+    for key in ("attention_scaling", "qk_scale", "scaling"):
+        if llm_dict.get(key) is not None:
+            return float(llm_dict[key])
+
+    # Gemma4 uses unscaled QK attention in HF even when the checkpoint config
+    # omits an explicit scale field.
+    if str(model_type) in {"gemma4", "gemma4_text"}:
+        return 1.0
+
+    return 1.0 / (float(head_dim)**0.5)
+
+
+def _get_rms_norm_eps(llm_dict: Dict[str, Any], model_type: str) -> float:
+    if str(model_type).lower().startswith("nemotron_h"):
+        return llm_dict.get(
+            "rms_norm_eps",
+            llm_dict.get("norm_eps", llm_dict.get("layer_norm_epsilon", 1e-6)))
+
+    return llm_dict.get("rms_norm_eps", 1e-6)
+
+
+def _get_embedding_scale(llm_dict: Dict[str, Any], model_type: str,
+                         hidden_size: int) -> float:
+    """Return the scale folded into runtime token embeddings."""
+    for key in ("embedding_scale", "embed_scale", "scalar_embed_scale"):
+        if llm_dict.get(key) is not None:
+            return float(llm_dict[key])
+
+    if str(model_type) in {"gemma4", "gemma4_text"}:
+        return math.sqrt(float(hidden_size))
+
+    return 1.0
+
+
+def _get_has_value_norm(llm_dict: Dict[str, Any], model_type: str) -> bool:
+    """Return whether attention values use Gemma-style RMSNorm."""
+    for key in ("has_value_norm", "has_v_norm", "value_norm"):
+        if llm_dict.get(key) is not None:
+            return bool(llm_dict[key])
+
+    return str(model_type) in {"gemma4", "gemma4_text"}
+
+
+@dataclass
+class Mapping:
+    """Parallel-execution placement (tensor/pipeline/expert ranks).
+
+    Single source of truth for "which rank am I, out of how many" across
+    the loader and exporter. Pipeline / expert fields are reserved for
+    future use; only ``world_size``, ``tp_size``, and ``tp_rank`` are
+    consumed today.
+    """
+    world_size: int = 1
+    tp_size: int = 1
+    tp_rank: int = 0
+    pp_size: int = 1
+    pp_rank: int = 0
+    ep_size: int = 1
+    ep_rank: int = 0
 
 
 @dataclass
@@ -164,17 +329,6 @@ class QuantConfig:
     layer_overrides: dict = field(default_factory=dict)
     # True when quant_algo is MIXED_PRECISION: unlisted modules are FP16.
     is_mixed_precision: bool = False
-    # Deployment-target backend for NVFP4 MoE plugins (only consumed when
-    # ``quant_type == QUANT_NVFP4`` *and* the model is an MoE arch). See the
-    # ``NVFP4_MOE_BACKEND_*`` constants above for the supported values.
-    # Default targets Thor SM110.
-    nvfp4_moe_backend: str = NVFP4_MOE_BACKEND_THOR
-
-    def __post_init__(self) -> None:
-        if self.nvfp4_moe_backend not in _VALID_NVFP4_MOE_BACKENDS:
-            raise ValueError(
-                f"QuantConfig.nvfp4_moe_backend must be one of "
-                f"{_VALID_NVFP4_MOE_BACKENDS}, got {self.nvfp4_moe_backend!r}")
 
     @property
     def is_quantized(self) -> bool:
@@ -276,7 +430,7 @@ class ModelConfig:
     """Flat model hyper-parameter config consumed by module builders."""
 
     # ------------------------------------------------------------------ arch
-    model_type: str  # e.g. "qwen3", "llama", "hybrid_mamba"
+    model_type: str  # HF architecture name, e.g. "qwen3", "llama"
     hidden_size: int
     num_hidden_layers: int
     num_attention_heads: int
@@ -294,12 +448,40 @@ class ModelConfig:
     original_max_position_embeddings: Optional[int] = None
     # Fraction of head_dim used for RoPE (e.g. 0.75 for phi3/phi4, 1.0 for most others).
     partial_rotary_factor: float = 1.0
+    # Gemma4: head_dim for global (full_attention) layers (0 = same as head_dim)
+    global_head_dim: int = 0
+    # Gemma4 E4B: num_key_value_heads for global (full_attention) layers (0 = same as num_key_value_heads)
+    num_global_key_value_heads: int = 0
+    # Hidden activation name used by architecture-specific auxiliary modules.
+    hidden_activation: str = "silu"
+    # Optional explicit RoPE configs for mixed sliding/full attention stacks.
+    sliding_rope_config: Optional[dict] = None
+    full_rope_config: Optional[dict] = None
     # ------------------------------------------ model-family feature flags
     # Per-head RMSNorm after Q and K projections.
     # Auto-detected from checkpoint key names; not inferred from model_type.
     has_qk_norm: bool = False
+    # Per-head RMSNorm after V projection. Gemma4 stores this norm without
+    # learned weights, so it is selected from config metadata instead of
+    # checkpoint key names.
+    has_value_norm: bool = False
     # Bias on q/k/v projections.  Read from config.json "attention_bias".
     attention_bias: bool = False
+    # Multiplicative scale applied to QK^T before softmax.
+    attention_scaling: float = 0.0
+    # Gemma4 full/global attention can use a different per-head dimension
+    # from sliding attention.
+    global_head_dim: Optional[int] = None
+    # Gemma4 K=V full/global attention can use a different KV head count from
+    # sliding attention.
+    num_global_key_value_heads: Optional[int] = None
+    # Gemma4 full/global attention reuses k_proj(hidden_states) as the value
+    # projection source when enabled.
+    attention_k_eq_v: bool = False
+    # Multiplicative scale applied by the HF embedding module.
+    embedding_scale: float = 1.0
+    # Final logit softcapping: tanh(logits/cap)*cap.  None = disabled.
+    final_logit_softcapping: Optional[float] = None
     # Weight dtype in the checkpoint
     torch_dtype: str = "bfloat16"
     # When True, embed_tokens and lm_head share the same weight tensor
@@ -309,11 +491,30 @@ class ModelConfig:
     # ------------------------------------------ per-layer block types
     # One entry per hidden layer: LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, or LAYER_MOE.
     layer_types: List[str] = field(default_factory=list)
+    # Original attention labels for attention layers: full_attention or sliding_attention.
+    attention_layer_types: List[str] = field(default_factory=list)
     # ------------------------------------------ multimodal deepstack (VL)
     # Number of deepstack visual embedding tensors injected into the first N
     # hidden layers. Prefer ``vision_config.deepstack_visual_indexes`` length on
     # the root config when present; else ``num_deepstack_features`` or fallback.
     num_deepstack_features: int = 0
+    # ----------------------------------------- Qwen3-Omni emitted-tensor layer
+    # Read by the Qwen3-Omni-specific ``Transformer`` subclasses (dense and
+    # MoE) to decide which tensor to expose via ``emitted_hidden_states``
+    # (consumed by their ``CausalLM`` wrappers when
+    # ``emit_hidden_states = True``):
+    #
+    # * ``accept_hidden_layer >= 1`` (and ≤ num_hidden_layers): pre-norm
+    #   output of decoder layer ``accept_hidden_layer - 1``.  Matches HF's
+    #   ``outputs.hidden_states[k]`` convention where ``k`` denotes "after
+    #   ``k`` decoder layers" (k=0 is inputs_embeds, k=N is the last layer
+    #   pre-norm).  Used by Qwen3-Omni Thinker → Talker: Talker
+    #   consumes ``thinker.hidden_states[accept_hidden_layer]``.
+    #
+    # * Default ``-1``: post-final-norm output (= ``model.norm(last_layer)``).
+    #   Used by Qwen3-Omni Talker → CodePredictor: HF reads
+    #   ``hidden_states[0][-1]`` which resolves to the post-norm tensor.
+    accept_hidden_layer: int = -1
     # -------------------------------------------------- quantization config
     quant: QuantConfig = field(default_factory=QuantConfig)
     # ------------------------------------------ mamba / hybrid config
@@ -337,14 +538,25 @@ class ModelConfig:
     # with tree-attention inputs (attention_mask, attention_pos_id) and
     # an extra hidden_states output (concatenated from 3 selected layers).
     eagle_base: bool = False
+    # ------------------------------------------ DFlash config
+    # When True, export the standard Qwen3.5 model as the DFlash base with
+    # tree-attention verify inputs and multi-layer hidden_states output.
+    dflash_base: bool = False
+    is_dflash_draft_flag: bool = False
+    dflash_target_layer_ids: List[int] = field(default_factory=list)
+    dflash_block_size: int = 16
+    dflash_mask_token_id: int = 248070
     # ------------------------------------------ sparse MoE config (Qwen3-style)
-    # num_experts=0 means dense (no MoE).
+    # num_experts=0 means dense (no MoE) for Qwen/Mixtral-style keys; Nemotron-H instead reports
+    # its expert count via n_routed_experts, so n_routed_experts > 0 also indicates MoE.
     num_experts: int = 0
     n_routed_experts: int = 0
     num_experts_per_tok: int = 0
     # Expert MLP intermediate size (may differ from dense intermediate_size).
     moe_intermediate_size: int = 0
     moe_shared_expert_intermediate_size: int = 0
+    # Optional latent dimension used by Nemotron-H routed experts.
+    moe_latent_size: Optional[int] = None
     routed_scaling_factor: float = 1.0
     n_group: int = 1
     topk_group: int = 1
@@ -359,10 +571,38 @@ class ModelConfig:
     # Runtime vocabulary reduction. ``vocab_size`` remains the original
     # tokenizer/embedding size; this field is only the exported logits size.
     reduced_vocab_size: Optional[int] = None
+    # ------------------------------------------ per-layer embeddings (Gemma4)
+    # When > 0, Gemma4 E-model PLE is enabled. The ONNX graph receives
+    # one runtime-provided ple_token_embeds_* tensor per decoder layer and
+    # combines it with the context-aware projection from inputs_embeds.
+    hidden_size_per_layer_input: int = 0
+    # Gemma4 E-model vocabulary for the runtime-side token-identity PLE table.
+    # The table is exported as ple_embedding.safetensors and gathered by C++.
+    vocab_size_per_layer_input: int = 0
+    # Gemma4: number of KV-shared layers (counted from the last layer backward).
+    # Layers [num_hidden_layers - num_kv_shared_layers, num_hidden_layers) are
+    # "KV-shared" — in HF they reuse KV states from the last non-shared layer
+    # of the same attention type. Our export gives them independent K/V, but
+    # they may have a 2× wider MLP (use_double_wide_mlp).
+    num_kv_shared_layers: int = 0
+    # When True, KV-shared layers use 2× intermediate_size for their MLP.
+    use_double_wide_mlp: bool = False
+    # ------------------------------------------ tensor parallel
+    # ``mapping`` is the single source of truth for parallel placement.
+    # tp_size>1 returns a per-rank ONNX graph with col/row-parallel projections.
+    mapping: Mapping = field(default_factory=Mapping)
 
     # ------------------------------------------------------------------
     # Derived properties
     # ------------------------------------------------------------------
+
+    @property
+    def tp_size(self) -> int:
+        return self.mapping.tp_size
+
+    @property
+    def tp_rank(self) -> int:
+        return self.mapping.tp_rank
 
     @property
     def is_eagle3_draft(self) -> bool:
@@ -373,7 +613,16 @@ class ModelConfig:
         """True for a derived MTP draft config built from a base checkpoint."""
         return bool(self.mtp_num_hidden_layers is not None
                     and self.gdn_cfg is None and not self.mtp_base
-                    and not self.is_eagle3_draft)
+                    and not self.is_eagle3_draft and not self.is_dflash_draft)
+
+    @property
+    def is_dflash_draft(self) -> bool:
+        return self.is_dflash_draft_flag
+
+    @property
+    def ple_enabled(self) -> bool:
+        """True when Gemma4 per-layer embeddings are enabled."""
+        return self.hidden_size_per_layer_input > 0
 
     @property
     def eagle3_target_hidden_size(self) -> int:
@@ -389,7 +638,13 @@ class ModelConfig:
 
     @property
     def num_attn_layers(self) -> int:
-        return sum(1 for t in self.layer_types if t == LAYER_ATTN)
+        """Total attention layers (includes Gemma4 sliding/full variants).
+
+        Note: layers may have heterogeneous head dims — use per-layer configs
+        (kv_layer_configs) for allocation, not this count alone.
+        """
+        return sum(1 for t in self.layer_types
+                   if t in (LAYER_ATTN, "sliding_attention", "full_attention"))
 
     @property
     def num_mamba_layers(self) -> int:
@@ -408,6 +663,11 @@ class ModelConfig:
         return sum(1 for t in self.layer_types if t == LAYER_MOE)
 
     @property
+    def use_dual_rope(self) -> bool:
+        return (self.sliding_rope_config is not None
+                and self.full_rope_config is not None)
+
+    @property
     def compute_dtype(self) -> "torch.dtype":  # noqa: F821
         import torch
         _MAP = {
@@ -416,6 +676,34 @@ class ModelConfig:
             "float32": torch.float32,
         }
         return _MAP.get(self.torch_dtype, torch.bfloat16)
+
+    def for_rank(self, rank: int, world: int) -> "ModelConfig":
+        """Return a per-rank copy of this config for TP.
+
+        Divides head and intermediate sizes by *world* so each rank's model
+        carries per-rank shapes.
+
+        Usage:
+            cfg = ModelConfig.from_pretrained(path).for_rank(rank, world)
+            model = CausalLM(cfg)
+            load_weights(model, path, mapping=cfg.mapping)
+        """
+        import copy
+        if world == 1:
+            return self
+        for name, v in (("num_attention_heads", self.num_attention_heads),
+                        ("num_key_value_heads", self.num_key_value_heads),
+                        ("intermediate_size", self.intermediate_size)):
+            if v % world:
+                raise ValueError(
+                    f"TP world={world}: {name}={v} is not divisible by {world}"
+                )
+        c = copy.deepcopy(self)
+        c.mapping = Mapping(world_size=world, tp_size=world, tp_rank=rank)
+        c.num_attention_heads //= world
+        c.num_key_value_heads //= world
+        c.intermediate_size //= world
+        return c
 
     # ------------------------------------------------------------------
     # Factory
@@ -440,14 +728,25 @@ class ModelConfig:
         hidden_size = llm_dict["hidden_size"]
         num_attn_heads = llm_dict["num_attention_heads"]
         head_dim = llm_dict.get("head_dim", hidden_size // num_attn_heads)
+        global_head_dim = int(llm_dict.get("global_head_dim", 0) or 0)
+        num_global_kv_heads = int(
+            llm_dict.get("num_global_key_value_heads", 0) or 0)
 
         quant = _parse_quant(model_dir, llm_dict)
         layer_types = _parse_layer_types(llm_dict)
+        attention_layer_types = _parse_attention_layer_types(
+            llm_dict, llm_dict["num_hidden_layers"], model_type)
+        dual_rope_configs = _get_dual_rope_configs(llm_dict)
         mamba_cfg = _parse_mamba_cfg(llm_dict,
                                      layer_types,
                                      model_dir=model_dir)
         gdn_cfg = _parse_gdn_cfg(llm_dict, layer_types)
         has_qk_norm = _detect_has_qk_norm(model_dir)
+        has_value_norm = _get_has_value_norm(llm_dict, model_type)
+        attention_scaling = _get_attention_scaling(llm_dict, model_type,
+                                                   head_dim)
+        embedding_scale = _get_embedding_scale(llm_dict, model_type,
+                                               hidden_size)
 
         # MTP config
         mtp_num_hidden_layers = llm_dict.get("mtp_num_hidden_layers")
@@ -464,8 +763,12 @@ class ModelConfig:
         # EAGLE3 draft model fields
         draft_vocab_size = llm_dict.get("draft_vocab_size", None)
         target_hidden_size = llm_dict.get("target_hidden_size", None)
-        # Sliding window: only active when use_sliding_window=True.
+        # Sliding window: active when use_sliding_window=True, OR when
+        # layer_types contains "sliding_attention" (Gemma4 convention).
         use_sw = llm_dict.get("use_sliding_window", False)
+        layer_types_raw = llm_dict.get("layer_types", [])
+        if not use_sw and "sliding_attention" in layer_types_raw:
+            use_sw = True
         sw_raw = llm_dict.get("sliding_window") if use_sw else None
         sliding_window_size = int(sw_raw) if sw_raw is not None else -1
 
@@ -474,8 +777,21 @@ class ModelConfig:
         num_experts = int(
             llm_dict.get("num_experts", llm_dict.get("num_local_experts", 0))
             or 0)
-        num_experts_per_tok = int(llm_dict.get("num_experts_per_tok", 0))
-        moe_intermediate_size = int(llm_dict.get("moe_intermediate_size", 0))
+        # Nemotron-H declares routed experts as ``n_routed_experts`` rather
+        # than ``num_experts`` / ``num_local_experts``; treat either as MoE so
+        # the sizes below are parsed instead of defaulting to 0.
+        n_routed_experts = int(llm_dict.get("n_routed_experts", 0) or 0)
+        if num_experts > 0 or n_routed_experts > 0:
+            num_experts_per_tok = int(
+                llm_dict.get("num_experts_per_tok",
+                             llm_dict.get("top_k_experts", 0)) or 0)
+            moe_intermediate_size = int(
+                llm_dict.get("moe_intermediate_size", 0) or 0)
+        else:
+            num_experts_per_tok = 0
+            moe_intermediate_size = 0
+        # HF Qwen3-Omni MoE Talker uses the un-prefixed name; HF NemotronH /
+        # other MoE families use ``moe_shared_expert_intermediate_size``.
         moe_shared_expert_intermediate_size = int(
             llm_dict.get("moe_shared_expert_intermediate_size",
                          llm_dict.get("shared_expert_intermediate_size", 0))
@@ -487,6 +803,9 @@ class ModelConfig:
         decoder_sparse_step = int(llm_dict.get("decoder_sparse_step", 1))
         mlp_only_layers = list(llm_dict.get("mlp_only_layers") or [])
         norm_topk_prob = bool(llm_dict.get("norm_topk_prob", True))
+        moe_latent_size = llm_dict.get("moe_latent_size", None)
+        if moe_latent_size is not None:
+            moe_latent_size = int(moe_latent_size)
 
         intermediate_size = int(
             llm_dict.get("intermediate_size")
@@ -503,23 +822,35 @@ class ModelConfig:
                                              num_attn_heads),
             intermediate_size=intermediate_size,
             head_dim=head_dim,
-            rms_norm_eps=llm_dict.get("rms_norm_eps", 1e-6),
+            global_head_dim=global_head_dim,
+            num_global_key_value_heads=num_global_kv_heads,
+            rms_norm_eps=_get_rms_norm_eps(llm_dict, model_type),
             vocab_size=llm_dict["vocab_size"],
             rope_theta=_get_rope_theta(llm_dict),
             max_position_embeddings=llm_dict.get("max_position_embeddings",
                                                  4096),
-            rope_scaling=(llm_dict.get("rope_scaling")
-                          or llm_dict.get("rope_parameters") or None),
+            rope_scaling=_select_rope_scaling(llm_dict),
             original_max_position_embeddings=llm_dict.get(
                 "original_max_position_embeddings", None),
             partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
+            hidden_activation=llm_dict.get("hidden_activation",
+                                           llm_dict.get("hidden_act", "silu")),
+            sliding_rope_config=dual_rope_configs.get("sliding_rope_config"),
+            full_rope_config=dual_rope_configs.get("full_rope_config"),
             has_qk_norm=has_qk_norm,
+            has_value_norm=has_value_norm,
             attention_bias=bool(llm_dict.get("attention_bias", False)),
+            attention_scaling=attention_scaling,
+            attention_k_eq_v=bool(llm_dict.get("attention_k_eq_v", False)),
+            embedding_scale=embedding_scale,
+            final_logit_softcapping=llm_dict.get("final_logit_softcapping",
+                                                 None),
             torch_dtype=llm_dict.get("torch_dtype",
                                      llm_dict.get("dtype", "bfloat16")),
             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
             sliding_window_size=sliding_window_size,
             layer_types=layer_types,
+            attention_layer_types=attention_layer_types,
             quant=quant,
             mamba_cfg=mamba_cfg,
             gdn_cfg=gdn_cfg,
@@ -527,22 +858,34 @@ class ModelConfig:
             mtp_num_hidden_layers=mtp_num_hidden_layers,
             mtp_use_dedicated_embeddings=mtp_use_dedicated_embeddings,
             mtp_base=bool(llm_dict.get("mtp_base", False)),
+            dflash_base=bool(llm_dict.get("dflash_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
+            accept_hidden_layer=_parse_accept_hidden_layer(llm_dict,
+                                                           root_config=root),
             draft_vocab_size=draft_vocab_size,
             target_hidden_size=target_hidden_size,
             num_experts=num_experts,
-            n_routed_experts=llm_dict.get("n_routed_experts", 0),
+            n_routed_experts=n_routed_experts,
             num_experts_per_tok=num_experts_per_tok,
             moe_intermediate_size=moe_intermediate_size,
             moe_shared_expert_intermediate_size=
             moe_shared_expert_intermediate_size,
+            moe_latent_size=moe_latent_size,
             routed_scaling_factor=routed_scaling_factor,
             n_group=n_group,
             topk_group=topk_group,
             decoder_sparse_step=decoder_sparse_step,
             mlp_only_layers=mlp_only_layers,
             norm_topk_prob=norm_topk_prob,
+            hidden_size_per_layer_input=int(
+                llm_dict.get("hidden_size_per_layer_input", 0) or 0),
+            vocab_size_per_layer_input=int(
+                llm_dict.get("vocab_size_per_layer_input", 0) or 0),
+            num_kv_shared_layers=int(
+                llm_dict.get("num_kv_shared_layers", 0) or 0),
+            use_double_wide_mlp=bool(llm_dict.get("use_double_wide_mlp",
+                                                  False)),
         )
 
 
@@ -551,8 +894,30 @@ class ModelConfig:
 # ---------------------------------------------------------------------------
 
 # When HF omits ``deepstack_visual_indexes`` / ``num_deepstack_features``,
-# these model families still expect three visual deepstack injections.
-_DEEPSTACK_MODEL_TYPES = ("qwen3_vl", "qwen3_omni")
+# these model_types are known to expect three visual deepstack injections
+# at runtime (Thinker side only). Listed explicitly — substring matching
+# (``"qwen3_omni" in "qwen3_omni_moe_talker"``) would otherwise mis-classify
+# Talker / CodePredictor configs as deepstack producers and bake 3 dangling
+# input ports into their engines.
+_DEEPSTACK_MODEL_TYPES = frozenset({
+    # HF root configs that wrap a deepstack-emitting visual encoder
+    "qwen3_vl",
+    "qwen3_omni",
+    "qwen3_omni_moe",
+    # Standalone Thinker text-LLM configs (after quant export); the Thinker
+    # still consumes deepstack inputs from the separately exported visual
+    # encoder at runtime.
+    "qwen3_vl_text",
+    "qwen3_omni_text",
+    "qwen3_omni_moe_text",
+})
+
+_QWEN3_5_MTP_CONFIG_MODEL_TYPES = frozenset({
+    "qwen3_5",
+    "qwen3_5_text",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+})
 
 
 def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
@@ -618,6 +983,53 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
     )
 
 
+def make_dflash_draft_config(draft_dir: str) -> ModelConfig:
+    """Build a DFlash draft ModelConfig from the draft checkpoint directory.
+
+    Now quantization-aware: if the draft directory contains
+    ``hf_quant_config.json`` (e.g. from DFlash draft NVFP4 quantization),
+    the quant config is parsed so ``make_linear`` will produce the correct
+    Linear class (``NVFP4Linear`` etc.) during ONNX export.
+    """
+    _, llm_dict = load_checkpoint_config_dicts(draft_dir)
+    dflash_config = llm_dict.get("dflash_config", {}) or {}
+
+    # Parse quantization config from the draft checkpoint directory.
+    # For FP16 draft checkpoints this returns QuantConfig() (no quant).
+    quant = _parse_quant(draft_dir, llm_dict)
+
+    return ModelConfig(
+        model_type=llm_dict.get("model_type", "qwen3"),
+        hidden_size=llm_dict["hidden_size"],
+        num_hidden_layers=llm_dict["num_hidden_layers"],
+        num_attention_heads=llm_dict["num_attention_heads"],
+        num_key_value_heads=llm_dict.get("num_key_value_heads",
+                                         llm_dict["num_attention_heads"]),
+        intermediate_size=llm_dict["intermediate_size"],
+        head_dim=llm_dict.get(
+            "head_dim",
+            llm_dict["hidden_size"] // llm_dict["num_attention_heads"]),
+        rms_norm_eps=llm_dict.get("rms_norm_eps", 1e-6),
+        vocab_size=llm_dict["vocab_size"],
+        rope_theta=_get_rope_theta(llm_dict),
+        max_position_embeddings=llm_dict.get("max_position_embeddings", 4096),
+        rope_scaling=(llm_dict.get("rope_scaling")
+                      or llm_dict.get("rope_parameters") or None),
+        partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
+        has_qk_norm=True,
+        torch_dtype=llm_dict.get("torch_dtype", "bfloat16"),
+        tie_word_embeddings=False,
+        layer_types=[LAYER_ATTN] * int(llm_dict["num_hidden_layers"]),
+        is_dflash_draft_flag=True,
+        dflash_target_layer_ids=list(
+            dflash_config.get("target_layer_ids", [1, 8, 15, 22, 29])),
+        dflash_block_size=int(
+            dflash_config.get("block_size", llm_dict.get("block_size", 16))),
+        dflash_mask_token_id=int(dflash_config.get("mask_token_id", 248070)),
+        quant=quant,
+    )
+
+
 def _parse_num_deepstack_features(
     config: dict,
     model_type: str,
@@ -647,10 +1059,42 @@ def _parse_num_deepstack_features(
                 return len(indexes)
 
     root_mt = (root_config or {}).get("model_type") or ""
-    merged = f"{model_type} {root_mt}"
-    if any(t in merged for t in _DEEPSTACK_MODEL_TYPES):
+    if model_type in _DEEPSTACK_MODEL_TYPES or root_mt in _DEEPSTACK_MODEL_TYPES:
         return 3
     return 0
+
+
+def _parse_accept_hidden_layer(
+    config: dict,
+    *,
+    root_config: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Return ``accept_hidden_layer`` (Thinker decoder layer count whose output
+    is handed off to the Qwen3-Omni Talker), or -1 when not applicable.
+
+    Lookup order:
+      1. ``accept_hidden_layer`` at the LLM (text) dict top level.  This is
+         the layout written by the standalone-Thinker quant export, which
+         promotes the field out of ``talker_config`` into the Thinker root.
+      2. ``root_config["talker_config"]["accept_hidden_layer"]`` for the
+         full multimodal HF config.
+      3. ``root_config["accept_hidden_layer"]`` as a defensive fallback for
+         standalone Talker checkpoints where this field already lives at
+         root.
+    """
+    raw = config.get("accept_hidden_layer")
+    if raw is not None:
+        return int(raw)
+    if root_config is not None:
+        talker_cfg = root_config.get("talker_config")
+        if isinstance(talker_cfg, dict):
+            raw = talker_cfg.get("accept_hidden_layer")
+            if raw is not None:
+                return int(raw)
+        raw = root_config.get("accept_hidden_layer")
+        if raw is not None:
+            return int(raw)
+    return -1
 
 
 def _validate_mtp_constraints(
@@ -662,17 +1106,15 @@ def _validate_mtp_constraints(
     """Validate the currently supported MTP config subset."""
     if mtp_num_hidden_layers is None and not mtp_use_dedicated_embeddings:
         return
-    if model_type not in ("qwen3_5_text", "qwen3_5_moe_text"):
+    if model_type not in _QWEN3_5_MTP_CONFIG_MODEL_TYPES:
         raise NotImplementedError(
             "MTP config parsing is only supported for Qwen3.5 checkpoints.")
     if mtp_num_hidden_layers != 1:
         raise NotImplementedError(
-            "Only mtp_num_hidden_layers == 1 is supported for Qwen3.5 dense MTP."
-        )
+            "Only mtp_num_hidden_layers == 1 is supported for Qwen3.5 MTP.")
     if mtp_use_dedicated_embeddings:
         raise NotImplementedError(
-            "Dedicated MTP embeddings are not supported for Qwen3.5 dense MTP."
-        )
+            "Dedicated MTP embeddings are not supported for Qwen3.5 MTP.")
 
 
 def _parse_layer_types(config: dict) -> List[str]:
@@ -699,6 +1141,9 @@ def _parse_layer_types(config: dict) -> List[str]:
                 result.append(LAYER_MOE)
             elif "mlp" in bt_lower:
                 result.append(LAYER_MLP)
+            elif bt_lower in ("sliding_attention", "full_attention"):
+                # Gemma4: preserve raw string for per-layer head_dim dispatch
+                result.append(bt_lower)
             else:
                 result.append(LAYER_ATTN)
         return result
@@ -825,10 +1270,15 @@ def _get_partial_rotary_factor(llm_dict: Dict[str, Any]) -> float:
         return float(prf)
     for key in ("rope_parameters", "rope_scaling"):
         nested = llm_dict.get(key)
-        if isinstance(
-                nested,
-                dict) and nested.get("partial_rotary_factor") is not None:
+        if not isinstance(nested, dict):
+            continue
+        if nested.get("partial_rotary_factor") is not None:
             return float(nested["partial_rotary_factor"])
+        for attention_type in ("full_attention", "sliding_attention"):
+            attention_params = nested.get(attention_type)
+            if (isinstance(attention_params, dict) and
+                    attention_params.get("partial_rotary_factor") is not None):
+                return float(attention_params["partial_rotary_factor"])
     return 1.0
 
 
@@ -838,23 +1288,37 @@ def _detect_has_qk_norm(model_dir: str) -> bool:
     This is model-agnostic: any architecture that stores per-head Q/K norms
     as ``*.q_norm.weight`` buffers will be detected correctly.
     """
-    index_path = os.path.join(model_dir, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            index = json.load(f)
-        return any(".q_norm.weight" in k
-                   for k in index.get("weight_map", {}).keys())
+    return any(".q_norm.weight" in k
+               for k in _checkpoint_weight_keys(model_dir))
 
-    # Single-shard: scan keys without loading tensors
+
+def _checkpoint_weight_keys(model_dir: str) -> List[str]:
+    """Return checkpoint tensor keys, ignoring stale shard indexes when needed."""
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
     single_path = os.path.join(model_dir, "model.safetensors")
+    if os.path.exists(index_path):
+        try:
+            with open(index_path) as f:
+                index = json.load(f)
+            weight_map = index.get("weight_map", {})
+            missing_shards = {
+                shard
+                for shard in set(weight_map.values())
+                if not os.path.exists(os.path.join(model_dir, shard))
+            }
+            if not missing_shards or not os.path.exists(single_path):
+                return list(weight_map.keys())
+        except (OSError, json.JSONDecodeError):
+            pass
+
     if os.path.exists(single_path):
         try:
             from safetensors import safe_open
             with safe_open(single_path, framework="pt") as f:
-                return any(".q_norm.weight" in k for k in f.keys())
+                return list(f.keys())
         except (OSError, ImportError):
             pass
-    return False
+    return []
 
 
 _VL_LLM_PREFIXES = ("language_model.", "text_model.", "llm.", "thinker.")
@@ -901,24 +1365,11 @@ def _detect_unquantized_modules(model_dir: str) -> List[str]:
     """Return module names whose weights are plain float (not int4 quantized).
 
     Some layers (often ``lm_head``) use ``*.weight`` instead of ``*.qweight``.
-    VL wrapper prefixes (``language_model.`` etc.) are stripped so that the
-    returned names match the short names used by ``make_linear()``.
+    Checkpoint wrapper prefixes (``model.``, ``language_model.``, etc.) are
+    stripped so that the returned names match the short names used by
+    ``make_linear()``.
     """
-    all_keys: List[str] = []
-    index_path = os.path.join(model_dir, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            index = json.load(f)
-        all_keys = list(index.get("weight_map", {}).keys())
-    else:
-        single_path = os.path.join(model_dir, "model.safetensors")
-        if os.path.exists(single_path):
-            try:
-                from safetensors import safe_open
-                with safe_open(single_path, framework="pt") as f:
-                    all_keys = list(f.keys())
-            except (OSError, ImportError):
-                pass
+    all_keys = _checkpoint_weight_keys(model_dir)
 
     # Top-level module prefix = everything before the last dot segment
     qweight_modules = {
@@ -930,13 +1381,13 @@ def _detect_unquantized_modules(model_dir: str) -> List[str]:
         for k in all_keys if k.endswith(".weight")
     }
     excluded: List[str] = [
-        _strip_vl_prefix(m) for m in (weight_modules - qweight_modules)
+        _normalize_module_name(m) for m in (weight_modules - qweight_modules)
     ]
     # lm_head may have neither .weight nor .qweight when tie_word_embeddings=True
     # (the checkpoint omits lm_head.weight entirely).  Treat it as FP16 so that
     # tie_weights() can clone embed_tokens.weight into it after loading.
     all_linear_stripped = {
-        _strip_vl_prefix(m)
+        _normalize_module_name(m)
         for m in qweight_modules | weight_modules
     }
     if "lm_head" not in all_linear_stripped:
@@ -966,21 +1417,7 @@ def _with_gdn_fused_exclusions(modules: List[str]) -> List[str]:
 
 def _detect_quantized_modules(model_dir: str) -> List[str]:
     """Return modules that have checkpoint quantization sidecars."""
-    all_keys: List[str] = []
-    index_path = os.path.join(model_dir, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            index = json.load(f)
-        all_keys = list(index.get("weight_map", {}).keys())
-    else:
-        single_path = os.path.join(model_dir, "model.safetensors")
-        if os.path.exists(single_path):
-            try:
-                from safetensors import safe_open
-                with safe_open(single_path, framework="pt") as f:
-                    all_keys = list(f.keys())
-            except (OSError, ImportError):
-                pass
+    all_keys = _checkpoint_weight_keys(model_dir)
 
     suffixes = (".qweight", ".weight_scale", ".weight_scale_2", ".input_scale",
                 ".scales")
@@ -1038,24 +1475,7 @@ def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
     opposite direction: false-negative excludes when ``exclude_modules`` is
     silent on a submodule that was actually skipped during PTQ.
     """
-    all_keys: List[str] = []
-    index_path = os.path.join(model_dir, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        try:
-            with open(index_path) as f:
-                index = json.load(f)
-            all_keys = list(index.get("weight_map", {}).keys())
-        except (OSError, json.JSONDecodeError):
-            pass
-    if not all_keys:
-        single_path = os.path.join(model_dir, "model.safetensors")
-        if os.path.exists(single_path):
-            try:
-                from safetensors import safe_open
-                with safe_open(single_path, framework="pt") as f:
-                    all_keys = list(f.keys())
-            except (OSError, ImportError):
-                pass
+    all_keys = _checkpoint_weight_keys(model_dir)
 
     if not all_keys:
         return []
@@ -1089,24 +1509,6 @@ def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
     return _with_gdn_fused_exclusions(sorted(excluded))
 
 
-def _parse_nvfp4_moe_backend(blob: dict) -> str:
-    """Read ``nvfp4_moe_backend`` from a quantization-config blob.
-
-    Accepts ``thor`` / ``geforce`` (case-insensitive). Missing key falls back
-    to :data:`NVFP4_MOE_BACKEND_THOR`. Raises on an unknown explicit value so
-    typos don't silently degrade the deployment target.
-    """
-    raw = blob.get("nvfp4_moe_backend")
-    if raw is None:
-        return NVFP4_MOE_BACKEND_THOR
-    backend = str(raw).strip().lower()
-    if backend not in _VALID_NVFP4_MOE_BACKENDS:
-        raise ValueError(
-            f"nvfp4_moe_backend must be one of {_VALID_NVFP4_MOE_BACKENDS}, "
-            f"got {raw!r}")
-    return backend
-
-
 def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
     """Determine quantisation config from hf_quant_config.json or config.json."""
 
@@ -1116,7 +1518,6 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
         with open(hf_path) as f:
             hq = json.load(f)
         q = hq.get("quantization", {})
-        nvfp4_moe_backend = _parse_nvfp4_moe_backend(q)
         algo = (q.get("quant_algo") or "").upper()
         if "AWQ" in algo and "W4A16" in algo:
             # Drop exclusions that the checkpoint contradicts (false positives),
@@ -1131,7 +1532,6 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
                 quant_type=QUANT_INT4_AWQ_MODELOPT,
                 group_size=int(q.get("group_size", 128)),
                 excluded=excluded,
-                nvfp4_moe_backend=nvfp4_moe_backend,
             )
         if algo == "MIXED_PRECISION":
             quantized_layers = q.get("quantized_layers", {})
@@ -1145,7 +1545,6 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
                     model_dir, list(q.get("exclude_modules", []))),
                 layer_overrides=layer_overrides,
                 is_mixed_precision=True,
-                nvfp4_moe_backend=nvfp4_moe_backend,
             )
         qt = _algo_to_quant_type(algo)
         gs = int(q.get("group_size", 1))
@@ -1161,14 +1560,12 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             group_size=gs,
             kv_cache_quant=_kv_norm(q.get("kv_cache_quant_algo", "")),
             excluded=excluded,
-            nvfp4_moe_backend=nvfp4_moe_backend,
         )
 
     # ---- Embedded quantization_config in config.json ------------------------
     qc = config.get("quantization_config")
     if qc is None:
         return QuantConfig()
-    nvfp4_moe_backend = _parse_nvfp4_moe_backend(qc)
 
     # Embedded block with ``quant_algo`` (export tool formats)
     if "quant_algo" in qc:
@@ -1179,7 +1576,6 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
                 group_size=int(qc.get("group_size", 128)),
                 excluded=_effective_excluded_modules(
                     model_dir, list(qc.get("ignore", []))),
-                nvfp4_moe_backend=nvfp4_moe_backend,
             )
         group_size = 1
         cg = qc.get("config_groups", {})
@@ -1195,7 +1591,6 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             kv_cache_quant=kv_str,
             excluded=_effective_excluded_modules(model_dir,
                                                  list(qc.get("ignore", []))),
-            nvfp4_moe_backend=nvfp4_moe_backend,
         )
 
     # quant_method == awq (column-packed int4 checkpoints)
@@ -1204,7 +1599,6 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             quant_type=QUANT_INT4_AWQ,
             group_size=int(qc.get("group_size", 128)),
             excluded=_detect_unquantized_modules(model_dir),
-            nvfp4_moe_backend=nvfp4_moe_backend,
         )
 
     # quant_method == gptq
@@ -1215,10 +1609,9 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             gptq_zero_point_offset=_detect_gptq_zero_point_offset(
                 model_dir, qc),
             excluded=_detect_unquantized_modules(model_dir),
-            nvfp4_moe_backend=nvfp4_moe_backend,
         )
 
-    return QuantConfig(nvfp4_moe_backend=nvfp4_moe_backend)
+    return QuantConfig()
 
 
 def _detect_gptq_zero_point_offset(model_dir: str, qc: dict) -> int:

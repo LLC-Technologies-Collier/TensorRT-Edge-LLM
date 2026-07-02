@@ -320,7 +320,7 @@ def _causal_conv1d_translation(
     padding: int,
     dilation: int,
     groups: int,
-) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16, onnxscript.FLOAT16]:
     output, conv_state_out = _trt_edgellm.causal_conv1d(
         hidden_states,
         weight,
@@ -334,7 +334,8 @@ def _causal_conv1d_translation(
         use_mtp=0,
         _outputs=2,
     )
-    return output, conv_state_out
+    intermediate_conv_state_out = _op21.Identity(conv_state_out)
+    return output, conv_state_out, intermediate_conv_state_out
 
 
 @script()
@@ -399,7 +400,7 @@ def _gated_delta_net_translation(
     context_lengths: onnxscript.INT32,
     k_dim: int,
     v_dim: int,
-) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT]:
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT, onnxscript.FLOAT]:
     output, h0_out = _trt_edgellm.gated_delta_net(
         q,
         k,
@@ -415,7 +416,8 @@ def _gated_delta_net_translation(
         use_mtp=0,
         _outputs=2,
     )
-    return output, h0_out
+    intermediate_h0_out = _op21.Identity(h0_out)
+    return output, h0_out, intermediate_h0_out
 
 
 @script()
@@ -557,6 +559,60 @@ def _vit_attention_plugin_translation(
 
 
 # ---------------------------------------------------------------------------
+# TRT-native ViT attention (TRT >= 11, packed NHD with Q scaling)
+# ---------------------------------------------------------------------------
+
+
+@script()
+def _vit_trt_attention_inner(
+    query_states: onnxscript.FLOAT16,
+    key_states: onnxscript.FLOAT16,
+    value_states: onnxscript.FLOAT16,
+    mask: onnxscript.FLOAT16,
+    query_lengths: onnxscript.INT32,
+    kv_lengths: onnxscript.INT32,
+) -> onnxscript.FLOAT16:
+    """Inner onnxscript function with all 6 positional inputs."""
+    return _trt.TRT_Attention(
+        query_states,
+        key_states,
+        value_states,
+        mask,
+        query_lengths,
+        kv_lengths,
+        query_form="packed_nhd",
+        kv_form="packed_nhd",
+        causal_kind="none",
+        TRT_decomposable=0,
+    )
+
+
+def _vit_trt_attention_translation(
+    query_states,
+    key_states,
+    value_states,
+    query_lengths,
+    kv_lengths,
+    num_heads,
+    head_size,
+):
+    """ViT ragged self-attention via TRT-native IAttention (packed NHD).
+
+    Q is expected to be pre-scaled by 1/sqrt(head_size) by the caller.
+    query_lengths and kv_lengths must be separate graph tensors — TRT
+    crashes when the same ONNX tensor is wired to both positions.
+    """
+    return _vit_trt_attention_inner(
+        query_states,
+        key_states,
+        value_states,
+        None,
+        query_lengths,
+        kv_lengths,
+    )
+
+
+# ---------------------------------------------------------------------------
 # TRT native attention ops (RotaryEmbedding, TensorScatter, Attention)
 # ---------------------------------------------------------------------------
 
@@ -645,15 +701,14 @@ def _int4_moe_plugin_translation(
 def _nvfp4_moe_plugin_translation(
     router_logits: onnxscript.FLOAT,
     hidden_states: onnxscript.FLOAT16,
-    hidden_global_scale: onnxscript.FLOAT,
-    up_weights: onnxscript.INT8,
-    up_block_scale: onnxscript.INT8,
-    up_global_scale: onnxscript.FLOAT,
-    down_weights: onnxscript.INT8,
-    down_block_scale: onnxscript.INT8,
-    down_global_scale: onnxscript.FLOAT,
-    up_block_scale_decode: onnxscript.INT8,
-    down_block_scale_decode: onnxscript.INT8,
+    fc1_qweights: onnxscript.INT8,
+    fc1_blocks_scale: onnxscript.INT8,
+    fc1_alpha: onnxscript.FLOAT,
+    fc2_qweights: onnxscript.INT8,
+    fc2_blocks_scale: onnxscript.INT8,
+    fc2_alpha: onnxscript.FLOAT,
+    input_global_scale: onnxscript.FLOAT,
+    down_input_scale: onnxscript.FLOAT,
     e_score_correction_bias: onnxscript.FLOAT,
     num_experts: int,
     top_k: int,
@@ -665,19 +720,21 @@ def _nvfp4_moe_plugin_translation(
     norm_topk_prob: int,
     routed_scaling_factor: float,
     routing_mode: int,
+    backend: int,
+    io_dtype: int,
+    max_routed_rows: int,
 ) -> onnxscript.FLOAT16:
     output = _trt_edgellm.Nvfp4MoePlugin(
         router_logits,
         hidden_states,
-        hidden_global_scale,
-        up_weights,
-        up_block_scale,
-        up_global_scale,
-        down_weights,
-        down_block_scale,
-        down_global_scale,
-        up_block_scale_decode,
-        down_block_scale_decode,
+        fc1_qweights,
+        fc1_blocks_scale,
+        fc1_alpha,
+        fc2_qweights,
+        fc2_blocks_scale,
+        fc2_alpha,
+        input_global_scale,
+        down_input_scale,
         e_score_correction_bias,
         num_experts=num_experts,
         top_k=top_k,
@@ -689,8 +746,16 @@ def _nvfp4_moe_plugin_translation(
         norm_topk_prob=norm_topk_prob,
         routed_scaling_factor=routed_scaling_factor,
         routing_mode=routing_mode,
+        backend=backend,
+        io_dtype=io_dtype,
+        max_routed_rows=max_routed_rows,
     )
     return output
+
+
+# ---------------------------------------------------------------------------
+# NvFP4MoEPluginGeforce (SM12x fused; same signature, different plugin layer)
+# ---------------------------------------------------------------------------
 
 
 @script()
@@ -705,11 +770,17 @@ def _nvfp4_moe_plugin_geforce_translation(
     fc2_alpha: onnxscript.FLOAT,
     input_global_scale: onnxscript.FLOAT,
     down_input_scale: onnxscript.FLOAT,
+    e_score_correction_bias: onnxscript.FLOAT,
     num_experts: int,
     top_k: int,
     hidden_size: int,
     moe_inter_size: int,
     activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    routing_mode: int,
     backend: int,
     io_dtype: int,
     max_routed_rows: int,
@@ -725,16 +796,84 @@ def _nvfp4_moe_plugin_geforce_translation(
         fc2_alpha,
         input_global_scale,
         down_input_scale,
+        e_score_correction_bias,
         num_experts=num_experts,
         top_k=top_k,
         hidden_size=hidden_size,
         moe_inter_size=moe_inter_size,
         activation_type=activation_type,
+        n_group=n_group,
+        topk_group=topk_group,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_mode=routing_mode,
         backend=backend,
         io_dtype=io_dtype,
         max_routed_rows=max_routed_rows,
     )
     return output
+
+
+# ---------------------------------------------------------------------------
+# FusedGemmAllReducePlugin (row-parallel NVFP4 GEMM + AllReduce)
+# ---------------------------------------------------------------------------
+
+
+@script()
+def _fused_gemm_allreduce_translation(
+    hidden_states: onnxscript.FLOAT16,
+    global_scale: onnxscript.FLOAT,
+    weight_f4: onnxscript.INT8,
+    weight_f8_scale: onnxscript.FLOAT8E4M3FN,
+    weight_f32_scale: onnxscript.FLOAT,
+    tp_size: int,
+    fuse_residual_rmsnorm: int,
+) -> onnxscript.FLOAT16:
+    """Emit the full row-parallel NVFP4 GEMM + AllReduce ONNX subgraph."""
+    x_f4, sx_f8 = _trt.TRT_FP4DynamicQuantize(
+        hidden_states,
+        global_scale,
+        axis=-1,
+        block_size=16,
+        scale_type=17,
+        _outputs=2,
+    )
+    combined_scale = _trt.DequantizeLinear(sx_f8, global_scale)
+    return _trt_edgellm.FusedGemmAllReducePlugin(
+        x_f4,
+        combined_scale,
+        weight_f4,
+        weight_f8_scale,
+        weight_f32_scale,
+        tp_size=tp_size,
+        fuse_residual_rmsnorm=fuse_residual_rmsnorm,
+    )
+
+
+# ---------------------------------------------------------------------------
+# DFlash target KV cache update op
+# ---------------------------------------------------------------------------
+
+
+@script()
+def _dflash_target_kv_cache_update_translation(
+    k_delta: onnxscript.FLOAT16,
+    v_delta: onnxscript.FLOAT16,
+    past_key_value: onnxscript.FLOAT16,
+    rope_cos_sin: onnxscript.FLOAT,
+    delta_start_positions: onnxscript.INT32,
+    delta_lengths: onnxscript.INT32,
+) -> onnxscript.FLOAT16:
+    """DFlash target KV cache update: apply RoPE to k_delta, write k+v into cache."""
+    present_kv = _trt_edgellm.DFlashTargetKVCacheUpdate(
+        k_delta,
+        v_delta,
+        past_key_value,
+        rope_cos_sin,
+        delta_start_positions,
+        delta_lengths,
+    )
+    return present_kv
 
 
 def build_custom_translation_table() -> dict:
@@ -781,6 +920,8 @@ def build_custom_translation_table() -> dict:
         _gated_delta_net_dispatch,
         torch.ops.trt.vit_attention_plugin.default:
         _vit_attention_plugin_translation,
+        torch.ops.trt.vit_trt_attention.default:
+        _vit_trt_attention_translation,
         torch.ops.trt.gather_nd.default:
         _gather_nd_translation,
         torch.ops.trt_edgellm.int4_moe_plugin.default:
@@ -789,6 +930,8 @@ def build_custom_translation_table() -> dict:
         _nvfp4_moe_plugin_translation,
         torch.ops.trt_edgellm.NvFP4MoEPluginGeforce.default:
         _nvfp4_moe_plugin_geforce_translation,
+        torch.ops.trt_edgellm.dflash_target_kv_cache_update.default:
+        _dflash_target_kv_cache_update_translation,
         # TRT native attention ops (used by EdgeLLMAttentionTRTNative / Alpamayo)
         torch.ops.trt.rope_onnx.default:
         _rope_onnx_translation,
@@ -796,4 +939,6 @@ def build_custom_translation_table() -> dict:
         _kv_cache_update_onnx_translation,
         torch.ops.trt.attention_onnx.default:
         _attention_onnx_translation,
+        torch.ops.trt_edgellm.fused_gemm_allreduce.default:
+        _fused_gemm_allreduce_translation,
     }

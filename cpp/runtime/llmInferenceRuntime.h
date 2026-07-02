@@ -31,6 +31,7 @@
 #include "runtime/features/deepstackBinding.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
+#include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/preprocess/stepPreparer.h"
 #include "runtime/state/decodingInferenceContext.h"
 #include "runtime/state/pipelineIO.h"
@@ -224,6 +225,7 @@ private:
 
     rt::Tensor mSharedExecContextMemory{}; //!< Shared device memory for all execution contexts
     int32_t mMaxRuntimeBatchSize{1};       //!< Maximum runtime batch size
+    bool mHasFFPALayer{false};             //!< True if any attention layer uses headDim=512 (FFPA)
 
     DeploymentConfig mDeployment{};                    //!< Parsed base+draft configs + consolidated strategy settings
     std::unique_ptr<EngineExecutor> mBaseExecutor;     //!< Base model TRT wrapper
@@ -232,8 +234,9 @@ private:
     TensorMap mBaseTensorMap;                          //!< Base engine binding map
     std::unique_ptr<DecodingRuntimeContext> mDecodingRuntimeContext;
     std::unique_ptr<DecoderRegistry> mDecoderRegistry;
-    std::unique_ptr<StepPreparer> mStepPreparer;          //!< Per-step sequence preprocessor
-    std::unique_ptr<EmbeddingPreprocessor> mEmbeddingPre; //!< Embedding-lookup preprocessor
+    std::unique_ptr<StepPreparer> mStepPreparer;             //!< Per-step sequence preprocessor
+    std::unique_ptr<EmbeddingPreprocessor> mEmbeddingPre;    //!< Embedding-lookup preprocessor
+    std::unique_ptr<Gemma4EmbeddingPreprocessor> mGemma4Ple; //!< Gemma4 PLE token-identity preprocessor
     //! Base-engine deepstack binding (nullptr when the base engine was built
     //! without deepstack features). Swaps between `io.deepstackEmbeds[i]`
     //! (prefill) and the shared `zeroDeepstackBroadcast` (all other phases).
@@ -287,6 +290,12 @@ private:
 
     //! @brief Zero all recurrent/conv states for a given batch index.
     void zeroRecurrentStates(int32_t batchIdx, cudaStream_t stream);
+
+    //! @brief Zero embedding/PLE tensors at padding positions before engine execution.
+    //! FFPA (headDim=512) has no cu_seqlens support and processes all positions uniformly,
+    //! so non-zero padding embeddings cause fp16 overflow → NaN propagation.
+    void zeroPaddingForFFPA(
+        int32_t const* contextLengths, int32_t batchSize, int32_t inputIdsLength, cudaStream_t stream);
 
     // Key functions to drive the runtime, defined in a consumer-producer pattern.
     // Consume tokenized IDS as input and produce hidden states for the whole sequence and first generated token.

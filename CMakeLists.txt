@@ -17,7 +17,7 @@ cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
 project(
   tensorrt_edgellm_sdk
-  VERSION 0.8.0
+  VERSION 0.9.0
   LANGUAGES C CXX CUDA)
 
 # Specify the C++ standard and flags
@@ -139,7 +139,8 @@ set(COMMON_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/cpp
     ${CMAKE_SOURCE_DIR}/examples/multimodal
     ${CMAKE_SOURCE_DIR}/3rdParty/nlohmannJson/include
-    ${CMAKE_SOURCE_DIR}/3rdParty/stb)
+    ${CMAKE_SOURCE_DIR}/3rdParty/stb
+    ${CMAKE_SOURCE_DIR}/3rdParty/miniaudio)
 
 add_library(commonLibraryExt INTERFACE)
 target_link_libraries(
@@ -162,8 +163,19 @@ option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
 option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 
 # CuTe DSL unified kernel option — declare here so it is always defined before
-# any subdirectory or include references it. Choices: OFF | ALL | fmha | gdn |
-# semicolon-separated group list (e.g. -DENABLE_CUTE_DSL=fmha;gdn).
+# any subdirectory or include references it.
+# cmake-format: off
+# Choices:
+#   OFF              -- no CuTe DSL kernels
+#   ALL              -- enable every kernel group below
+#   fmha             -- FMHA Blackwell attention
+#   gdn              -- gated delta net (Mamba2-style hybrid SSM)
+#   nvfp4_moe        -- SM110 (Thor) split FC1/FC2 NVFP4 MoE; consumed by the
+#                       SM110-only ``Nvfp4MoePlugin``
+#   nvfp4_fused_moe  -- SM12x (consumer Blackwell / Spark GB10) fused NVFP4
+#                       MoE; consumed by ``NvFP4MoEPluginGeforce``
+#   semicolon-separated group list (e.g. -DENABLE_CUTE_DSL=fmha;gdn)
+# cmake-format: on
 set(ENABLE_CUTE_DSL
     "OFF"
     CACHE

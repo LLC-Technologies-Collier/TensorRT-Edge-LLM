@@ -271,10 +271,13 @@ size_t CausalConv1dPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* in
 
 int32_t CausalConv1dPlugin::getAliasedInput(int32_t outputIndex) noexcept
 {
-    if (outputIndex == kOUT_CONV_STATE_IDX)
-    {
-        return kIN_CONV_STATE_IDX;
-    }
+    // WAR: this is not the correct plugin API usage. The
+    // plugin updates the conv state in place, so the correct return is the
+    // conv-state input index. We return -1 to drop the alias because declaring it
+    // makes Myelin keep a redundant per-layer state copy (the perf regression).
+    // In-place read-write still works because the runtime binds the past and
+    // present conv state to the same buffer. TODO: restore the alias declaration
+    // once the Myelin issue is fixed.
     return -1;
 }
 
@@ -315,7 +318,7 @@ int32_t CausalConv1dPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTen
     // TODO: refactor the dispatch logic to explicitly distinguish MTP tree-verify decoding
     // from prefill when 1 < seqLen <= kMTPMaxSeqLen (e.g. pass an execution-phase flag
     // from the runtime instead of relying solely on seq_len range heuristics).
-    constexpr int32_t kMTPMaxSeqLen = 8;
+    constexpr int32_t kMTPMaxSeqLen = 16;
     bool const mtpActive = mUseMTP && (seqLen > 1) && (seqLen <= kMTPMaxSeqLen);
 
     namespace rt = trt_edgellm::rt;

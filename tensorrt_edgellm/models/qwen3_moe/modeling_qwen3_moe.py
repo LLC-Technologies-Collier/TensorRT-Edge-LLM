@@ -32,8 +32,8 @@ MoE layer design
 The entire Qwen3SparseMoeBlock — router (Linear + Softmax + TopK) and all
 expert GEMMs (gate/up/down projections with SiLU gating) plus weighted
 combine — is captured as a single custom MoE op. GPTQ/AWQ exports keep using
-``trt_edgellm::Int4MoePlugin``. NVFP4 exports use the CuTeDSL GeForce
-``trt_edgellm::NvFP4MoEPluginGeforce`` contract.
+``trt_edgellm::Int4MoePlugin``. NVFP4 exports use the CuTeDSL
+``trt_edgellm::Nvfp4MoePlugin`` contract.
 
 Per-expert weights are loaded into an ``nn.ModuleList`` for checkpoint
 compatibility, then stacked into 3-D tensors ``[E, ...]`` during the
@@ -64,33 +64,30 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 
-from ...config import NVFP4_MOE_BACKEND_GEFORCE, QUANT_NVFP4, ModelConfig
+from ...config import QUANT_NVFP4, ModelConfig
 from ..default.modeling_default import (MLP, Attention, OnnxSpec, RMSNorm,
                                         _make_flat_wrapper)
 from ..linear import FP16Linear, make_linear
-from ..ops import int4_moe_plugin, nvfp4_moe_plugin, nvfp4_moe_plugin_geforce
+from ..ops import (int4_moe_plugin, nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
+                   use_geforce_nvfp4_moe)
 
 logger = logging.getLogger(__name__)
 
 # SiLU activation type expected by the C++ Int4MoePlugin.
 _INT4_ACTIVATION_SILU = 0
 
-# Activation_type for the Marlin/CuTeDSL ``Nvfp4MoePlugin`` (Thor SM110
-# backend). The plugin folds gated SwiGLU internally via the 32-column
-# interleaved (up, gate) FC1 weight layout and ``nOutFor(SiLU, 2*I) = I``; see
-# ``cpp/plugins/nvfp4MoePlugin/nvfp4MoePlugin.cpp::mapActivation``.
-_NVFP4_THOR_ACTIVATION_SILU = 1
 # Plugin slot 0 — softmax + flat top-k + renormalize routing kernel
 # (``Nvfp4MoeRoutingMode::kSOFTMAX_TOPK``); Qwen3 does not use the
 # sigmoid-group-topk path.
 _NVFP4_ROUTING_MODE_SOFTMAX_TOPK = 0
 
-# SwiGLU activation_type for the GeForce SM120/121 ``NvFP4MoEPluginGeforce``
-# (different integer mapping than the Thor plugin: kSwiGLU=2 there).
-_NVFP4_GEFORCE_ACTIVATION_SWIGLU = 2
-_GEFORCE_BACKEND_AUTO = 0
-_GEFORCE_IO_DTYPE_FP16 = 1
-_GEFORCE_MAX_ROUTED_ROWS_AUTO = 0
+# SwiGLU activation_type for the ``Nvfp4MoePlugin`` plugin.
+_NVFP4_ACTIVATION_SWIGLU = 2
+_NVFP4_MOE_BACKEND_AUTO = 0
+_NVFP4_MOE_IO_DTYPE_FP16 = 1
+_NVFP4_MOE_MAX_ROUTED_ROWS_AUTO = 0
+_NVFP4_MOE_N_GROUP_FLAT = 1
+_NVFP4_MOE_TOPK_GROUP_FLAT = 1
 
 # ONNX export dummy-input dims.
 _BATCH_SIZE = 1
@@ -225,32 +222,54 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.group_size = config.quant.group_size
         self.zero_point_offset = config.quant.gptq_zero_point_offset
         self._use_nvfp4_moe = config.quant.quant_type == QUANT_NVFP4
-        # NVFP4 backend dispatch: Thor (CuTeDSL ``Nvfp4MoePlugin``,
-        # SM100/101/110) or GeForce (``NvFP4MoEPluginGeforce``, SM120/121).
-        # See ``QuantConfig.nvfp4_moe_backend`` and the
-        # ``NVFP4_MOE_BACKEND_*`` constants in ``tensorrt_edgellm/config.py``.
-        self._nvfp4_moe_backend = config.quant.nvfp4_moe_backend
-        self._use_nvfp4_geforce = (self._use_nvfp4_moe
-                                   and self._nvfp4_moe_backend
-                                   == NVFP4_MOE_BACKEND_GEFORCE)
         # ``activation_type`` integer is plugin-specific — ints carry
-        # different meanings between Int4MoePlugin (SiLU=0), Nvfp4MoePlugin
-        # (SiLU=1) and NvFP4MoEPluginGeforce (SwiGLU=2). The per-path
-        # constants above document each mapping; see the corresponding C++
-        # plugin headers for the source of truth.
+        # different meanings between Int4MoePlugin (SiLU=0) and
+        # Nvfp4MoePlugin (SwiGLU=2). The per-path constants above
+        # document each mapping; see the corresponding C++ plugin headers
+        # for the source of truth.
         if not self._use_nvfp4_moe:
             self.activation_type = _INT4_ACTIVATION_SILU
-        elif self._use_nvfp4_geforce:
-            self.activation_type = _NVFP4_GEFORCE_ACTIVATION_SWIGLU
         else:
-            self.activation_type = _NVFP4_THOR_ACTIVATION_SILU
-        # GeForce-only attributes; values track the defaults consumed by
-        # ``NvFP4MoEPluginGeforce``.
-        self.backend = _GEFORCE_BACKEND_AUTO
-        self.io_dtype = _GEFORCE_IO_DTYPE_FP16
-        self.max_routed_rows = _GEFORCE_MAX_ROUTED_ROWS_AUTO
+            self.activation_type = _NVFP4_ACTIVATION_SWIGLU
+        # Plugin attributes consumed by ``Nvfp4MoePlugin``.
+        self.backend = _NVFP4_MOE_BACKEND_AUTO
+        self.io_dtype = _NVFP4_MOE_IO_DTYPE_FP16
+        self.max_routed_rows = _NVFP4_MOE_MAX_ROUTED_ROWS_AUTO
         self.gate = Qwen3MoERouter(config)
         self.experts = Qwen3MoEExperts(config)
+
+        # Qwen3-Omni MoE Talker (and any HF MoE variant that ships a per-layer
+        # shared expert) adds a parallel SwiGLU MLP with a learned scalar gate.
+        # Layout:
+        #   y = routed_moe(x) + sigmoid(shared_expert_gate(x)) * shared_expert(x)
+        # where shared_expert is a standard gate/up/down SwiGLU MLP of width
+        # ``moe_shared_expert_intermediate_size`` and ``shared_expert_gate`` is
+        # a single-output Linear.  ``make_linear`` picks NVFP4Linear when the
+        # checkpoint is NVFP4 so the existing dense-NVFP4 inference path
+        # (DequantizeLinear + MatMul) handles it -- no MoE plugin involvement.
+        shared_inter = config.moe_shared_expert_intermediate_size
+        self._has_shared_expert = shared_inter > 0
+        if self._has_shared_expert:
+            self.shared_expert = nn.Module()
+            self.shared_expert.gate_proj = make_linear(
+                config,
+                self.hidden_size,
+                shared_inter,
+                module_name="shared_expert.gate_proj")
+            self.shared_expert.up_proj = make_linear(
+                config,
+                self.hidden_size,
+                shared_inter,
+                module_name="shared_expert.up_proj")
+            self.shared_expert.down_proj = make_linear(
+                config,
+                shared_inter,
+                self.hidden_size,
+                module_name="shared_expert.down_proj")
+            self.shared_expert_gate = nn.Linear(self.hidden_size,
+                                                1,
+                                                bias=False,
+                                                dtype=torch.float16)
 
     def _prepare_moe_weights(self) -> None:
         """Extract expert weights and prepare plugin buffers.
@@ -326,114 +345,21 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.experts = nn.ModuleList()
 
     def _prepare_nvfp4_moe_weights(self) -> None:
-        """Backend-agnostic dispatcher: pick Thor or GeForce repack."""
-        if self._use_nvfp4_geforce:
-            self._prepare_nvfp4_moe_weights_geforce()
-        else:
-            self._prepare_nvfp4_moe_weights_thor()
+        """NVFP4 expert repack for ``Nvfp4MoePlugin``."""
+        self._prepare_nvfp4_moe_weights_impl()
 
-    def _prepare_nvfp4_moe_weights_thor(self) -> None:
-        """Repack Qwen3 NVFP4 experts for ``Nvfp4MoePlugin`` (Thor SM110, gated SwiGLU).
-
-        Both the prefill grouped GEMM and the decode GEMV are CuTeDSL AOT
-        cubins (``cute_dsl_nvfp4_moe_fc{1,2}_*`` and ``gemv_{up,dn}_*``;
-        target SM100/101/110); they share a single N-major weight buffer.
-
-        Per-expert ``gate_proj`` / ``up_proj`` are interleaved into a single
-        FC1 weight ``[H, 2*I]`` as 32-column ``(up, gate)`` chunks and packed
-        N-major; ``down_proj`` is packed N-major as ``[I, H/2]``.
-        The plugin sees ``moe_inter_size = 2*I`` (the FC1 N-axis) and
-        ``activation_type = 1`` (SiLU); ``nOutFor(SiLU, 2*I) = I`` recovers
-        the post-SwiGLU intermediate dim. Activation NVFP4 quantization is
-        done inside the plugin via ``fp4Quantize`` — only the per-tensor
-        global scales need to be threaded through (slot 2:
-        ``hidden_global_scale [2]``).
-        """
-        from ...checkpoint.repacking import repack_nvfp4_qwen3_moe_experts_thor
-
-        self.gate_linear = nn.Linear(self.hidden_size,
-                                     self.num_experts,
-                                     bias=False,
-                                     dtype=torch.float16)
-        self.gate_linear.weight.data = self.gate.weight.data
-
-        (
-            fc_up_qw,
-            fc_up_bs,
-            fc_up_gs,
-            fc_down_qw,
-            fc_down_bs,
-            fc_down_gs,
-            fc_up_bs_dec,
-            fc_down_bs_dec,
-        ) = repack_nvfp4_qwen3_moe_experts_thor(self.experts, self.hidden_size,
-                                                self.moe_intermediate_size,
-                                                self.group_size)
-
-        device = self.gate.weight.device
-        self.register_buffer("fc_up_qweights",
-                             fc_up_qw.to(device).contiguous())
-        self.register_buffer("fc_up_blocks_scale",
-                             fc_up_bs.to(device).contiguous())
-        self.register_buffer("fc_up_global_scale",
-                             fc_up_gs.to(device).contiguous())
-        self.register_buffer("fc_down_qweights",
-                             fc_down_qw.to(device).contiguous())
-        self.register_buffer("fc_down_blocks_scale",
-                             fc_down_bs.to(device).contiguous())
-        self.register_buffer("fc_down_global_scale",
-                             fc_down_gs.to(device).contiguous())
-        # Slots 9 / 10 are decode-scale slots; decode now reads the prefill SF
-        # at slots 4 / 7, but the plugin still validates them as INT8 tensors.
-        self.register_buffer("fc_up_blocks_scale_decode",
-                             fc_up_bs_dec.to(device).contiguous())
-        self.register_buffer("fc_down_blocks_scale_decode",
-                             fc_down_bs_dec.to(device).contiguous())
-
-        # Length-2 [FC1, FC2] activation global scales — max across experts of
-        # ``NVFP4Linear.input_scale`` (already ``amax / (6 * 448)`` per linear
-        # forward; see ``models/linear.py:NVFP4Linear``). Gate and up share
-        # the same activation, so FC1's scale folds in both.
-        fc1_act_gs = max(
-            max(float(e.gate_proj.input_scale.detach().float().max().item()),
-                float(e.up_proj.input_scale.detach().float().max().item()))
-            for e in self.experts)
-        fc2_act_gs = max(
-            float(e.down_proj.input_scale.detach().float().max().item())
-            for e in self.experts)
-        self.register_buffer(
-            "hidden_global_scale",
-            torch.tensor([fc1_act_gs, fc2_act_gs],
-                         dtype=torch.float32,
-                         device=device))
-
-        # Qwen3 routes via softmax-topk and does not consume an
-        # e_score_correction_bias; pass zeros so the bias is a no-op.
-        self.register_buffer(
-            "e_score_correction_bias",
-            torch.zeros(self.num_experts, dtype=torch.float32, device=device))
-
-        logger.info(
-            "Nvfp4MoePlugin (Thor gated)-packed %d Qwen3 experts: "
-            "fc_up_qw %s, fc_down_qw %s",
-            self.num_experts,
-            list(self.fc_up_qweights.shape),
-            list(self.fc_down_qweights.shape),
-        )
-
-        self.experts = nn.ModuleList()
-
-    def _prepare_nvfp4_moe_weights_geforce(self) -> None:
-        """Repack Qwen3 NVFP4 experts for ``NvFP4MoEPluginGeforce`` (SM120/121).
+    def _prepare_nvfp4_moe_weights_impl(self) -> None:
+        """Repack Qwen3 NVFP4 experts for the active NVFP4 MoE plugin.
 
         Decodes ModelOpt NVFP4 to dense, rounds through BF16, and emits the
-        CuTeDSL 6D MMA scale layout the GeForce fused kernel expects. FC1
-        is ``[up, gate]`` along the M axis (the SwiGLU order the GeForce
-        kernel hard-codes; see ``kernelSrcs/nvfp4_fused_moe_cutedsl/`` and
-        :func:`repack_nvfp4_qwen3_moe_experts_geforce`).
+        CuTeDSL 6D MMA scale layout the kernel expects. FC1 SwiGLU layout
+        is selected from :func:`use_geforce_nvfp4_moe`:
+
+        * SM100/101/110 ``Nvfp4MoePlugin`` -- 64-row up/gate interleave (default).
+        * SM12x ``NvFP4MoEPluginGeforce`` -- plain ``[up_all, gate_all]``
+          concat along the M axis.
         """
-        from ...checkpoint.repacking import \
-            repack_nvfp4_qwen3_moe_experts_geforce
+        from ...checkpoint.repacking import repack_nvfp4_qwen3_moe_experts
 
         self.gate_linear = nn.Linear(self.hidden_size,
                                      self.num_experts,
@@ -441,11 +367,13 @@ class Qwen3SparseMoeBlock(nn.Module):
                                      dtype=torch.float16)
         self.gate_linear.weight.data = self.gate.weight.data
 
+        fc1_layout = "concat" if use_geforce_nvfp4_moe() else "interleave"
         fc1_qweights, fc1_blocks_scale, fc2_qweights, fc2_blocks_scale = (
-            repack_nvfp4_qwen3_moe_experts_geforce(self.experts,
-                                                   self.hidden_size,
-                                                   self.moe_intermediate_size,
-                                                   self.group_size))
+            repack_nvfp4_qwen3_moe_experts(self.experts,
+                                           self.hidden_size,
+                                           self.moe_intermediate_size,
+                                           self.group_size,
+                                           fc1_layout=fc1_layout))
 
         device = self.gate.weight.device
         self.register_buffer("fc1_qweights",
@@ -471,23 +399,49 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.register_buffer(
             "down_input_scale",
             torch.ones(self.num_experts, dtype=torch.float32, device=device))
+        self.register_buffer(
+            "e_score_correction_bias",
+            torch.zeros(self.num_experts, dtype=torch.float32, device=device))
 
         logger.info(
-            "NvFP4MoEPluginGeforce (CuTeDSL fused)-packed %d Qwen3 experts: "
+            "%s (CuTeDSL)-packed %d Qwen3 experts (fc1_layout=%s): "
             "fc1_qw %s, fc2_qw %s",
+            "NvFP4MoEPluginGeforce"
+            if use_geforce_nvfp4_moe() else "Nvfp4MoePlugin",
             self.num_experts,
+            fc1_layout,
             list(self.fc1_qweights.shape),
             list(self.fc2_qweights.shape),
         )
 
         self.experts = nn.ModuleList()
 
+    def _shared_expert_forward(self,
+                               hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the per-layer shared expert MLP with sigmoid gating.
+
+        Matches HF Qwen3-Omni MoE Talker:
+            gate_logits = shared_expert_gate(x)                 # [..., 1]
+            gated = sigmoid(gate_logits) * shared_expert(x)
+            return gated
+        ``shared_expert`` is a SwiGLU MLP (gate_proj / up_proj / down_proj)
+        whose constituent linears live on the standard dense NVFP4 path.
+        """
+        gate = self.shared_expert.gate_proj(hidden_states)
+        up = self.shared_expert.up_proj(hidden_states)
+        intermediate = torch.nn.functional.silu(gate) * up
+        shared_out = self.shared_expert.down_proj(intermediate)
+        gate_logits = self.shared_expert_gate(hidden_states)
+        return torch.sigmoid(gate_logits) * shared_out
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, hidden_dim)
         router_logits = self.gate_linear(hidden_flat).float()
-        if self._use_nvfp4_geforce:
-            return nvfp4_moe_plugin_geforce(
+        if self._use_nvfp4_moe:
+            moe_op = (nvfp4_moe_plugin_geforce
+                      if use_geforce_nvfp4_moe() else nvfp4_moe_plugin)
+            routed = moe_op(
                 router_logits,
                 hidden_states,
                 self.fc1_qweights,
@@ -498,44 +452,25 @@ class Qwen3SparseMoeBlock(nn.Module):
                 self.fc2_alpha,
                 self.input_global_scale,
                 self.down_input_scale,
+                self.e_score_correction_bias,
                 self.num_experts,
                 self.top_k,
                 self.hidden_size,
                 self.moe_intermediate_size,
                 self.activation_type,
+                _NVFP4_MOE_N_GROUP_FLAT,
+                _NVFP4_MOE_TOPK_GROUP_FLAT,
+                1,
+                1.0,
+                _NVFP4_ROUTING_MODE_SOFTMAX_TOPK,
                 self.backend,
                 self.io_dtype,
                 self.max_routed_rows,
             )
-        if self._use_nvfp4_moe:
-            # Thor path. FC1 width passed to the plugin is 2*I; the plugin
-            # reads 32-column interleaved (up, gate) weights and folds SwiGLU
-            # in the FC1 epilogue (``nOutFor(SiLU, 2*I) = I``).
-            return nvfp4_moe_plugin(
-                router_logits,
-                hidden_states,
-                self.hidden_global_scale,
-                self.fc_up_qweights,
-                self.fc_up_blocks_scale,
-                self.fc_up_global_scale,
-                self.fc_down_qweights,
-                self.fc_down_blocks_scale,
-                self.fc_down_global_scale,
-                self.fc_up_blocks_scale_decode,
-                self.fc_down_blocks_scale_decode,
-                self.e_score_correction_bias,
-                num_experts=self.num_experts,
-                top_k=self.top_k,
-                hidden_size=self.hidden_size,
-                moe_inter_size=2 * self.moe_intermediate_size,
-                activation_type=self.activation_type,
-                n_group=1,
-                topk_group=1,
-                norm_topk_prob=1,
-                routed_scaling_factor=1.0,
-                routing_mode=_NVFP4_ROUTING_MODE_SOFTMAX_TOPK,
-            )
-        return int4_moe_plugin(
+            if self._has_shared_expert:
+                routed = routed + self._shared_expert_forward(hidden_states)
+            return routed
+        routed = int4_moe_plugin(
             router_logits,
             hidden_states,
             self.fc_gate_up_qweights,
@@ -549,6 +484,9 @@ class Qwen3SparseMoeBlock(nn.Module):
             self.activation_type,
             self.group_size,
         )
+        if self._has_shared_expert:
+            routed = routed + self._shared_expert_forward(hidden_states)
+        return routed
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +563,24 @@ class Qwen3MoeTransformer(nn.Module):
             for i in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # Decoder layer index whose OUTPUT is exposed via
+        # ``last_pre_norm_hidden_states`` for the Qwen3-Omni Talker.
+        # ``accept_hidden_layer`` follows HF's ``hidden_states[k]`` convention:
+        # k=N means "after N decoder layers", so we stash hidden_states right
+        # after ``layer_index == accept_hidden_layer - 1``.  Negative value
+        # falls back to the legacy "last layer" behaviour.
+        self.accept_hidden_layer: int = int(
+            getattr(config, "accept_hidden_layer", -1))
+        self.last_pre_norm_hidden_states: "torch.Tensor | None" = None
+        # Tensor exposed to CausalLM wrapper when ``emit_hidden_states``
+        # is enabled. Selection (set in ``forward``):
+        #   * accept_hidden_layer >= 1 → pre-norm output of that decoder layer
+        #     (Thinker → Talker; HF reads layer_k pre-norm).
+        #   * accept_hidden_layer < 1  → post-final-norm output (= self.norm
+        #     applied to layer-N output). Matches HF's Talker → CodePredictor
+        #     past_hidden semantics (modeling_qwen3_omni_moe.py:3176, where
+        #     ``hidden_states[0][-1]`` resolves to the post-norm tensor).
+        self.emitted_hidden_states: "torch.Tensor | None" = None
 
     def forward(
         self,
@@ -633,9 +589,17 @@ class Qwen3MoeTransformer(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        deepstack_embeds: Tuple[torch.Tensor, ...] = (),
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
         hidden_states = inputs_embeds
         present_key_values_list: List[torch.Tensor] = []
+
+        # ``accept_hidden_layer == k`` (k >= 1) means the runtime expects the
+        # output of decoder layer (k-1) i.e. "the residual after k layers",
+        # matching HF Qwen3-Omni's ``hidden_states[k]`` indexing convention.
+        # Capture that tensor below; negative or 0 falls back to "last layer".
+        target_layer = self.accept_hidden_layer
+        captured: "torch.Tensor | None" = None
 
         for layer_index, layer in enumerate(self.layers):
             hidden_states, next_key_value = layer(
@@ -647,7 +611,38 @@ class Qwen3MoeTransformer(nn.Module):
             )
             present_key_values_list.append(next_key_value)
 
-        return self.norm(hidden_states), tuple(present_key_values_list)
+            # Multimodal deepstack visual embedding (post-layer, first N layers).
+            # Mirrors modeling_default.Transformer.forward; Qwen3-Omni MoE
+            # Thinker needs deepstack injection for image understanding.
+            if layer_index < len(deepstack_embeds):
+                hidden_states = hidden_states + deepstack_embeds[layer_index]
+
+            if target_layer >= 1 and layer_index == target_layer - 1:
+                captured = hidden_states
+
+        # Expose the captured layer-output for the Qwen3-Omni Thinker -> Talker
+        # next-stage consumer. When ``target_layer`` is unset / negative, fall back to the
+        # legacy behaviour of stashing the last decoder layer's output.  Plain
+        # text generation ignores this attribute regardless.
+        self.last_pre_norm_hidden_states = (captured if captured is not None
+                                            else hidden_states)
+
+        normed = self.norm(hidden_states)
+
+        # Emitted tensor (consumed by Qwen3MoeCausalLM.forward when
+        # emit_hidden_states=True).  See attribute docstring on
+        # emitted_hidden_states in ``__init__`` for the selection rule.
+        # Defensive bounds check: if accept_hidden_layer was set but exceeds
+        # the actual layer count (e.g. Talker checkpoints inheriting Thinker's
+        # value of 24 while having only 20 layers), ``captured`` stays None
+        # and we fall back to the post-norm output rather than silently
+        # emitting the last layer's pre-norm.
+        if target_layer >= 1 and captured is not None:
+            self.emitted_hidden_states = self.last_pre_norm_hidden_states
+        else:
+            self.emitted_hidden_states = normed
+
+        return normed, tuple(present_key_values_list)
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +655,23 @@ class Qwen3MoeCausalLM(nn.Module):
 
     The inner transformer is stored as attribute ``model`` so parameter keys
     carry the ``model.`` prefix matching checkpoint key prefixes.
+
+    Subclasses can set the class attribute ``emit_hidden_states = True`` to
+    add a second ``hidden_states`` ONNX output carrying the full-sequence
+    tensor emitted on the additional ONNX output.  Selection depends on ``config.accept_hidden_layer``:
+
+    * ``accept_hidden_layer >= 1``: pre-norm output of that decoder layer.
+      Used by Qwen3-Omni MoE Thinker → Talker (HF picks
+      ``outputs.hidden_states[k]`` with k>=1 = layer-(k-1) output, pre-norm).
+
+    * ``accept_hidden_layer < 1`` (legacy default): post-final-norm output
+      (= ``self.norm(last_layer_output)``).  Used by Qwen3-Omni MoE
+      Talker → CodePredictor (HF picks
+      ``outputs.hidden_states[0][-1]`` which resolves to the post-norm tensor
+      in ``modeling_qwen3_omni_moe.py:3176``).
     """
+
+    emit_hidden_states: bool = False
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -686,7 +697,10 @@ class Qwen3MoeCausalLM(nn.Module):
         """Return all model-specific parameters needed for ONNX export."""
         config = self.config
         Na = config.num_hidden_layers
-        Nd = 0  # Qwen3-MoE has no deepstack visual embeddings
+        # Multimodal MoE Thinker variants (e.g. Qwen3-Omni MoE) inject
+        # ``num_deepstack_features`` visual embeddings post-layer at the
+        # first N layers; match modeling_default.Transformer.
+        Nd = config.num_deepstack_features
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
         dtype16 = torch.float16
@@ -726,16 +740,28 @@ class Qwen3MoeCausalLM(nn.Module):
                                      dtype=torch.int64,
                                      device=device)
 
+        deepstack_embeds_list: List[torch.Tensor] = [
+            torch.zeros(batch_size,
+                        seq_len,
+                        config.hidden_size,
+                        dtype=dtype16,
+                        device=device) for _ in range(Nd)
+        ]
+
         args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
-                context_lengths, kvcache_start_index, last_token_ids)
+                context_lengths, kvcache_start_index, last_token_ids,
+                *deepstack_embeds_list)
 
         input_names = (["inputs_embeds"] +
                        [f"past_key_values_{i}" for i in range(Na)] + [
                            "rope_rotary_cos_sin", "context_lengths",
                            "kvcache_start_index", "last_token_ids"
-                       ])
+                       ] + [f"deepstack_embeds_{i}" for i in range(Nd)])
         output_names = (["logits"] +
                         [f"present_key_values_{i}" for i in range(Na)])
+        if self.emit_hidden_states:
+            output_names = (["logits", "hidden_states"] +
+                            [f"present_key_values_{i}" for i in range(Na)])
 
         batch = torch.export.Dim("batch", min=1, max=256)
         seq = torch.export.Dim("seq_len", min=1, max=32768)
@@ -751,8 +777,11 @@ class Qwen3MoeCausalLM(nn.Module):
         all_shapes.append({0: batch})  # context_lengths
         all_shapes.append({0: kv_batch})  # kvcache_start_index
         all_shapes.append({0: batch})  # last_token_ids
+        for _ in range(Nd):
+            all_shapes.append({0: batch, 1: seq})  # deepstack_embeds_i
 
-        wrapped = _make_flat_wrapper(self, Na, Nd)
+        wrapped = _make_flat_wrapper(
+            self, Na, Nd, emit_hidden_states=self.emit_hidden_states)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -762,13 +791,14 @@ class Qwen3MoeCausalLM(nn.Module):
                         dynamic_shapes=all_shapes)
 
     def forward(
-        self,
-        inputs_embeds: torch.Tensor,
-        past_key_values: Tuple[torch.Tensor, ...],
-        rope_rotary_cos_sin: torch.Tensor,
-        context_lengths: torch.Tensor,
-        kvcache_start_index: torch.Tensor,
-        last_token_ids: torch.Tensor,
+            self,
+            inputs_embeds: torch.Tensor,
+            past_key_values: Tuple[torch.Tensor, ...],
+            rope_rotary_cos_sin: torch.Tensor,
+            context_lengths: torch.Tensor,
+            kvcache_start_index: torch.Tensor,
+            last_token_ids: torch.Tensor,
+            deepstack_embeds: Tuple[torch.Tensor, ...] = (),
     ) -> Tuple:
         hidden_states, present_key_values = self.model(
             inputs_embeds,
@@ -776,9 +806,20 @@ class Qwen3MoeCausalLM(nn.Module):
             rope_rotary_cos_sin,
             context_lengths,
             kvcache_start_index,
+            deepstack_embeds,
         )
         # Select hidden states for specified token positions before lm_head.
-        hidden_states = torch.ops.trt.gather_nd(hidden_states, last_token_ids)
+        selected_hidden_states = torch.ops.trt.gather_nd(
+            hidden_states, last_token_ids)
 
-        logits = self.lm_head(hidden_states).to(torch.float32)
+        logits = self.lm_head(selected_hidden_states).to(torch.float32)
+
+        if self.emit_hidden_states:
+            # Full-sequence hidden_states emitted to the next stage.
+            #   * Thinker→Talker (accept_hidden_layer>=1): pre-norm layer-k output
+            #   * Talker→CodePredictor (accept_hidden_layer<1): post-final-norm
+            # Selection logic lives in ``Qwen3MoeTransformer.forward``.
+            return logits, self.model.emitted_hidden_states, \
+                present_key_values
+
         return logits, present_key_values

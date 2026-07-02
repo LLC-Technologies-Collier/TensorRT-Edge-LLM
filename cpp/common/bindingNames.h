@@ -44,6 +44,14 @@ namespace binding_names
 inline constexpr char const* kInputsEmbeds = "inputs_embeds";
 
 /*!
+ * @brief Gemma4 per-layer token-identity embedding input template.
+ *
+ * Template: "ple_token_embeds_{layer_idx}"
+ * Shape: [batch_size, sequence_length, ple_hidden_size] (FLOAT16/BFLOAT16)
+ */
+inline constexpr char const* kPleTokenEmbedsTemplate = "ple_token_embeds";
+
+/*!
  * @brief Context lengths tensor - specifies the actual length of each sequence in the batch
  *
  * Shape: [batch_size] (INT32)
@@ -71,6 +79,28 @@ inline constexpr char const* kLogits = "logits";
  */
 inline constexpr char const* kOutputHiddenStates = "hidden_states";
 
+/*!
+ * @brief DFlash draft model input: concatenated target hidden states.
+ *
+ * Shape: [batch_size, context_length, base_output_hidden_dim] (FLOAT16)
+ */
+inline constexpr char const* kDFlashTargetHiddenConcat = "dflash_target_hidden_concat";
+
+/*!
+ * @brief DFlash draft model input: per-batch delta lengths for multi-batch.
+ *
+ * Shape: [batch_size] (INT32)
+ */
+inline constexpr char const* kDFlashDeltaLengths = "dflash_delta_lengths";
+
+/*!
+ * @brief Gemma4 PLE token-identity embedding table sidecar.
+ *
+ * Contains tensor "weight" with shape [vocab_size_per_layer_input,
+ * num_ple_inputs * ple_hidden_size].
+ */
+inline constexpr char const* kPleEmbeddingFileName = "ple_embedding.safetensors";
+
 /*! @} */
 
 /*! @name Positional Encoding Bindings
@@ -83,6 +113,20 @@ inline constexpr char const* kOutputHiddenStates = "hidden_states";
  * Shape: [batch_size, max_seq_len, rotary_dim] (FLOAT32)
  */
 inline constexpr char const* kRopeCosSin = "rope_rotary_cos_sin";
+
+/*!
+ * @brief Rotary positional encoding cos/sin cache tensor for sliding attention layers
+ *
+ * Shape: [batch_size, max_seq_len, sliding_rotary_dim] (FLOAT32)
+ */
+inline constexpr char const* kRopeCosSinSliding = "rope_rotary_cos_sin_sliding";
+
+/*!
+ * @brief Rotary positional encoding cos/sin cache tensor for full attention layers
+ *
+ * Shape: [batch_size, max_seq_len, full_rotary_dim] (FLOAT32)
+ */
+inline constexpr char const* kRopeCosSinFull = "rope_rotary_cos_sin_full";
 
 /*! @} */
 
@@ -288,11 +332,18 @@ inline constexpr char const* kVisualInput = "input";
 inline constexpr char const* kVisualOutput = "output";
 
 /*!
- * @brief Rotary positional embeddings for visual inputs (Qwen-VL specific)
+ * @brief Rotary positional embeddings for visual inputs
  *
  * Shape: [sequence_length, embed_dim] (FLOAT32)
  */
 inline constexpr char const* kRotaryPosEmb = "rotary_pos_emb";
+
+/*!
+ * @brief Gemma4 pixel position ids for visual patch embeddings and 2-D RoPE
+ *
+ * Shape: [sequence_length, 2] (INT64)
+ */
+inline constexpr char const* kPixelPositionIds = "pixel_position_ids";
 
 /*!
  * @brief Cumulative sequence lengths for ragged ViT attention
@@ -302,11 +353,28 @@ inline constexpr char const* kRotaryPosEmb = "rotary_pos_emb";
 inline constexpr char const* kCuSeqlens = "cu_seqlens";
 
 /*!
+ * @brief KV sequence lengths for TRT-native attention (TRT >= 11).
+ *
+ * Same data as cu_seqlens but must be a separate tensor — TRT IAttentionV2
+ * requires distinct tensors for query_lengths and kv_lengths inputs.
+ *
+ * Shape: [num_images + 1] (INT32)
+ */
+inline constexpr char const* kKvLengths = "kv_lengths";
+
+/*!
  * @brief Shape-only input used to convey runtime max sequence-length for FMHA launch
  *
  * Shape: [max_seqlen] (INT32)
  */
 inline constexpr char const* kMaxSeqLenCarrier = "max_seqlen_carrier";
+
+/*!
+ * @brief Gemma4 position-aware pooling weights
+ *
+ * Shape: [num_image_tokens, sequence_length] (FLOAT16)
+ */
+inline constexpr char const* kPoolingWeights = "pooling_weights";
 
 /*!
  * @brief Cumulative window sequence lengths for Qwen2.5-VL window attention
@@ -649,6 +717,17 @@ inline std::string formatDeepstackFeaturesName(int32_t layerIdx)
 inline std::string formatDeepstackEmbedsName(int32_t embedIdx)
 {
     return std::string(kDeepstackEmbedsTemplate) + "_" + std::to_string(embedIdx);
+}
+
+/*!
+ * @brief Format Gemma4 PLE token embedding input binding name.
+ *
+ * @param layerIdx The decoder layer index
+ * @return Formatted binding name like "ple_token_embeds_0"
+ */
+inline std::string formatPleTokenEmbedsName(int32_t layerIdx)
+{
+    return std::string(kPleTokenEmbedsTemplate) + "_" + std::to_string(layerIdx);
 }
 
 /*! @} */

@@ -33,7 +33,9 @@ pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
 # or
 pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
 
-pip install nvidia-cutlass-dsl==4.5.1
+# CUDA 13: install the [cu13] extra. CUDA 12: install the base package.
+pip install 'nvidia-cutlass-dsl[cu13]==4.5.2'  # CUDA 13.x
+# CUDA 12.x: pip install 'nvidia-cutlass-dsl==4.5.2'
 ```
 
 If your environment hits a `ModuleNotFoundError` while importing CUTLASS DSL,
@@ -190,7 +192,7 @@ Uses `tcgen05.mma` (UMMA) + TMA. Exported ABI is 3D with batch `L=1`:
 - `C`: `[M, N, 1]`
 
 Thor (`SM110`) requires explicitly using Blackwell-family shared-memory
-capacity in the kernel because cuTe DSL 4.5.1 does not auto-detect it
+capacity in the kernel because cuTe DSL 4.5.2 does not auto-detect it
 reliably.
 
 ### Blackwell GeForce / GB10
@@ -228,7 +230,7 @@ replacing the old cuBLAS-based path.
 
 | Dependency | Version |
 |---|---|
-| `nvidia-cutlass-dsl` | `4.5.1` |
+| `nvidia-cutlass-dsl` | `4.5.2` (CUDA 13: `[cu13]` extra; CUDA 12: base package) |
 | `cuda-python` | compatible with local CUDA |
 | `cupy-cuda12x` | `12.3.0` for CUDA 12.x |
 | `cupy-cuda13x` | `13.6.0` for CUDA 13.x |

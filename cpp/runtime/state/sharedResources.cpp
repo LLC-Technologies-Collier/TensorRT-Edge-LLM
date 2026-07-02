@@ -28,6 +28,23 @@ namespace trt_edgellm
 namespace rt
 {
 
+bool needsBaseVerifyIntermediateStates(DeploymentConfig const& bundle)
+{
+    if (bundle.base.numLinearAttnLayers == 0)
+    {
+        return false;
+    }
+
+    switch (bundle.base.specDecodeType)
+    {
+    case SpecDecodeMode::kMTP:
+    case SpecDecodeMode::kDFlash: return true;
+    case SpecDecodeMode::kEAGLE:
+    case SpecDecodeMode::kNONE: return false;
+    }
+    return false;
+}
+
 void allocateZeroBuffer(SharedResources& res, int64_t bytes)
 {
     res.zeroBuffer = Tensor({bytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8, "SharedResources::zeroBuffer");
@@ -71,39 +88,18 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
 
     // RoPE cache
     // For MRope, the cache is stored in PipelineIO (initialized below).
-    // For LongRope, we initialize the pool entry manually.
-    // For standard / dynamic / NoRope, getOrCreate handles everything.
-    if (cfg.ropeConfig.type == RopeType::kLongRope)
+    // For standard / dynamic / LongRope / NoRope, getOrCreate handles initialization.
+    if (cfg.useDualRope)
     {
-        // Pre-populate the RoPE pool entry, then reinitialize with the correct LongRope data.
-        rt::Tensor& ropeEntry
-            = resources->ropePool.getOrCreate(cfg.ropeConfig, cfg.rotaryDim, cfg.maxKVCacheCapacity, stream);
-        // getOrCreate allocated the tensor but initializeRopeCosSinCache fails for LongRope.
-        // Re-initialize with the LongRope-specific function.
         check::check(
-            cfg.ropeConfig.longRope.has_value() && cfg.ropeConfig.longRope.value().originalMaxPositionEmbeddings != -1,
-            "longRope is not set correctly");
-
-        rt::Tensor shortCosSinCache = rt::Tensor({1, cfg.maxKVCacheCapacity, cfg.rotaryDim}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kFLOAT, "LLMInferenceRuntime::shortCosSinCache");
-        rt::Tensor longCosSinCache = rt::Tensor({1, cfg.maxKVCacheCapacity, cfg.rotaryDim}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kFLOAT, "LLMInferenceRuntime::longCosSinCache");
-        bool const initRopeStatus
-            = initializeLongRopeCosSinCache(shortCosSinCache, longCosSinCache, cfg.ropeConfig, stream);
-        check::check(initRopeStatus, "Failed to initialize long Rope CosSinCache.");
-        // Choose short or long based on max KV capacity vs original max position embeddings.
-        if (cfg.maxKVCacheCapacity <= cfg.ropeConfig.longRope.value().originalMaxPositionEmbeddings)
-        {
-            ropeEntry = std::move(shortCosSinCache);
-        }
-        else
-        {
-            ropeEntry = std::move(longCosSinCache);
-        }
+            cfg.slidingRopeConfig.type != RopeType::kLongRope && cfg.fullRopeConfig.type != RopeType::kLongRope,
+            "LongRope is not supported with dual RoPE bindings");
+        resources->ropePool.getOrCreate(cfg.slidingRopeConfig, cfg.slidingRotaryDim, cfg.maxKVCacheCapacity, stream);
+        resources->ropePool.getOrCreate(cfg.fullRopeConfig, cfg.fullRotaryDim, cfg.maxKVCacheCapacity, stream);
     }
     else if (cfg.ropeConfig.type != RopeType::kMRope)
     {
-        // Standard / Dynamic / NoRope — getOrCreate handles initialization.
+        // Standard / Dynamic / LongRope / NoRope — getOrCreate handles initialization.
         resources->ropePool.getOrCreate(cfg.ropeConfig, cfg.rotaryDim, cfg.maxKVCacheCapacity, stream);
     }
     // MRope: handled via PipelineIO::mropeCosSin below.
@@ -161,17 +157,12 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
 
     int32_t const maxDraftProposalSize = bundle.specConfig->maxDraftProposalSize;
 
-    // Base hybrid cache manager (index 0). EAGLE3 base is pure-attention but
-    // an MTP base can be a hybrid model (e.g. Qwen3.5 MTP, 18 mamba layers),
-    // so size the Mamba sub-manager from the base's parsed config.
-    // MTP base needs intermediate-state slots sized to the verification
-    // budget so the accepted recurrent/conv snapshot can be committed after
-    // base verification.
+    // Base hybrid cache manager (index 0). Hybrid MTP/DFlash base verification
+    // writes per-token recurrent/conv snapshots; after accept, the decoder
+    // scatters only the accepted prefix into the persistent state pools.
     {
         int32_t const baseMaxIntermediateSeqLen
-            = (bundle.base.specDecodeType == SpecDecodeMode::kMTP && bundle.base.numLinearAttnLayers > 0)
-            ? bundle.specConfig->maxVerifySize
-            : 0;
+            = needsBaseVerifyIntermediateStates(bundle) ? bundle.specConfig->maxVerifySize : 0;
         rt::KVCacheManager::Config kvCfg{
             /*.numAttentionLayers=*/static_cast<int32_t>(bundle.base.kvLayerConfigs.size()),
             /*.maxBatchSize=*/bundle.base.maxSupportedBatchSize,
@@ -231,7 +222,17 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
     }
 
     // RoPE cache (shared — base and draft use same RoPE config)
-    if (bundle.base.ropeConfig.type != RopeType::kMRope)
+    if (bundle.base.useDualRope)
+    {
+        check::check(bundle.base.slidingRopeConfig.type != RopeType::kLongRope
+                && bundle.base.fullRopeConfig.type != RopeType::kLongRope,
+            "LongRope is not supported with dual RoPE bindings");
+        resources->ropePool.getOrCreate(
+            bundle.base.slidingRopeConfig, bundle.base.slidingRotaryDim, bundle.base.maxKVCacheCapacity, stream);
+        resources->ropePool.getOrCreate(
+            bundle.base.fullRopeConfig, bundle.base.fullRotaryDim, bundle.base.maxKVCacheCapacity, stream);
+    }
+    else if (bundle.base.ropeConfig.type != RopeType::kMRope)
     {
         resources->ropePool.getOrCreate(
             bundle.base.ropeConfig, bundle.base.rotaryDim, bundle.base.maxKVCacheCapacity, stream);

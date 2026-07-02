@@ -59,7 +59,7 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
     check::check(
         mRuntime.deployment.specConfig.has_value(), "SpecDecode drafting strategy requires a drafting config.");
     check::check(runtime.deployment.base.specDecodeType == SpecDecodeMode::kMTP,
-        "MTP decoding requires a base engine exported with model_type=mtp_base.");
+        "MTP decoding requires a base engine exported with spec_decode_type=mtp and engine_role=base.");
 
     mDraftExecutor = spec_decode_utils::loadDraftEngine(engineDir, mRuntime.deployment);
 
@@ -119,10 +119,9 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
         cudaMemsetAsync(mDraftVocabMappingTable.rawPointer(), 0, mDraftVocabMappingTable.getMemoryCapacity(), stream));
 }
 
-char const* MTPDecoder::unsupportedReason(LLMGenerationRequest const&) const noexcept
+char const* MTPDecoder::unsupportedReason(LLMGenerationRequest const& request) const noexcept
 {
-    // Greedy override is handled by the runtime (handleRequest forces greedy when spec-decode is active).
-    return nullptr;
+    return spec_decode_utils::isGreedyCompatible(request);
 }
 
 int64_t MTPDecoder::getRequiredContextMemorySize() const noexcept
@@ -227,6 +226,10 @@ bool MTPDecoder::runDraftModelPrefill(DecodingInferenceContext& context)
     {
         kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
             mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    }
+    if (mRuntime.preprocess.gemma4Ple)
+    {
+        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
     }
 
     int32_t* ctxLenData = mRuntime.base.pipelineIO.hostContextLengths.dataPointer<int32_t>();
@@ -460,6 +463,10 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
         "Tensor reshape failed");
     kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
         mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    if (mRuntime.preprocess.gemma4Ple)
+    {
+        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
+    }
 
     int32_t const selectTokenSize = activeBatchSize * mRuntime.deployment.specConfig->verifySize;
     check::check(
@@ -589,6 +596,10 @@ bool MTPDecoder::runDraftModelAcceptToken(DecodingInferenceContext& context)
         "Tensor reshape failed");
     kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
         mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    if (mRuntime.preprocess.gemma4Ple)
+    {
+        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
+    }
 
     {
         int32_t const acceptedTokenNum = static_cast<int32_t>(inputIdsLength);
@@ -765,6 +776,11 @@ bool MTPDecoder::captureCudaGraphs(cudaStream_t stream)
             check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
                              {batchSize, verifySize, mRuntime.deployment.base.hiddenSize}),
                 "Tensor reshape failed");
+            check::check(mRuntime.preprocess.idsInput.reshape({batchSize, verifySize}), "Tensor reshape failed");
+            if (mRuntime.preprocess.gemma4Ple)
+            {
+                mRuntime.preprocess.gemma4Ple->reshapeOutputs(batchSize, verifySize);
+            }
 
             Tensor const& baseKVCacheLengths = mRuntime.base.cacheManager.getKVCacheLengths();
             check::check(

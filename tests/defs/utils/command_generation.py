@@ -18,18 +18,32 @@ Centralized command configuration
 
 import os
 import shlex
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..config import (DEFAULT_SEARCH_DEPTH, PRE_QUANTIZED_MODELS, ModelType,
-                      TestConfig, _find_directory)
+                      TestConfig, _find_directory, strip_model_quant_suffixes)
 from .checkpoint_export_helpers import get_tensorrt_edgellm_root
 
 # Available LoRA weights mapping
+# Keyed by the *base* model name (no quant suffix); resolve_lora_model_name
+# strips suffixes so every precision variant reuses the same adapter.
 AVAILABLE_LORA_WEIGHTS = {
     "Qwen2.5-0.5B-Instruct": "Jailbreak-Detector-2-XL",
-    "Qwen2.5-0.5B-Instruct-FP8": "Jailbreak-Detector-2-XL",
     "Qwen2.5-VL-3B-Instruct": "Qwen2.5-VL-Diagrams2SQL-v2",
 }
+
+
+def resolve_lora_model_name(model_name: str) -> Optional[str]:
+    """LoRA adapter for a (possibly quantized) model: exact name, then base."""
+    base = strip_model_quant_suffixes(model_name)
+    for candidate in dict.fromkeys((model_name, base)):
+        if candidate in AVAILABLE_LORA_WEIGHTS:
+            return AVAILABLE_LORA_WEIGHTS[candidate]
+    return None
+
+
+def _uses_spec_decode(config: TestConfig) -> bool:
+    return bool(config.is_eagle or config.is_mtp or config.is_dflash)
 
 
 def _tensorrt_edgellm_module_shell(module: str, args: List[str]) -> str:
@@ -55,7 +69,7 @@ def _generate_merge_lora_commands(
 
     merge_lora_shell = _tensorrt_edgellm_module_shell(
         "tensorrt_edgellm.scripts.merge_lora", [
-            f"--model_dir={config.get_torch_model_dir()}",
+            f"--model_dir={config.get_base_torch_model_dir()}",
             f"--lora_dir={config.get_lora_adapter_dir()}",
             f"--output_dir={config.get_merged_model_dir()}"
         ])
@@ -87,7 +101,6 @@ def _llm_quant_shell(
         "llm",
         f"--model_dir={input_model_dir}",
         f"--output_dir={output_model_dir}",
-        f"--dataset={config.get_cnn_dailymail_dataset_dir()}",
     ]
     if needs_weight_quant:
         args.append(f"--quantization={config.llm_precision}")
@@ -132,7 +145,7 @@ def _generate_quantization_commands(
         if config.merge_lora:
             input_model_dir = config.get_merged_model_dir()
         else:
-            input_model_dir = config.get_torch_model_dir()
+            input_model_dir = config.get_base_torch_model_dir()
 
         if needs_weight_quant or needs_visual_quant or needs_audio_quant:
             output_model_dir = config.get_quantized_model_dir()
@@ -156,8 +169,8 @@ def _draft_quant_shell(config: TestConfig) -> str:
             "Cannot find tensorrt-edge-llm root. "
             "Set LLM_SDK_DIR to the SDK root, or run from a full tensorrt-edge-llm tree."
         )
-    base_model_dir = config.get_torch_model_dir()
-    draft_model_dir = config.get_draft_model_dir()
+    base_model_dir = config.get_base_torch_model_dir()
+    draft_model_dir = config.get_draft_torch_model_dir()
     quantized_draft_dir = config.get_quantized_draft_model_dir()
     args: List[str] = [
         "python3",
@@ -209,11 +222,7 @@ def _generate_tensorrt_edgellm_draft_export_for_vocab_commands(
     if not (config.is_eagle and config.reduced_vocab_size):
         return commands
 
-    if (config.draft_llm_precision and config.draft_llm_precision != "fp16"
-            and config.draft_llm_precision != "int4_gptq"):
-        draft_model_dir = config.get_quantized_draft_model_dir()
-    else:
-        draft_model_dir = config.get_draft_model_dir()
+    draft_model_dir = config.get_eagle_draft_checkpoint_dir()
     draft_onnx_dir = config.get_draft_onnx_dir()
 
     edgellm_root = get_tensorrt_edgellm_root()
@@ -243,7 +252,7 @@ def _generate_vocab_reduction_commands(
     if not config.reduced_vocab_size:
         return commands
 
-    torch_model_dir = config.get_torch_model_dir()
+    torch_model_dir = config.get_base_torch_model_dir()
     reduced_vocab_dir = config.get_reduced_vocab_dir()
 
     vocab_reduction_args = [
@@ -314,13 +323,14 @@ def generate_post_tensorrt_edgellm_commands(
         ]
         commands.append((insert_cmd, 120))
 
-        if config.model_name not in AVAILABLE_LORA_WEIGHTS:
+        lora_model_name = resolve_lora_model_name(config.model_name)
+        if lora_model_name is None:
             raise ValueError(
-                f"No LoRA weights available for {config.model_name}. "
+                f"No LoRA weights available for {config.model_name} (also tried "
+                f"base {strip_model_quant_suffixes(config.model_name)}). "
                 f"Please add it to AVAILABLE_LORA_WEIGHTS")
         edgellm_data_dir = os.environ.get("EDGELLM_DATA_DIR",
                                           "/scratch.edge_llm_cache")
-        lora_model_name = AVAILABLE_LORA_WEIGHTS[config.model_name]
         lora_weights_dir = _find_directory(edgellm_data_dir, lora_model_name,
                                            DEFAULT_SEARCH_DEPTH)
         if not lora_weights_dir:
@@ -343,10 +353,10 @@ def generate_post_tensorrt_edgellm_commands(
 def _generate_draft_build_commands(
         config: TestConfig,
         executable_files: Dict[str, str]) -> List[Tuple[List[str], int]]:
-    """Generate draft model build commands for EAGLE"""
+    """Generate draft model build commands for speculative decoding."""
     commands = []
 
-    if not config.is_eagle:
+    if not _uses_spec_decode(config):
         return commands
 
     draft_cmd = [executable_files['llm_build']]
@@ -380,7 +390,7 @@ def generate_build_commands(
             f"--maxBatchSize={config.max_batch_size}"
         ])
 
-        if config.is_eagle:
+        if _uses_spec_decode(config):
             cmd.append("--specBase")
             cmd.append(f"--maxVerifyTreeSize={config.max_verify_tree_size}")
 
@@ -403,7 +413,7 @@ def generate_build_commands(
             f"--maxBatchSize={config.max_batch_size}"
         ])
 
-        if config.is_eagle:
+        if _uses_spec_decode(config):
             llm_cmd.append("--specBase")
             llm_cmd.append(
                 f"--maxVerifyTreeSize={config.max_verify_tree_size}")
@@ -430,6 +440,46 @@ def generate_build_commands(
             visual_cmd.append("--debug")
 
         commands.append((visual_cmd, 1200))
+
+    elif config.model_type == ModelType.VLA:
+        # llm_build, visual_build, action_build share the visual_engine_dir
+        # as the parent of visual/ and action/, matching what
+        # action_inference --multimodalEngineDir expects.
+        llm_cmd = [executable_files['llm_build']]
+        llm_cmd.extend([
+            f"--onnxDir={config.get_llm_onnx_dir()}",
+            f"--engineDir={config.get_llm_engine_dir()}",
+            f"--maxInputLen={config.max_input_len}",
+            f"--maxBatchSize={config.max_batch_size}",
+        ])
+        if config.max_kv_cache_capacity:
+            llm_cmd.append(
+                f"--maxKVCacheCapacity={config.max_kv_cache_capacity}")
+        if config.debug:
+            llm_cmd.append("--debug")
+        commands.append((llm_cmd, 1200))
+
+        visual_cmd = [executable_files['visual_build']]
+        visual_cmd.extend([
+            f"--onnxDir={config.get_visual_onnx_dir('fp16')}",
+            f"--engineDir={config.get_visual_engine_dir()}",
+            f"--minImageTokens={config.min_image_tokens}",
+            f"--maxImageTokens={config.max_image_tokens}",
+            f"--maxImageTokensPerImage={config.max_image_tokens_per_image}",
+        ])
+        if config.debug:
+            visual_cmd.append("--debug")
+        commands.append((visual_cmd, 1200))
+
+        action_cmd = [executable_files['action_build']]
+        action_cmd.extend([
+            f"--onnxDir={config.get_action_onnx_dir()}",
+            f"--engineDir={config.get_visual_engine_dir()}",
+            f"--maxBatchSize={config.max_batch_size}",
+        ])
+        if config.debug:
+            action_cmd.append("--debug")
+        commands.append((action_cmd, 1200))
 
     elif config.model_type == ModelType.TTS:
         # TTS: build talker + code_predictor LLM engines (under
@@ -574,6 +624,22 @@ def generate_inference_commands(
         commands.append((cmd, 6000))
         return commands
 
+    if config.model_type == ModelType.VLA:
+        cmd = [executable_files['action_inference']]
+        cmd.extend([
+            f"--engineDir={config.get_llm_engine_dir()}",
+            f"--multimodalEngineDir={config.get_visual_engine_dir()}",
+            f"--inputFile={config.get_test_case_file()}",
+            f"--outputFile={config.get_output_json_file()}",
+            "--dumpProfile",
+        ])
+        if config.warmup:
+            cmd.append(f"--warmup={config.warmup}")
+        if config.debug:
+            cmd.append("--debug")
+        commands.append((cmd, 6000))
+        return commands
+
     cmd = [executable_files['llm_inference']]
     cmd.extend([
         f"--engineDir={config.get_llm_engine_dir()}",
@@ -581,8 +647,8 @@ def generate_inference_commands(
         f"--outputFile={config.get_output_json_file()}", f"--dumpProfile"
     ])
 
-    # Add EAGLE parameters
-    if config.is_eagle:
+    # Add speculative decoding parameters.
+    if _uses_spec_decode(config):
         cmd.append("--specDecode")
         cmd.append(f"--specDraftTopK={config.eagle_draft_top_k}")
         cmd.append(f"--specDraftStep={config.eagle_draft_step}")
@@ -613,6 +679,39 @@ def generate_e2e_bench_commands(
     """Generate e2e benchmark commands - returns list of (command, timeout) tuples"""
     commands = []
 
+    if config.model_type == ModelType.VLA:
+        cmd = [executable_files['action_inference']]
+        cmd.extend([
+            f"--engineDir={config.get_llm_engine_dir()}",
+            f"--multimodalEngineDir={config.get_visual_engine_dir()}",
+            f"--inputFile={config.get_test_case_file()}",
+            f"--outputFile={config.get_output_json_file()}",
+            "--dumpProfile",
+        ])
+        cmd.append(f"--warmup={config.warmup or 10}")
+        if config.debug:
+            cmd.append("--debug")
+        commands.append((cmd, 6000))
+        return commands
+
+    if config.model_type == ModelType.TTS:
+        cmd = [executable_files['qwen3_tts_inference']]
+        cmd.extend([
+            f"--talkerEngineDir={config.get_talker_engine_dir()}",
+            f"--code2wavEngineDir={config.get_code2wav_engine_dir()}",
+            f"--tokenizerDir={config.get_tts_tokenizer_dir()}",
+            f"--inputFile={config.get_test_case_file()}",
+            f"--outputFile={config.get_output_json_file()}",
+            f"--outputAudioDir={config.get_output_audio_dir()}",
+            "--dumpProfile",
+        ])
+        if config.batch_size is not None:
+            cmd.append(f"--batchSize={config.batch_size}")
+        if config.debug:
+            cmd.append("--debug")
+        commands.append((cmd, 6000))
+        return commands
+
     cmd = [executable_files['llm_inference']]
     cmd.extend([
         f"--engineDir={config.get_llm_engine_dir()}",
@@ -620,8 +719,8 @@ def generate_e2e_bench_commands(
         f"--outputFile={config.get_output_json_file()}", f"--dumpProfile"
     ])
 
-    # Add EAGLE parameters
-    if config.is_eagle:
+    # Add speculative decoding parameters.
+    if _uses_spec_decode(config):
         cmd.append("--specDecode")
         cmd.append(f"--specDraftTopK={config.eagle_draft_top_k}")
         cmd.append(f"--specDraftStep={config.eagle_draft_step}")

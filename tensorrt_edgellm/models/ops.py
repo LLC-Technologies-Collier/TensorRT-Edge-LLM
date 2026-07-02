@@ -21,9 +21,58 @@ Domains ``trt::`` / ``trt_edgellm::`` map to ONNX nodes consumed by the
 TensorRT plugin runtime.
 """
 
+import logging
+import os
 from typing import List, Optional, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# NVFP4 MoE target arch selector
+# ---------------------------------------------------------------------------
+#
+# ``Nvfp4MoePlugin`` (SM100/101/110, split FC1/FC2) and ``NvFP4MoEPluginGeforce``
+# (SM12x/Blackwell consumer, fused) share the same 11-input ONNX surface and
+# attribute set, but consume **different FC1 weight layouts** for SwiGLU MoE:
+#
+#   * SM100/101/110 expect FC1 packed as the 64-row up/gate interleave that
+#     ``_interleave_qwen3_swiglu_fc1`` produces.
+#   * SM12x expects FC1 packed as the plain ``[up_all, gate_all]`` concat
+#     that ``_concat_qwen3_swiglu_fc1`` produces.
+#
+# Repacking and modeling code call :func:`use_geforce_nvfp4_moe` to pick the
+# matching plugin op and FC1 layout at export time. Override via env var:
+#
+#   EDGELLM_NVFP4_MOE_TARGET=sm100  -> Nvfp4MoePlugin
+#   EDGELLM_NVFP4_MOE_TARGET=sm110  -> Nvfp4MoePlugin            (default)
+#   EDGELLM_NVFP4_MOE_TARGET=sm12x  -> NvFP4MoEPluginGeforce
+#
+# Accepted aliases for SM12x: ``sm120``, ``sm121``, ``geforce``.
+
+_NVFP4_MOE_TARGET_ENV = "EDGELLM_NVFP4_MOE_TARGET"
+_NVFP4_MOE_SM110_ALIASES = frozenset(
+    ("sm100", "sm101", "sm110", "blackwell_dc", "thor", ""))
+_NVFP4_MOE_SM12X_ALIASES = frozenset(("sm12x", "sm120", "sm121", "geforce"))
+
+
+def use_geforce_nvfp4_moe() -> bool:
+    """Return True iff exporting for ``NvFP4MoEPluginGeforce`` (SM12x).
+
+    The default is the SM100/101/110 path so existing export pipelines keep producing
+    the 64-row up/gate interleave layout consumed by ``Nvfp4MoePlugin``.
+    """
+    val = os.environ.get(_NVFP4_MOE_TARGET_ENV, "sm110").strip().lower()
+    if val in _NVFP4_MOE_SM12X_ALIASES:
+        return True
+    if val in _NVFP4_MOE_SM110_ALIASES:
+        return False
+    raise ValueError(
+        f"{_NVFP4_MOE_TARGET_ENV}={val!r} is not recognized. Use 'sm100'/'sm110' "
+        "(Nvfp4MoePlugin) or 'sm12x' (Blackwell consumer/NvFP4MoEPluginGeforce). "
+        "Aliases: sm101/blackwell_dc/thor, sm120/sm121/geforce.")
+
 
 # ---------------------------------------------------------------------------
 # Custom op: trt::attention_plugin  (unified: vanilla / FP8-KV / EAGLE tree)
@@ -180,8 +229,96 @@ def _(query_states, key_states, value_states, cu_seqlens, max_seqlen_carrier,
 
 
 # ---------------------------------------------------------------------------
+# Custom op: trt::vit_trt_attention  (TRT-native ViT ragged self-attention)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::vit_trt_attention", mutates_args=())
+def vit_trt_attention(
+    query_states: torch.Tensor,  # [T, num_heads, head_size]
+    key_states: torch.Tensor,  # [T, num_heads, head_size]
+    value_states: torch.Tensor,  # [T, num_heads, head_size]
+    query_lengths: torch.Tensor,  # [batch+1] int32
+    kv_lengths: torch.Tensor,  # [batch+1] int32
+    num_heads: int,
+    head_size: int,
+) -> torch.Tensor:
+    """TRT-native ViT ragged self-attention proxy op (TRT >= 11).
+
+    Emits trt::TRT_Attention ONNX node instead of the edgellm plugin.
+    Q is expected to be pre-scaled by 1/sqrt(head_dim) by the caller.
+    query_lengths and kv_lengths must be separate tensors (not the same
+    object) — TRT requires distinct inputs for these positions.
+    """
+    return torch.empty_like(query_states)
+
+
+@vit_trt_attention.register_fake
+def _(query_states, key_states, value_states, query_lengths, kv_lengths,
+      num_heads, head_size):
+    return torch.empty_like(query_states)
+
+
+# ---------------------------------------------------------------------------
+# Factory: choose between plugin and TRT-native ViT attention
+# ---------------------------------------------------------------------------
+
+
+def get_vit_attention_fn():
+    """Return ``vit_trt_attention`` or ``vit_attention_plugin``.
+
+    Only uses TRT-native attention when explicitly requested via
+    ``USE_TRT_NATIVE_VIT_ATTN=1``.  The env var is set by the test
+    harness for ``-trt11`` configs; without it the plugin path is used
+    so that ONNX artifacts remain compatible with TRT 10.
+    """
+    if os.environ.get("USE_TRT_NATIVE_VIT_ATTN") == "1":
+        logger.debug("Using TRT-native VIT attention (TRT_Attention)")
+        return vit_trt_attention
+    logger.debug("Using VIT attention plugin (ViTAttentionPlugin)")
+    return vit_attention_plugin
+
+
+# ---------------------------------------------------------------------------
 # Custom op: trt::fp8_quantize
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::dflash_target_kv_cache_update
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::dflash_target_kv_cache_update",
+                         mutates_args=())
+def dflash_target_kv_cache_update(
+    k_delta: torch.Tensor,
+    v_delta: torch.Tensor,
+    past_key_value: torch.Tensor,
+    rope_cos_sin: torch.Tensor,
+    delta_start_positions: torch.Tensor,
+    delta_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Update the draft combined KV cache with target-hidden-derived K/V delta.
+
+    k_delta: [B, L, numKVHeads, headDim] FP16, k_normed, not RoPE-applied.
+    v_delta: [B, L, numKVHeads, headDim] FP16.
+    past_key_value: [B, 2, numKVHeads, maxSeqLen, headDim] FP16.
+    rope_cos_sin: [ropeBatch, maxSeqLen, rotaryDim] FP32.
+    delta_start_positions: [B] INT32, old committed draft target cache length.
+    delta_lengths: [B] INT32, per-batch delta lengths.
+
+    Applies RoPE to k_delta and writes k_rope + v_delta into the KV cache at
+    positions [delta_start, delta_start + t) for each batch element, where
+    t < delta_lengths[b]. Positions beyond delta_lengths[b] are skipped.
+    Returns present_key_value (same shape as past_key_value — aliased in TRT).
+    """
+    return past_key_value.clone()
+
+
+@dflash_target_kv_cache_update.register_fake
+def _(k_delta, v_delta, past_key_value, rope_cos_sin, delta_start_positions,
+      delta_lengths):
+    return torch.empty_like(past_key_value)
 
 
 @torch.library.custom_op("trt::fp8_quantize", mutates_args=())
@@ -435,8 +572,8 @@ def causal_conv1d(
     dilation: int,
     groups: int,
     collect_intermediate_states: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Stub: causal conv1d; with MTP enabled it returns an optional 3rd output."""
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stub: causal conv1d; with MTP enabled it fills the 3rd output."""
     if collect_intermediate_states:
         batch_size, seq_len, _ = hidden_states.shape
         intermediate_conv_state = torch.zeros(batch_size,
@@ -447,7 +584,8 @@ def causal_conv1d(
                                               device=conv_state.device)
         return (torch.zeros_like(hidden_states), conv_state.clone(),
                 intermediate_conv_state)
-    return torch.zeros_like(hidden_states), conv_state.clone()
+    return (torch.zeros_like(hidden_states), conv_state.clone(),
+            conv_state.clone())
 
 
 @causal_conv1d.register_fake
@@ -471,7 +609,8 @@ def _(hidden_states,
                                               device=conv_state.device)
         return (torch.empty_like(hidden_states), conv_state.clone(),
                 intermediate_conv_state)
-    return torch.empty_like(hidden_states), conv_state.clone()
+    return (torch.empty_like(hidden_states), conv_state.clone(),
+            torch.empty_like(conv_state))
 
 
 # ---------------------------------------------------------------------------
@@ -680,8 +819,8 @@ def gated_delta_net(
     k_dim: int,
     v_dim: int,
     collect_intermediate_states: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Stub: GatedDeltaNet; with MTP enabled it returns an optional 3rd output."""
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stub: GatedDeltaNet; with MTP enabled it fills the 3rd output."""
     if collect_intermediate_states:
         batch_size, seq_len, num_v_heads, _ = v.shape
         intermediate_recurrent_state = torch.zeros(batch_size,
@@ -693,7 +832,7 @@ def gated_delta_net(
                                                    device=h0_source.device)
         return (torch.zeros_like(v), h0_source.clone(),
                 intermediate_recurrent_state)
-    return torch.zeros_like(v), h0_source.clone()
+    return torch.zeros_like(v), h0_source.clone(), h0_source.clone()
 
 
 @gated_delta_net.register_fake
@@ -720,7 +859,7 @@ def _(q,
                                                    device=h0_source.device)
         return (torch.empty_like(v), h0_source.clone(),
                 intermediate_recurrent_state)
-    return torch.empty_like(v), h0_source.clone()
+    return torch.empty_like(v), h0_source.clone(), torch.empty_like(h0_source)
 
 
 # ---------------------------------------------------------------------------
@@ -732,15 +871,14 @@ def _(q,
 def nvfp4_moe_plugin(
     router_logits: torch.Tensor,
     hidden_states: torch.Tensor,
-    hidden_global_scale: torch.Tensor,
-    up_weights: torch.Tensor,
-    up_block_scale: torch.Tensor,
-    up_global_scale: torch.Tensor,
-    down_weights: torch.Tensor,
-    down_block_scale: torch.Tensor,
-    down_global_scale: torch.Tensor,
-    up_block_scale_decode: torch.Tensor,
-    down_block_scale_decode: torch.Tensor,
+    fc1_qweights: torch.Tensor,
+    fc1_blocks_scale: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_qweights: torch.Tensor,
+    fc2_blocks_scale: torch.Tensor,
+    fc2_alpha: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    down_input_scale: torch.Tensor,
     e_score_correction_bias: torch.Tensor,
     num_experts: int,
     top_k: int,
@@ -752,22 +890,28 @@ def nvfp4_moe_plugin(
     norm_topk_prob: int,
     routed_scaling_factor: float,
     routing_mode: int,
+    backend: int,
+    io_dtype: int,
+    max_routed_rows: int,
 ) -> torch.Tensor:
     return torch.zeros_like(hidden_states)
 
 
 @nvfp4_moe_plugin.register_fake
-def _(router_logits, hidden_states, hidden_global_scale, up_weights,
-      up_block_scale, up_global_scale, down_weights, down_block_scale,
-      down_global_scale, up_block_scale_decode, down_block_scale_decode,
-      e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
-      activation_type, n_group, topk_group, norm_topk_prob,
-      routed_scaling_factor, routing_mode):
+def _(router_logits, hidden_states, fc1_qweights, fc1_blocks_scale, fc1_alpha,
+      fc2_qweights, fc2_blocks_scale, fc2_alpha, input_global_scale,
+      down_input_scale, e_score_correction_bias, num_experts, top_k,
+      hidden_size, moe_inter_size, activation_type, n_group, topk_group,
+      norm_topk_prob, routed_scaling_factor, routing_mode, backend, io_dtype,
+      max_routed_rows):
     return torch.empty_like(hidden_states)
 
 
 # ---------------------------------------------------------------------------
 # Custom op: trt_edgellm::NvFP4MoEPluginGeforce
+#   SM12x (consumer Blackwell) fused NVFP4 MoE. Same signature as
+#   ``nvfp4_moe_plugin``; FC1 weights must be in the plain ``[up, gate]``
+#   concat layout (not the 64-row up/gate interleave) for SwiGLU activations.
 # ---------------------------------------------------------------------------
 
 
@@ -783,11 +927,17 @@ def nvfp4_moe_plugin_geforce(
     fc2_alpha: torch.Tensor,
     input_global_scale: torch.Tensor,
     down_input_scale: torch.Tensor,
+    e_score_correction_bias: torch.Tensor,
     num_experts: int,
     top_k: int,
     hidden_size: int,
     moe_inter_size: int,
     activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    routing_mode: int,
     backend: int,
     io_dtype: int,
     max_routed_rows: int,
@@ -798,6 +948,54 @@ def nvfp4_moe_plugin_geforce(
 @nvfp4_moe_plugin_geforce.register_fake
 def _(router_logits, hidden_states, fc1_qweights, fc1_blocks_scale, fc1_alpha,
       fc2_qweights, fc2_blocks_scale, fc2_alpha, input_global_scale,
-      down_input_scale, num_experts, top_k, hidden_size, moe_inter_size,
-      activation_type, backend, io_dtype, max_routed_rows):
+      down_input_scale, e_score_correction_bias, num_experts, top_k,
+      hidden_size, moe_inter_size, activation_type, n_group, topk_group,
+      norm_topk_prob, routed_scaling_factor, routing_mode, backend, io_dtype,
+      max_routed_rows):
     return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::fused_gemm_allreduce
+#   NVFP4 row-parallel GEMM fused with AllReduce
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::fused_gemm_allreduce", mutates_args=())
+def fused_gemm_allreduce(
+    hidden_states: torch.Tensor,  # FP16 activation [..., K_per_rank]
+    global_scale: torch.Tensor,  # FP32 scalar: amax / (6.0 * 448.0)
+    weight_f4: torch.Tensor,  # int8-packed FP4 [N, K_per_rank // 2]
+    weight_f8_scale: torch.Tensor,  # FP8E4M3FN [N, K_per_rank // group_size]
+    weight_f32_scale: torch.Tensor,  # FP32 scalar
+    tp_size: int,
+    fuse_residual_rmsnorm: int,
+) -> torch.Tensor:
+    """Stub: NVFP4 row-parallel GEMM fused with AllReduce.
+
+    Single op that emits the entire chain feeding
+    ``FusedGemmAllReducePlugin``::
+
+        TRT_FP4DynamicQuantize(x, global_scale, axis=-1, block_size=16, scale_type=17)
+            -> (x_f4, sx_f8)
+        trt::DequantizeLinear(sx_f8, global_scale)            -> combined_scale_fp32
+        FusedGemmAllReducePlugin(x_f4, combined_scale, weight_f4,
+                                 weight_f8_scale, weight_f32_scale,
+                                 tp_size, fuse_residual_rmsnorm)
+            -> y_fp16   (already AllReduced across ranks)
+    """
+    out_features = weight_f4.shape[0]
+    out_shape = list(hidden_states.shape[:-1]) + [out_features]
+    return torch.zeros(*out_shape,
+                       dtype=torch.float16,
+                       device=hidden_states.device)
+
+
+@fused_gemm_allreduce.register_fake
+def _(hidden_states, global_scale, weight_f4, weight_f8_scale,
+      weight_f32_scale, tp_size, fuse_residual_rmsnorm):
+    out_features = weight_f4.shape[0]
+    out_shape = list(hidden_states.shape[:-1]) + [out_features]
+    return torch.empty(*out_shape,
+                       dtype=torch.float16,
+                       device=hidden_states.device)

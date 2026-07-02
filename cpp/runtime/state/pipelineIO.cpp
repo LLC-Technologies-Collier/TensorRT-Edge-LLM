@@ -78,16 +78,38 @@ void allocateMRope(PipelineIO& io, int32_t maxBatch, int32_t maxKVCacheCapacity,
         "PipelineIO::mropeCosSin");
 }
 
-void buildTensorMap(
-    TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t kvCacheIndex)
+void StreamingPrefillBuffers::populateFromPrefill(Tensor const& liveInputEmbeds, Tensor const& liveEngineHiddenStates,
+    int32_t batch, int32_t prefillLen, int32_t hiddenSize, int32_t maxBatch, int32_t maxSeq, cudaStream_t stream)
 {
-    // Core I/O
-    map.set(binding_names::kInputsEmbeds, io.inputsEmbeds);
-    map.set(binding_names::kLogits, io.outputLogits);
-    map.set(binding_names::kContextLengths, io.contextLengths);
-    map.set(binding_names::kLastTokenIds, io.selectTokenIndices);
+    auto const dtype = nvinfer1::DataType::kHALF;
+    if (inputEmbeds.isEmpty())
+    {
+        inputEmbeds = Tensor(
+            {maxBatch, maxSeq, hiddenSize}, DeviceType::kGPU, dtype, "PipelineIO::streamingPrefill.inputEmbeds");
+        engineHiddenStates = Tensor(
+            {maxBatch, maxSeq, hiddenSize}, DeviceType::kGPU, dtype, "PipelineIO::streamingPrefill.engineHiddenStates");
+    }
+    check::check(inputEmbeds.reshape({batch, prefillLen, hiddenSize}), "Tensor reshape failed");
+    check::check(engineHiddenStates.reshape({batch, prefillLen, hiddenSize}), "Tensor reshape failed");
 
-    // RoPE
+    size_t const bytes = static_cast<size_t>(batch) * prefillLen * hiddenSize * sizeof(__half);
+    CUDA_CHECK(cudaMemcpyAsync(
+        inputEmbeds.rawPointer(), liveInputEmbeds.rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        engineHiddenStates.rawPointer(), liveEngineHiddenStates.rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
+}
+
+void bindRopeTensors(TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg)
+{
+    if (cfg.useDualRope)
+    {
+        map.set(binding_names::kRopeCosSinSliding,
+            res.ropePool.getOrCreate(cfg.slidingRopeConfig, cfg.slidingRotaryDim, cfg.maxKVCacheCapacity, nullptr));
+        map.set(binding_names::kRopeCosSinFull,
+            res.ropePool.getOrCreate(cfg.fullRopeConfig, cfg.fullRotaryDim, cfg.maxKVCacheCapacity, nullptr));
+        return;
+    }
+
     if (cfg.ropeConfig.type == RopeType::kMRope)
     {
         map.set(binding_names::kRopeCosSin, io.mropeCosSin);
@@ -97,6 +119,18 @@ void buildTensorMap(
         map.set(binding_names::kRopeCosSin,
             res.ropePool.getOrCreate(cfg.ropeConfig, cfg.rotaryDim, cfg.maxKVCacheCapacity, nullptr));
     }
+}
+
+void buildTensorMap(
+    TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t kvCacheIndex)
+{
+    // Core I/O
+    map.set(binding_names::kInputsEmbeds, io.inputsEmbeds);
+    map.set(binding_names::kLogits, io.outputLogits);
+    map.set(binding_names::kContextLengths, io.contextLengths);
+    map.set(binding_names::kLastTokenIds, io.selectTokenIndices);
+
+    bindRopeTensors(map, io, res, cfg);
 
     // Hybrid cache routing: walk absolute decoder-layer indices, route by
     // `cfg.layerTypes[absIdx]`, and bind per-layer tensors using LOCAL indices.
@@ -105,7 +139,7 @@ void buildTensorMap(
     auto& mambaMgr = cacheMgr.getMambaCacheManager();
 
     // The split K/V view cache only needs to exist in TRT-native mode.
-    // `KVCacheManager::getSeparateKVCache` returns views by value, so we keep
+    // `KVCacheManager::getSeparateKVCache` returns views by value, so we store
     // them in stable-address storage (res.kCacheViews / res.vCacheViews).
     if (cfg.useTrtNativeOps)
     {
@@ -127,20 +161,28 @@ void buildTensorMap(
     {
         if (cfg.layerTypes[absIdx] == rt::HybridCacheManager::LayerType::kAttention)
         {
+            // Check if this attention layer shares KV cache from a donor layer.
+            int32_t const donorIdx
+                = (!cfg.kvSharingDonors.empty() && localAttnIdx < static_cast<int32_t>(cfg.kvSharingDonors.size()))
+                ? cfg.kvSharingDonors[localAttnIdx]
+                : -1;
+
             if (!cfg.useTrtNativeOps)
             {
-                // Plugin (combined KV): bind a reference to the owning tensor.
-                auto& combinedKV = kvMgr.getCombinedKVCache(localAttnIdx);
+                // Plugin (combined KV): bind to donor's tensor if shared, else own tensor.
+                auto& combinedKV
+                    = (donorIdx >= 0) ? kvMgr.getCombinedKVCache(donorIdx) : kvMgr.getCombinedKVCache(localAttnIdx);
                 map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/true), combinedKV);
                 map.set(
                     binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/false), combinedKV); // alias: in-place
             }
             else
             {
-                // TRT-native (split K/V): views returned by value are kept in the view cache.
+                // TRT-native (split K/V): views returned by value, stored in the view cache.
                 auto& kViews = res.kCacheViews[kvCacheIndex];
                 auto& vViews = res.vCacheViews[kvCacheIndex];
-                auto [kT, vT] = kvMgr.getSeparateKVCache(localAttnIdx);
+                int32_t const sourceIdx = (donorIdx >= 0) ? donorIdx : localAttnIdx;
+                auto [kT, vT] = kvMgr.getSeparateKVCache(sourceIdx);
                 kViews.push_back(std::move(kT));
                 vViews.push_back(std::move(vT));
 

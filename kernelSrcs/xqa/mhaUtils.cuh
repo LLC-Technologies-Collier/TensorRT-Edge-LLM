@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -99,6 +99,25 @@ struct HeadPtr<Head, 0, 0> : TinyPtr<Head>
 {
 };
 
+template <typename Head, typename SliceHead>
+struct HeadSlicePtr
+{
+    Head* pointer;
+    uint32_t offset;
+    uint32_t sliceByteOffset;
+
+    __device__ inline SliceHead& operator[](uint32_t i) const
+    {
+        return *(*this + i);
+    }
+
+    __device__ inline SliceHead* operator+(uint32_t i) const
+    {
+        uint64_t const base = reinterpret_cast<uint64_t>(pointer + offset + i);
+        return reinterpret_cast<SliceHead*>(base + sliceByteOffset);
+    }
+};
+
 // template <typename Head>
 // #if BEAM_WIDTH == 1
 // using SrcHeadPtr = TinyPtr<Head const>;
@@ -168,6 +187,43 @@ __device__ inline void copyHeadsAsync(
     constexpr uint32_t idxPart = 0;
     copyPartialHeadsAsync<Head, maxNbHeadsPerWarp, 1, swizzle, isFull, dstNbHeads>(warp, dst, dstHeadOffset, src,
         idxPart, warpNbAvailHeads, [&](uint32_t x) { return localHeadIdxMap(dstHeadOffset + x); });
+}
+
+//! Variant of copyHeadsAsync that stripes a single wide head across all x-warps.
+template <typename Head, uint32_t maxNbCopiedHeads, uint32_t nbWarps, bool swizzle, bool isFull, uint32_t dstNbHeads,
+    typename SrcHeadPtr, typename LocalHeadIdxMap = uint32_t (*)(uint32_t)>
+__device__ inline void copyHeadsAsyncMultiWarp(
+    uint32_t idxWarp, Array2D<LdGrain, dstNbHeads, exactDiv(sizeof(Head), grainBytes)>& dst, SrcHeadPtr const& src,
+    uint32_t nbAvailHeads = maxNbCopiedHeads, LocalHeadIdxMap&& localHeadIdxMap = [](uint32_t x) { return x; })
+{
+    static_assert(maxNbCopiedHeads <= dstNbHeads);
+    assert(idxWarp < nbWarps);
+    assert(!isFull || nbAvailHeads >= maxNbCopiedHeads);
+    constexpr uint32_t nbGrainsPerHead = exactDiv(sizeof(Head), grainBytes);
+    constexpr uint32_t nbTotalGrains = maxNbCopiedHeads * nbGrainsPerHead;
+    constexpr uint32_t nbThreads = warp_size * nbWarps;
+    uint32_t const tid = warp_size * idxWarp + laneId();
+#pragma unroll
+    for (uint32_t i = 0; i < divUp(nbTotalGrains, nbThreads); i++)
+    {
+        uint32_t const idxGrain = nbThreads * i + tid;
+        if (idxGrain >= nbTotalGrains)
+        {
+            break;
+        }
+        uint32_t const idxHeadLocal = idxGrain / nbGrainsPerHead;
+        uint32_t const idxGrainInsideHead = idxGrain % nbGrainsPerHead;
+        bool const isHeadInBound = isFull || (idxHeadLocal < nbAvailHeads);
+        using SrcHead = mha::decay_t<decltype(src[0])>;
+        constexpr uint32_t nbValidGrains = exactDiv(sizeof(SrcHead), grainBytes);
+        bool const isGrainInBound = (!isHeadPadded || idxGrainInsideHead < nbValidGrains);
+        SrcHead const* const pSrcHead = src + localHeadIdxMap(idxHeadLocal);
+        bool const isValidPage = (pSrcHead != nullptr);
+        LdGrain const* const pSrc = reinterpret_cast<LdGrain const*>(pSrcHead) + idxGrainInsideHead;
+        LdGrain* const pDst = &dst.template at<swizzle>(idxHeadLocal, idxGrainInsideHead);
+        assert(!hasBankConflict(pDst));
+        ldgsts::copyAsync<grainBytes>(pDst, pSrc, isValidPage && isHeadInBound && isGrainInBound ? grainBytes : 0u);
+    }
 }
 
 template <bool isAsync, uint32_t maxTotalNbGrains, uint32_t nbWarps, bool isFull = true>
@@ -380,14 +436,17 @@ __device__ inline InputElem2 float2ToInputElem2(float2 src)
         reinterpret_cast<nv_bfloat162&>(dst) = __float22bfloat162_rn(src);
         return dst;
     }
+#if SUPPORTS_FP8
     else if constexpr (mha::is_same_v<InputElem2, __nv_fp8x2_e4m3>)
     {
         reinterpret_cast<__nv_fp8x2_e4m3&>(dst) = __nv_fp8x2_e4m3{src};
         return dst;
     }
+#endif
     else
     {
         trap();
+        return InputElem2{};
     }
 }
 
@@ -464,18 +523,16 @@ template <bool real>
 __device__ inline bool test_wait_parity(CtaBarrier* pBarrier, ParityOrNone<real> parity)
 {
     assert(real == (pBarrier != nullptr));
+    bool ret = false;
     if constexpr (real)
     {
 #if USE_CUSTOM_BARRIER
-        return pBarrier->test_wait_parity(parity);
+        ret = pBarrier->test_wait_parity(parity);
 #else
-        return pBarrier->try_wait_parity_for(parity, cuda::std::chrono::nanoseconds(0));
+        ret = pBarrier->try_wait_parity_for(parity, cuda::std::chrono::nanoseconds(0));
 #endif
     }
-    else
-    {
-        return false;
-    }
+    return ret;
 }
 
 template <bool real = true>

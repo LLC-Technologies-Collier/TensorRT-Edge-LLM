@@ -840,6 +840,89 @@ _attention_trt_native_schema = OpSchema(
     ],
 )
 
+_vit_trt_attention_schema = OpSchema(
+    name="TRT_Attention",
+    domain="trt",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="TRT-native ViT attention (packed NHD, no causal mask, no KV cache).",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="query",
+            description=
+            "Query tensor [total_S, H, D] (pre-scaled by 1/sqrt(D))",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="key",
+            description="Key tensor [total_S, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="value",
+            description="Value tensor [total_S, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="mask",
+            description="Unused — positional placeholder",
+            type_str="T",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
+            name="query_lengths",
+            description="Cumulative query lengths [B+1]",
+            type_str="tensor(int32)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
+            name="kv_lengths",
+            description="Cumulative KV lengths [B+1]",
+            type_str="tensor(int32)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="attn_output",
+            description="Attention output [total_S, H, D]",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)", "tensor(float)", "tensor(bfloat16)"],
+            "Input and output data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="query_form",
+            type=OpSchema.AttrType.STRING,
+            description="Query IO form",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="kv_form",
+            type=OpSchema.AttrType.STRING,
+            description="Key-value IO form",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="causal_kind",
+            type=OpSchema.AttrType.STRING,
+            description="Causal mask kind (none/upper_left/lower_right)",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="TRT_decomposable",
+            type=OpSchema.AttrType.INT,
+            description="Whether the attention can be decomposed",
+            required=False,
+        ),
+    ],
+)
+
 _gated_delta_net_schema = OpSchema(
     name="gated_delta_net",
     domain="trt_edgellm",
@@ -1010,74 +1093,16 @@ _int4_moe_plugin_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
-# trt_edgellm::Nvfp4MoePlugin
+# trt_edgellm::Nvfp4MoePlugin (SM100/101/110 split FC1/FC2, 64-row up/gate interleave)
 # ---------------------------------------------------------------------------
 
 _nvfp4_moe_plugin_schema = OpSchema(
     name="Nvfp4MoePlugin",
     domain="trt_edgellm",
     since_version=_SCHEMA_SINCE_VERSION,
-    doc=("NVFP4 MoE plugin: FP16 hidden + NVFP4 N-major weights. "
-         "Dispatches decode or prefill"),
-    inputs=[
-        OpSchema.FormalParameter("router_logits", "T1",
-                                 "Router logits (B*S, E)"),
-        OpSchema.FormalParameter("hidden_states", "T2",
-                                 "Hidden states (B, S, H)"),
-        OpSchema.FormalParameter("hidden_global_scale", "T1",
-                                 "Activation global scales (2,) [FC1, FC2]"),
-        OpSchema.FormalParameter("up_weights", "T3", "Up weights (E, H, I/2)"),
-        OpSchema.FormalParameter(
-            "up_block_scale", "T3",
-            "Up prefill block scales (E, padUp(I,128), padUp(H/16,4))"),
-        OpSchema.FormalParameter("up_global_scale", "T1",
-                                 "Up global scales (E,)"),
-        OpSchema.FormalParameter("down_weights", "T3",
-                                 "Down weights (E, I, H/2)"),
-        OpSchema.FormalParameter(
-            "down_block_scale", "T3",
-            "Down prefill block scales (E, padUp(H,128), padUp(I/16,4))"),
-        OpSchema.FormalParameter("down_global_scale", "T1",
-                                 "Down global scales (E,)"),
-        OpSchema.FormalParameter("up_block_scale_decode", "T3",
-                                 "Up decode block scales (E, H/16, I)"),
-        OpSchema.FormalParameter("down_block_scale_decode", "T3",
-                                 "Down decode block scales (E, I/16, H)"),
-        OpSchema.FormalParameter("e_score_correction_bias", "T1",
-                                 "Per-expert load-balancing bias (E,)"),
-    ],
-    outputs=[
-        OpSchema.FormalParameter("output", "T2", "Output [B, S, H] FP16"),
-    ],
-    type_constraints=[
-        ("T1", ["tensor(float)"], "FP32"),
-        ("T2", ["tensor(float16)"], "FP16"),
-        ("T3", ["tensor(int8)"], "INT8"),
-    ],
-    attributes=[
-        OpSchema.Attribute("num_experts", OpSchema.AttrType.INT),
-        OpSchema.Attribute("top_k", OpSchema.AttrType.INT),
-        OpSchema.Attribute("hidden_size", OpSchema.AttrType.INT),
-        OpSchema.Attribute("moe_inter_size", OpSchema.AttrType.INT),
-        OpSchema.Attribute("activation_type", OpSchema.AttrType.INT),
-        OpSchema.Attribute("n_group", OpSchema.AttrType.INT),
-        OpSchema.Attribute("topk_group", OpSchema.AttrType.INT),
-        OpSchema.Attribute("norm_topk_prob", OpSchema.AttrType.INT),
-        OpSchema.Attribute("routed_scaling_factor", OpSchema.AttrType.FLOAT),
-        OpSchema.Attribute("routing_mode", OpSchema.AttrType.INT),
-    ],
-)
-
-# ---------------------------------------------------------------------------
-# trt_edgellm::NvFP4MoEPluginGeforce
-# ---------------------------------------------------------------------------
-
-_nvfp4_moe_plugin_geforce_schema = OpSchema(
-    name="NvFP4MoEPluginGeforce",
-    domain="trt_edgellm",
-    since_version=_SCHEMA_SINCE_VERSION,
-    doc=("GeForce CuTeDSL NVFP4 MoE plugin: FP16 hidden states, FP4 expert "
-         "weights, and FP8 block scales in 6D MMA layout."),
+    doc=("NVFP4 MoE plugin (CuTeDSL SM100/101/110 split FC1/FC2): FP16 hidden "
+         "states, FP4 expert weights with 64-row up/gate interleaved FC1, "
+         "and FP8 block scales in 6D MMA layout."),
     inputs=[
         OpSchema.FormalParameter("router_logits", "T_ROUTER",
                                  "Router logits [B*S, E] FP32"),
@@ -1101,6 +1126,8 @@ _nvfp4_moe_plugin_geforce_schema = OpSchema(
                                  "FC1 activation scales [E] FP32"),
         OpSchema.FormalParameter("down_input_scale", "T_ROUTER",
                                  "FC2 activation scales [E] FP32"),
+        OpSchema.FormalParameter("e_score_correction_bias", "T_ROUTER",
+                                 "Router correction bias [E] FP32"),
     ],
     outputs=[
         OpSchema.FormalParameter("output", "T_HIDDEN",
@@ -1117,9 +1144,210 @@ _nvfp4_moe_plugin_geforce_schema = OpSchema(
         OpSchema.Attribute("hidden_size", OpSchema.AttrType.INT),
         OpSchema.Attribute("moe_inter_size", OpSchema.AttrType.INT),
         OpSchema.Attribute("activation_type", OpSchema.AttrType.INT),
+        OpSchema.Attribute("n_group", OpSchema.AttrType.INT),
+        OpSchema.Attribute("topk_group", OpSchema.AttrType.INT),
+        OpSchema.Attribute("norm_topk_prob", OpSchema.AttrType.INT),
+        OpSchema.Attribute("routed_scaling_factor", OpSchema.AttrType.FLOAT),
+        OpSchema.Attribute("routing_mode", OpSchema.AttrType.INT),
         OpSchema.Attribute("backend", OpSchema.AttrType.INT),
         OpSchema.Attribute("io_dtype", OpSchema.AttrType.INT),
         OpSchema.Attribute("max_routed_rows", OpSchema.AttrType.INT),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# trt_edgellm::NvFP4MoEPluginGeforce (SM12x fused, plain [up, gate] concat)
+# ---------------------------------------------------------------------------
+
+_nvfp4_moe_plugin_geforce_schema = OpSchema(
+    name="NvFP4MoEPluginGeforce",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("NVFP4 MoE plugin (CuTeDSL SM12x fused): FP16 hidden states, FP4 "
+         "expert weights with plain [up_all, gate_all] concat FC1 (no 64-row "
+         "up/gate interleave), and FP8 block scales in 6D MMA layout. Same "
+         "11-input ONNX surface as Nvfp4MoePlugin; FC1 packing convention "
+         "and target arch differ."),
+    inputs=[
+        OpSchema.FormalParameter("router_logits", "T_ROUTER",
+                                 "Router logits [B*S, E] FP32"),
+        OpSchema.FormalParameter("hidden_states", "T_HIDDEN",
+                                 "Hidden states [B, S, H] FP16"),
+        OpSchema.FormalParameter(
+            "fc1_qweights", "T_INT8",
+            "FC1 weights [E, N1, H/2] INT8 (plain [up, gate] concat)"),
+        OpSchema.FormalParameter(
+            "fc1_blocks_scale", "T_INT8",
+            "FC1 block scales [E, m_tiles, k_tiles, 32, 4, 4] INT8"),
+        OpSchema.FormalParameter("fc1_alpha", "T_ROUTER",
+                                 "FC1 global weight scales [E] FP32"),
+        OpSchema.FormalParameter("fc2_qweights", "T_INT8",
+                                 "FC2 weights [E, H, I/2] INT8"),
+        OpSchema.FormalParameter(
+            "fc2_blocks_scale", "T_INT8",
+            "FC2 block scales [E, m_tiles, k_tiles, 32, 4, 4] INT8"),
+        OpSchema.FormalParameter("fc2_alpha", "T_ROUTER",
+                                 "FC2 global weight scales [E] FP32"),
+        OpSchema.FormalParameter("input_global_scale", "T_ROUTER",
+                                 "FC1 activation scales [E] FP32"),
+        OpSchema.FormalParameter("down_input_scale", "T_ROUTER",
+                                 "FC2 activation scales [E] FP32"),
+        OpSchema.FormalParameter("e_score_correction_bias", "T_ROUTER",
+                                 "Router correction bias [E] FP32"),
+    ],
+    outputs=[
+        OpSchema.FormalParameter("output", "T_HIDDEN",
+                                 "Output [B, S, H] FP16"),
+    ],
+    type_constraints=[
+        ("T_ROUTER", ["tensor(float)"], "FP32 tensors"),
+        ("T_HIDDEN", ["tensor(float16)"], "FP16 tensors"),
+        ("T_INT8", ["tensor(int8)"], "INT8 byte tensors"),
+    ],
+    attributes=[
+        OpSchema.Attribute("num_experts", OpSchema.AttrType.INT),
+        OpSchema.Attribute("top_k", OpSchema.AttrType.INT),
+        OpSchema.Attribute("hidden_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("moe_inter_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("activation_type", OpSchema.AttrType.INT),
+        OpSchema.Attribute("n_group", OpSchema.AttrType.INT),
+        OpSchema.Attribute("topk_group", OpSchema.AttrType.INT),
+        OpSchema.Attribute("norm_topk_prob", OpSchema.AttrType.INT),
+        OpSchema.Attribute("routed_scaling_factor", OpSchema.AttrType.FLOAT),
+        OpSchema.Attribute("routing_mode", OpSchema.AttrType.INT),
+        OpSchema.Attribute("backend", OpSchema.AttrType.INT),
+        OpSchema.Attribute("io_dtype", OpSchema.AttrType.INT),
+        OpSchema.Attribute("max_routed_rows", OpSchema.AttrType.INT),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# trt_edgellm::FusedGemmAllReducePlugin (row-parallel NVFP4 GEMM)
+# ---------------------------------------------------------------------------
+
+_fused_gemm_allreduce_plugin_schema = OpSchema(
+    name="FusedGemmAllReducePlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("NVFP4 row-parallel GEMM fused with AllReduce.  Replaces the "
+         "dequant→MatMul→AllReduce chain in o_proj / down_proj when "
+         "tp_size>1.  Inputs are in raw FP4 form; output is FP16 and "
+         "already AllReduced across ranks."),
+    inputs=[
+        OpSchema.FormalParameter(
+            name="fp4_act",
+            description="FP4 packed activation [..., K_per_rank // 2]",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="act_scale",
+            description=
+            "Combined per-block activation scale [..., K_per_rank // 16] (FP32)",
+            type_str="tensor(float)",
+        ),
+        OpSchema.FormalParameter(
+            name="weight_f4",
+            description="FP4 packed weight [N, K_per_rank // 2]",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="weight_f8_scale",
+            description=
+            "FP8E4M3FN per-block weight scale [N, K_per_rank // group_size]",
+            type_str="tensor(float8e4m3fn)",
+        ),
+        OpSchema.FormalParameter(
+            name="weight_f32_scale",
+            description="FP32 global weight scale (scalar)",
+            type_str="tensor(float)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="AllReduced FP16 output [..., N]",
+            type_str="tensor(float16)",
+        ),
+    ],
+    type_constraints=[],
+    attributes=[
+        OpSchema.Attribute(
+            name="tp_size",
+            type=OpSchema.AttrType.INT,
+            description="Tensor parallel world size",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="fuse_residual_rmsnorm",
+            type=OpSchema.AttrType.INT,
+            description="0/1: fuse the post-AllReduce residual+RMSNorm",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="rmsnorm_epsilon",
+            type=OpSchema.AttrType.FLOAT,
+            description="RMSNorm epsilon when fuse_residual_rmsnorm=1",
+            required=False,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# trt_edgellm::DFlashTargetKVCacheUpdate
+# ---------------------------------------------------------------------------
+
+_dflash_target_kv_cache_update_schema = OpSchema(
+    name="DFlashTargetKVCacheUpdate",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("DFlash target KV cache update: apply RoPE to k_delta and write "
+         "k_rope + v_delta into the combined draft KV cache."),
+    inputs=[
+        OpSchema.FormalParameter(
+            name="k_delta",
+            description="K delta [B, L, Hkv, D] after k_norm, no RoPE",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="v_delta",
+            description="V delta [B, L, Hkv, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="past_key_value",
+            description="Combined KV cache [B, 2, Hkv, capacity, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="rope_cos_sin",
+            description="RoPE cos/sin [ropeBatch, capacity, rotaryDim] FP32",
+            type_str="tensor(float)",
+        ),
+        OpSchema.FormalParameter(
+            name="delta_start_positions",
+            description="Start positions for delta write [B] INT32",
+            type_str="tensor(int32)",
+        ),
+        OpSchema.FormalParameter(
+            name="delta_lengths",
+            description=
+            "Per-batch delta lengths [B] INT32 for multi-batch guard",
+            type_str="tensor(int32)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="present_key_value",
+            description="Updated KV cache (aliased to past_key_value)",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)"],
+            "KV cache data type (FP16 for now).",
+        ),
     ],
 )
 
@@ -1136,10 +1364,13 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _rotary_embedding_schema,
     _tensor_scatter_schema,
     _attention_trt_native_schema,
+    _vit_trt_attention_schema,
     _gated_delta_net_schema,
     _int4_moe_plugin_schema,
     _nvfp4_moe_plugin_schema,
     _nvfp4_moe_plugin_geforce_schema,
+    _fused_gemm_allreduce_plugin_schema,
+    _dflash_target_kv_cache_update_schema,
 )
 
 _registered_tensorrt_edgellm_schemas: bool = False

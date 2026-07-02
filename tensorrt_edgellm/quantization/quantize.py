@@ -44,29 +44,38 @@ from .qwen3_asr_loader import (asr_calibration_dataloader, is_qwen3_asr_model,
                                postprocess_qwen3_asr_checkpoint)
 
 
+def _load_dataset(*args, **kwargs):
+    from datasets import load_dataset
+    return load_dataset(*args, **kwargs)
+
+
 def _text_calib_dataloader(tokenizer,
                            dataset_name="cnn_dailymail",
                            batch_size=1,
                            num_samples=512,
                            max_length=512):
     """Return a DataLoader of tokenised ``input_ids`` for calibration."""
-    from datasets import load_dataset
-    if "cnn_dailymail" in dataset_name:
-        ds = load_dataset(dataset_name, name="3.0.0", split="train")
-        texts = ds["article"][:num_samples]
-    elif os.path.isdir(dataset_name):
-        ds = load_dataset(dataset_name, split="train")
+
+    def _get_texts(ds):
         if "text" in ds.column_names:
             col = "text"
         elif "article" in ds.column_names:
             col = "article"
         else:
             raise ValueError(
-                f"Local dataset {dataset_name!r} has no 'text' or 'article' column: "
+                f"Dataset {dataset_name!r} has no 'text' or 'article' column: "
                 f"{ds.column_names}")
-        texts = ds[col][:num_samples]
+        return ds[col][:num_samples]
+
+    if "cnn_dailymail" in dataset_name:
+        ds = _load_dataset(dataset_name, name="3.0.0", split="train")
+        texts = ds["article"][:num_samples]
+    elif os.path.isfile(dataset_name):
+        ds = _load_dataset("json", data_files=dataset_name, split="train")
+        texts = _get_texts(ds)
     else:
-        raise ValueError(f"Unsupported dataset: {dataset_name}")
+        ds = _load_dataset(dataset_name, split="train")
+        texts = _get_texts(ds)
 
     enc = tokenizer(texts,
                     return_tensors="pt",
@@ -120,12 +129,11 @@ def _iter_image_question_pairs(dataset_name: str):
 
     Splits are tried in the order ``dev`` → ``validation`` → ``train``.
     """
-    from datasets import load_dataset
     last_err: Optional[Exception] = None
     ds = None
     for split in ("dev", "validation", "train"):
         try:
-            ds = load_dataset(dataset_name, split=split, streaming=True)
+            ds = _load_dataset(dataset_name, split=split, streaming=True)
             break
         except Exception as e:  # pylint: disable=broad-except
             last_err = e
@@ -439,6 +447,22 @@ def _normalize_tied_weights_keys(model) -> None:
             module._tied_weights_keys = {k: k for k in attr}
 
 
+def _remove_stale_safetensors_index(output_dir: str) -> None:
+    """Remove a stale shard index when export produced a single safetensors file."""
+    index_path = os.path.join(output_dir, "model.safetensors.index.json")
+    single_path = os.path.join(output_dir, "model.safetensors")
+    if not (os.path.exists(index_path) and os.path.exists(single_path)):
+        return
+    try:
+        with open(index_path, encoding="utf-8") as f:
+            weight_map = json.load(f).get("weight_map", {})
+    except (OSError, json.JSONDecodeError):
+        return
+    if any(not os.path.exists(os.path.join(output_dir, shard))
+           for shard in set(weight_map.values())):
+        os.remove(index_path)
+
+
 def _fix_generation_config_for_strict_validate(model) -> None:
     """WAR for transformers >= 5.x ``GenerationConfig.validate(strict=True)``.
 
@@ -737,6 +761,7 @@ def quantize_and_export(
         export_hf_checkpoint(model,
                              export_dir=output_dir,
                              extra_state_dict=mtp_state_dict)
+    _remove_stale_safetensors_index(output_dir)
     tokenizer.save_pretrained(output_dir)
     if processor is not None:
         if _is_phi4mm_model(model_dir):

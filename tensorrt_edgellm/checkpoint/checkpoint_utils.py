@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 from typing import TYPE_CHECKING, Any, Dict, Tuple
@@ -67,6 +68,15 @@ def normalize_rope_scaling_for_runtime(rope_scaling: Any) -> Any:
     # C++ collectRopeConfig() accepts either key.
     if "type" not in normalized and "rope_type" in normalized:
         normalized["type"] = normalized["rope_type"]
+    return normalized
+
+
+def _normalize_explicit_rope_config_for_runtime(
+        rope_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize one explicit runtime RoPE config block."""
+    normalized = dict(rope_config)
+    normalized["rope_scaling"] = normalize_rope_scaling_for_runtime(
+        normalized.get("rope_scaling"))
     return normalized
 
 
@@ -273,30 +283,44 @@ def _export_tool_version() -> str:
     return __version__
 
 
-def _determine_model_type(config) -> str:
-    """Map ModelConfig to runtime model_type string."""
-    if config.is_eagle3_draft:
-        return "eagle3_draft"
-    if config.eagle_base:
-        return "eagle3_base"
-    if config.is_mtp_draft:
-        return "mtp_draft"
-    if config.mtp_base:
-        return "mtp_base"
-    if config.is_hybrid:
-        return "hybrid_mamba"
+def _determine_spec_decode_type(config) -> str:
+    """Return the speculative decoding algorithm for runtime config."""
+    if config.is_eagle3_draft or config.eagle_base:
+        return "eagle3"
+    if config.is_dflash_draft or config.dflash_base:
+        return "dflash"
+    if config.is_mtp_draft or config.mtp_base:
+        return "mtp"
+    return "none"
+
+
+def _determine_engine_role(config) -> str:
+    """Return the engine role within the speculative decoding deployment."""
+    if config.is_eagle3_draft or config.is_dflash_draft or config.is_mtp_draft:
+        return "draft"
+    if config.eagle_base or config.dflash_base or config.mtp_base:
+        return "base"
     return "llm"
 
 
 def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
-    """JSON object written as ``config.json`` beside the ONNX export."""
+    """JSON object written as the runtime config beside the ONNX export.
+
+    Head and intermediate sizes describe the per-rank ONNX file this
+    config sits next to. When ``tp_size > 1`` the config is per-rank,
+    stamped with ``tp_size`` and ``tp_rank`` so each rank's artifact is
+    self-describing. For single-device exports no TP fields are emitted.
+    """
     config = model.config
     mc = config.mamba_cfg
     rope_scaling = normalize_rope_scaling_for_runtime(config.rope_scaling)
+    tp_size = max(1, getattr(config, "tp_size", 1))
+    tp_rank = max(0, getattr(config, "tp_rank", 0))
 
     out: Dict[str, Any] = {
         "model": config.model_type,
-        "model_type": _determine_model_type(config),
+        "spec_decode_type": _determine_spec_decode_type(config),
+        "engine_role": _determine_engine_role(config),
         "edgellm_version": _export_tool_version(),
         "vocab_size": config.vocab_size,
         "hidden_size": config.hidden_size,
@@ -311,12 +335,72 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         "partial_rotary_factor": config.partial_rotary_factor,
         "num_deepstack_features": config.num_deepstack_features,
     }
+    if tp_size > 1:
+        out["tp_size"] = tp_size
+        out["tp_rank"] = tp_rank
+
+    # Heterogeneous head dimensions (e.g. Gemma4: sliding=256, global=512)
+    if config.global_head_dim and config.global_head_dim != config.head_dim:
+        out["global_head_dim"] = config.global_head_dim
+        out["layer_types"] = config.layer_types
+        # Emit kv_layer_configs so C++ runtime sizes per-layer KV cache correctly.
+        # The C++ parser expects "attention"/"mamba" strings in layer_types when
+        # kv_layer_configs is present, so emit a normalised copy.
+        norm_lt: list = []
+        kv_cfgs: list = []
+        for lt in config.layer_types:
+            norm_lt.append("attention")  # all layers are attention in Gemma4
+            if lt == "full_attention":
+                kv_cfgs.append({
+                    "num_kv_heads":
+                    config.num_global_key_value_heads
+                    or config.num_key_value_heads,
+                    "head_dim":
+                    config.global_head_dim
+                })
+            else:
+                kv_cfgs.append({
+                    "num_kv_heads": config.num_key_value_heads,
+                    "head_dim": config.head_dim
+                })
+        out["layer_types"] = norm_lt
+        out["kv_layer_configs"] = kv_cfgs
+        # Per-layer-type RoPE: extract global attention RoPE parameters from
+        # rope_scaling.full_attention (Gemma4: theta=1000000, prf=0.25).
+        full_attn_rope = (rope_scaling or {}).get("full_attention", {})
+        if full_attn_rope.get("rope_theta"):
+            out["global_rope_theta"] = float(full_attn_rope["rope_theta"])
+
+    # KV-sharing donors: shared layers read from donor layer's KV cache.
+    num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+    if num_kv_shared > 0:
+        from ..models.gemma4.modeling_gemma4_text import \
+            _compute_kv_donor_indices
+        donor_map = _compute_kv_donor_indices(config)
+        # Build donors array of length num_hidden_layers (all are attention).
+        # -1 = no sharing, otherwise = donor layer index.
+        donors = [-1] * config.num_hidden_layers
+        for shared_idx, donor_idx in donor_map.items():
+            donors[shared_idx] = donor_idx
+        out["kv_sharing_donors"] = donors
+
+    ple_enabled = config.hidden_size_per_layer_input > 0
+    out["ple_enabled"] = ple_enabled
+    out["num_ple_inputs"] = config.num_hidden_layers if ple_enabled else 0
+    out["ple_hidden_size"] = (config.hidden_size_per_layer_input
+                              if ple_enabled else 0)
 
     # longrope requires original_max_position_embeddings for scaling factor computation.
     if (isinstance(rope_scaling, dict)
             and rope_scaling.get("type") == "longrope"
             and config.original_max_position_embeddings is not None):
         out["original_max_position_embeddings"] = config.original_max_position_embeddings
+
+    if config.use_dual_rope:
+        out["sliding_rope_config"] = _normalize_explicit_rope_config_for_runtime(
+            config.sliding_rope_config or {})
+        out["full_rope_config"] = _normalize_explicit_rope_config_for_runtime(
+            config.full_rope_config or {})
 
     if config.is_hybrid and mc is not None:
         out.update({
@@ -389,6 +473,30 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         out.update({
             "draft_vocab_size": config.vocab_size,
             "base_model_hidden_size": config.hidden_size,
+        })
+
+    if config.is_dflash_draft:
+        out.update({
+            "draft_vocab_size":
+            config.vocab_size,
+            "base_model_hidden_size":
+            len(config.dflash_target_layer_ids) * config.hidden_size,
+            "block_size":
+            config.dflash_block_size,
+            "dflash_config": {
+                "target_layer_ids": list(config.dflash_target_layer_ids),
+                "block_size": config.dflash_block_size,
+                "mask_token_id": config.dflash_mask_token_id,
+            },
+        })
+
+    if config.dflash_base:
+        out.update({
+            "dflash_config": {
+                "target_layer_ids": list(config.dflash_target_layer_ids),
+                "block_size": config.dflash_block_size,
+                "mask_token_id": config.dflash_mask_token_id,
+            },
         })
 
     if config.eagle_base:
@@ -516,12 +624,29 @@ def _build_alpamayo_tokenizer(config: Dict[str, Any], out_dir: str) -> None:
         logger.warning("Failed to build Alpamayo tokenizer: %s", exc)
 
 
+def _runtime_embedding_scale(model: "CausalLM") -> float:
+    """Return the scale folded into runtime token embedding sidecars."""
+    config = model.config
+    explicit_scale = getattr(config, "embedding_scale", None)
+    if explicit_scale is not None:
+        return float(explicit_scale)
+    if str(getattr(config, "model_type", "")).startswith("gemma4"):
+        return math.sqrt(float(config.hidden_size))
+    return 1.0
+
+
 def write_runtime_artifacts(model: "CausalLM",
                             model_dir: str,
                             out_dir: str,
                             fp8_embedding: bool = False,
-                            reduced_vocab_dir: str = "") -> None:
-    """Write ``config.json``, ``embedding.safetensors``, tokenizer copies, chat template."""
+                            reduced_vocab_dir: str = "",
+                            config_filename: str = "config.json") -> None:
+    """Write the runtime config, ``embedding.safetensors``, tokenizer copies, chat template.
+
+    ``config_filename`` selects the filename for the runtime config. Use
+    the default ``"config.json"`` for single-device exports, or
+    ``"config_tp{N}_rank{R}.json"`` for per-rank TP exports.
+    """
     import torch
     from safetensors.torch import save_file
 
@@ -544,10 +669,27 @@ def write_runtime_artifacts(model: "CausalLM",
                 root_cfg = json.load(_f)
             if root_cfg.get("vision_config"):
                 cfg_json["vision_config"] = root_cfg["vision_config"]
+            # Propagate eos_token_id so the C++ runtime can stop on any EOS
+            # token (e.g. Gemma4 uses [1, 106]).  Check config.json first,
+            # then fall back to generation_config.json (some models only set
+            # eos_token_id there).
+            eos = root_cfg.get("eos_token_id")
+            if eos is None:
+                gen_cfg_path = os.path.join(model_dir,
+                                            "generation_config.json")
+                if os.path.exists(gen_cfg_path):
+                    with open(gen_cfg_path) as _gf:
+                        gen_cfg = json.load(_gf)
+                    eos = gen_cfg.get("eos_token_id")
+            if isinstance(eos, list):
+                cfg_json["eos_token_id"] = [int(x) for x in eos]
+            elif isinstance(eos, int):
+                cfg_json["eos_token_id"] = [eos]
 
-    with open(os.path.join(out_dir, "config.json"), "w") as f:
+    cfg_path = os.path.join(out_dir, config_filename)
+    with open(cfg_path, "w") as f:
         json.dump(cfg_json, f, indent=2)
-    logger.info("Wrote config.json to %s", out_dir)
+    logger.info("Wrote %s to %s", config_filename, out_dir)
 
     # EAGLE3 draft models don't need embedding.safetensors — the C++ runtime
     # uses the base model's shared embedding table (the builder already skips
@@ -567,7 +709,10 @@ def write_runtime_artifacts(model: "CausalLM",
             embed = getattr(getattr(model, "backbone", None), "embeddings",
                             None)
         if embed is not None:
-            weight = embed.weight.data.cpu()
+            weight = embed.weight.data.detach().cpu()
+            embedding_scale = _runtime_embedding_scale(model)
+            if embedding_scale != 1.0:
+                weight = weight * embedding_scale
             # C++ runtime requires FP16 (or FP8) embedding; cast if needed.
             if weight.dtype in (torch.float32, torch.bfloat16):
                 weight = weight.to(torch.float16)
@@ -589,6 +734,23 @@ def write_runtime_artifacts(model: "CausalLM",
         else:
             logger.warning(
                 "embed_tokens not found; skipping embedding.safetensors")
+
+        if model.config.ple_enabled:
+            ple_embed = getattr(getattr(model, "model", None),
+                                "embed_tokens_per_layer", None)
+            if ple_embed is None:
+                raise ValueError(
+                    "Gemma4 PLE is enabled but embed_tokens_per_layer is missing"
+                )
+            ple_weight = ple_embed.weight.data.detach().cpu()
+            ple_weight = ple_weight * math.sqrt(
+                model.config.hidden_size_per_layer_input)
+            if ple_weight.dtype in (torch.float32, torch.bfloat16):
+                ple_weight = ple_weight.to(torch.float16)
+            ple_path = os.path.join(out_dir, "ple_embedding.safetensors")
+            save_file({"weight": ple_weight.contiguous()}, ple_path)
+            logger.info("Wrote ple_embedding.safetensors (%s)",
+                        list(ple_weight.shape))
 
     # Alpamayo-R1: tokenizer lives in the VLM checkpoint, not in model_dir.
     # Build it first so that tokenizer files exist before the copy loop

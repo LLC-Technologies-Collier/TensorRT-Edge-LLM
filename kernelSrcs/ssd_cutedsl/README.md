@@ -35,7 +35,7 @@ are **runtime** arguments.
 
 ### Blackwell (SM100-110 — TMA + TMEM + WGMMA)
 
-SM120+ (GB10/GB20) lacks TMEM/wgmma and uses the non-Blackwell fallback.
+SM120+ lacks TMEM/wgmma and uses the non-Blackwell fallback.
 
 | Variant | DIM | DSTATE | `has_init_states` | Notes |
 |---|---|---|---|---|
@@ -93,7 +93,9 @@ pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
 # or
 pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
 
-pip install nvidia-cutlass-dsl==4.5.1
+# CUDA 13: install the [cu13] extra. CUDA 12: install the base package.
+pip install 'nvidia-cutlass-dsl[cu13]==4.5.2'  # CUDA 13.x
+# CUDA 12.x: pip install 'nvidia-cutlass-dsl==4.5.2'
 
 cd tensorrt-edge-llm
 

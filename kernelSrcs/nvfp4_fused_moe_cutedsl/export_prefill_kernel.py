@@ -77,7 +77,7 @@ def export_prefill_moe_variant(args):
     activation = args.activation
     verbose = getattr(args, "verbose", False)
     is_gated = activation in ("swiglu", "geglu")
-    # v1 NvFP4MoEPluginGeforce consumes FP16 hidden states. BF16 is intentionally
+    # v1 Nvfp4MoePlugin consumes FP16 hidden states. BF16 is intentionally
     # deferred; when it returns, add --io_dtype {bf16,fp16} here and in the
     # sibling decode export script.
     io_dtype = cutlass.Float16
@@ -338,7 +338,7 @@ def export_prefill_moe_variant(args):
     # The AOT wrapper launches with cluster_size=1, where max active clusters
     # equals SM count. Avoid HardwareInfo here because SM121 builds can target
     # sm_120a for the fused kernel compile, which makes HardwareInfo's dummy
-    # occupancy kernel invalid on GB10.
+    # occupancy kernel invalid on SM121.
     mac = sm_count
 
     ab_dtype = cutlass.Float4E2M1FN

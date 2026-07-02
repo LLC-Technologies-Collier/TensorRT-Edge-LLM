@@ -53,6 +53,29 @@ namespace
 constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
 
+//! Fires `context.onTokenGenerated` once per active slot using the most recent
+//! token in `tokenIds`. Called at the end of prefill (one token sampled per
+//! slot) and after every decode iteration so streaming consumers see every
+//! emitted token in order.
+inline void emitTokenCallbacks(rt::DecodingInferenceContext& context)
+{
+    if (!context.onTokenGenerated.has_value())
+    {
+        return;
+    }
+    auto const& callback = context.onTokenGenerated.value();
+    for (int32_t i = 0; i < context.activeBatchSize; ++i)
+    {
+        auto const& slotTokens = context.tokenIds[i];
+        if (slotTokens.empty())
+        {
+            continue;
+        }
+        bool const isFinished = context.finishedStates[i] != 0;
+        callback(rt::TokenCallbackInfo{slotTokens.back(), i, context.generationRound, isFinished});
+    }
+}
+
 } // namespace
 
 namespace rt
@@ -85,17 +108,25 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     // 2. Parse engine configurations and attach user drafting (bundle factory
     //    performs cross-engine consistency and drafting-vs-capacity checks).
     // -----------------------------------------------------------------------
-    std::filesystem::path const baseEnginePath = draftingConfig.has_value()
-        ? std::filesystem::path(engineDir) / "eagle_base.engine"
-        : std::filesystem::path(engineDir) / "llm.engine";
-    std::filesystem::path const baseConfigPath = draftingConfig.has_value()
-        ? std::filesystem::path(engineDir) / "base_config.json"
-        : std::filesystem::path(engineDir) / "config.json";
+    std::filesystem::path const engineDirPath{engineDir};
+    std::filesystem::path const baseEnginePath
+        = draftingConfig.has_value() ? engineDirPath / "spec_base.engine" : engineDirPath / "llm.engine";
+    std::filesystem::path const baseConfigPath
+        = draftingConfig.has_value() ? engineDirPath / "base_config.json" : engineDirPath / "config.json";
     std::optional<std::filesystem::path> const draftConfigPath = draftingConfig.has_value()
-        ? std::optional<std::filesystem::path>{std::filesystem::path(engineDir) / "draft_config.json"}
+        ? std::optional<std::filesystem::path>{engineDirPath / "draft_config.json"}
         : std::nullopt;
 
     mDeployment = createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig);
+
+    // Precompute whether any attention layer uses FFPA (headDim=512).
+    // FFPA has no cu_seqlens support and requires zero-padded embeddings for ragged batches.
+    mHasFFPALayer = std::any_of(mDeployment.base.kvLayerConfigs.begin(), mDeployment.base.kvLayerConfigs.end(),
+        [](KVLayerConfig const& kv) { return kv.headDim == 512; });
+    if (mDeployment.base.kvLayerConfigs.empty())
+    {
+        mHasFFPALayer = (mDeployment.base.headDim == 512);
+    }
 
     ELLM_CHECK(mDeployment.base.numDeepstackFeatures <= 0 || !multimodalEngineDir.empty(),
         "--multimodalEngineDir is required for VLM engine.");
@@ -201,12 +232,17 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     int32_t const vanillaSamplingWorkspaceSize
         = static_cast<int32_t>(getTopKtopPSamplingWorkspaceSize(mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize,
             SamplingParams(mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize, 1.0f, 0, 0.9f)));
+    int32_t const draftSamplingRows = hasDraft && mDeployment.specDecodeMode() == SpecDecodeMode::kDFlash
+        ? mMaxRuntimeBatchSize * mDeployment.specConfig->verifySize
+        : mMaxRuntimeBatchSize * effectiveDraftTopK;
+    int32_t const draftSamplingTopK
+        = hasDraft && mDeployment.specDecodeMode() == SpecDecodeMode::kDFlash ? 1 : effectiveDraftTopK;
     int32_t const maxSamplingWorkspaceSize = hasDraft
         ? std::max({vanillaSamplingWorkspaceSize,
               static_cast<int32_t>(
                   getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize, 1)),
               static_cast<int32_t>(getSelectAllTopKWorkspaceSize(
-                  mMaxRuntimeBatchSize * effectiveDraftTopK, mDeployment.draft->outputVocabSize, effectiveDraftTopK))})
+                  draftSamplingRows, mDeployment.draft->outputVocabSize, draftSamplingTopK))})
         : vanillaSamplingWorkspaceSize;
 
     try
@@ -241,6 +277,12 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         LOG_ERROR("Failed to allocate runtime tensors: %s", e.what());
         throw std::runtime_error("Failed to allocate runtime tensors: " + std::string(e.what()));
     }
+    if (mDeployment.base.pleEnabled)
+    {
+        int32_t const maxPleSeqLen = std::max(maxInputLength, std::max(1, mDeployment.base.maxVerifyTreeSize));
+        mGemma4Ple = std::make_unique<Gemma4EmbeddingPreprocessor>(std::filesystem::path(engineDir), mDeployment.base,
+            mMaxRuntimeBatchSize, maxPleSeqLen, mBaseTensorMap, stream);
+    }
     LOG_INFO("Runtime tensors successfully allocated.");
 
     // -----------------------------------------------------------------------
@@ -272,6 +314,15 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     LOG_INFO("Start loading tokenizer from model directory: %s", engineDir.c_str());
     ELLM_CHECK(mTokenizer->loadFromHF(engineDir), "Failed to load tokenizer from model directory: " + engineDir);
     LOG_INFO("Tokenizer successfully loaded from model directory: %s", engineDir.c_str());
+
+    // Set additional EOS token IDs from parsed config (e.g. Gemma4 has eos_token_id: [1, 106])
+    if (!mDeployment.base.eosTokenIds.empty())
+    {
+        std::vector<tokenizer::Rank> additionalEos(
+            mDeployment.base.eosTokenIds.begin(), mDeployment.base.eosTokenIds.end());
+        mTokenizer->setAdditionalEosIds(additionalEos);
+        LOG_INFO("Loaded %zu EOS token IDs from config", additionalEos.size());
+    }
 
     // -----------------------------------------------------------------------
     // 13. Decoding strategies.
@@ -384,7 +435,8 @@ void LLMInferenceRuntime::buildDecodingRuntimeContext()
         *mSharedResources->cacheManagers[0], *mPipelineIO, [this](InferenceDims const& dims, cudaStream_t stream) {
             return captureBaseGraphWithLoraFanout(dims, stream);
         }};
-    PreprocessResources preprocessResources{*mStepPreparer, *mEmbeddingPre, mEmbedding, mIdsInput, mDeepstack.get()};
+    PreprocessResources preprocessResources{
+        *mStepPreparer, *mEmbeddingPre, mEmbedding, mIdsInput, mDeepstack.get(), mGemma4Ple.get()};
     SamplingBuffers sampling{mSamplingWorkspace, mSamplingIndices, mSamplingScores, mBaseVocabMappingTable,
         mHostPackedTokenIds, mHostSelectedTokenIds};
     mDecodingRuntimeContext.reset(new DecodingRuntimeContext{
@@ -431,10 +483,11 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     DecodingStrategy& decodingStrategy = mDecoderRegistry->select(request);
     bool const enableSpecDecode = decodingStrategy.isSpeculative();
 
-    // Speculative decoding only supports greedy; override non-default sampling params.
-    bool const hasNonDefaultSampling
-        = (request.topK > 1 || request.topP < 1.0f || std::fabs(request.temperature - 1.0f) > 1e-3f);
-    if (enableSpecDecode && hasNonDefaultSampling)
+    // Current speculative decoders only support greedy-compatible requests.
+    // DecoderRegistry falls back to vanilla for non-greedy requests; if a
+    // speculative decoder is selected here, normalize sampling params to greedy.
+    bool const hasNonGreedySampling = shouldUseNonGreedySampling(request.temperature, request.topK, request.topP);
+    if (enableSpecDecode && hasNonGreedySampling)
     {
         LOG_WARNING("Spec-decode active: overriding sampling params to greedy (ignoring temp/topK/topP).");
     }
@@ -478,7 +531,7 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         }
     }
 
-    // Forward sampling params to context; spec-decode forces greedy.
+    // Forward sampling params to context; selected spec-decode requests run greedy.
     context.temperature = enableSpecDecode ? 1.0f : request.temperature;
     context.topP = enableSpecDecode ? 1.0f : request.topP;
     context.topK = enableSpecDecode ? 0 : request.topK;
@@ -584,38 +637,22 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         return false;
     }
 
-    // Populate the base-model hidden-states portal so consumers (Qwen3-Omni Talker via
-    // streaming callback or post-handleRequest sequential consumer) can fetch the buffers
-    // by layer index. See getBaseModelHiddenStates() / getBaseModelInputTokenIds() for the
-    // lifetime contract.
-    int32_t prefillSequenceLength = 0;
+    // Streaming consumers (e.g. the Qwen3-Omni Talker) run concurrently with
+    // the base model's decode loop and read the prefill-time input embeddings
+    // and engine hidden_states output. Copy both into `streamingPrefill`
+    // between prefill and the first decode step — the live PipelineIO buffers
+    // are reshaped to `{B, 1, H}` and overwritten by every decode iteration.
     if (outputThinkerEmbeddings)
     {
-        prefillSequenceLength
+        int32_t const prefillSequenceLength
             = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
-
-        // Layer 0: back up post-multimodal input embeddings before the decode loop reshapes
-        // mPipelineIO->inputsEmbeds to {BS,1,H} (scrambling the contiguous {BS,prefillLen,H} layout).
-        // The backup buffer lives on PipelineIO and is lazy-allocated at maxISL on first
-        // streaming request, then reshaped per request — see getBaseModelHiddenStates() lifetime contract.
-        rt::Tensor& prefillEmbedsBackup = mPipelineIO->prefillEmbedsBackup;
-        if (prefillEmbedsBackup.isEmpty())
-        {
-            prefillEmbedsBackup = rt::Tensor(
-                {mMaxRuntimeBatchSize, mDeployment.base.maxSupportedInputLength, mDeployment.base.hiddenSize},
-                rt::DeviceType::kGPU, DataType::kHALF, "PipelineIO::prefillEmbedsBackup");
-        }
-        check::check(prefillEmbedsBackup.reshape({activeBatchSize, prefillSequenceLength, mDeployment.base.hiddenSize}),
-            "Tensor reshape failed");
-        size_t const prefillBytes = static_cast<size_t>(activeBatchSize) * prefillSequenceLength
-            * mDeployment.base.hiddenSize * sizeof(__half);
-        CUDA_CHECK(cudaMemcpyAsync(prefillEmbedsBackup.rawPointer(), mPipelineIO->inputsEmbeds.rawPointer(),
-            prefillBytes, cudaMemcpyDeviceToDevice, stream));
-
+        mPipelineIO->streamingPrefill.populateFromPrefill(mPipelineIO->inputsEmbeds, mPipelineIO->outputHiddenStates,
+            activeBatchSize, prefillSequenceLength, mDeployment.base.hiddenSize, mMaxRuntimeBatchSize,
+            mDeployment.base.maxSupportedInputLength, stream);
         mLastPrefillLength = prefillSequenceLength;
         mLastInputTokenIds = context.rawBatchedInputIds;
-        mHiddenStatesRegistry[0] = &prefillEmbedsBackup;
-        // Layer N (acceptHiddenLayer) is registered after the engine-output reshape below.
+        mHiddenStatesRegistry[0] = &mPipelineIO->streamingPrefill.inputEmbeds;
+        mHiddenStatesRegistry[request.acceptHiddenLayer] = &mPipelineIO->streamingPrefill.engineHiddenStates;
     }
 
     // Lambda to check if all batches are finished
@@ -641,6 +678,34 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     {
         trajFutureStartId = static_cast<int32_t>(mTokenizer->getTokenId("<|traj_future_start|>"));
     }
+
+    // Per-slot tracking: once thinking is complete (end marker emitted or model
+    // never entered thinking), secondary EOS tokens terminate generation normally.
+    std::vector<int8_t> thinkingDone(context.activeBatchSize, 0);
+    int32_t const endOfChannelId = static_cast<int32_t>(mTokenizer->getTokenId("<channel|>"));
+    int32_t const endOfThinkId = static_cast<int32_t>(mTokenizer->getTokenId("</think>"));
+    int32_t const startOfChannelId = static_cast<int32_t>(mTokenizer->getTokenId("<|channel>"));
+    int32_t const startOfThinkId = static_cast<int32_t>(mTokenizer->getTokenId("<think>"));
+
+    auto updateThinkingDone = [&]() {
+        if (!request.enableThinking)
+            return;
+        for (int32_t i = 0; i < context.activeBatchSize; ++i)
+        {
+            if (thinkingDone[i] || context.tokenIds[i].empty())
+                continue;
+            auto lastTok = context.tokenIds[i].back();
+            if (lastTok == endOfChannelId || lastTok == endOfThinkId)
+            {
+                thinkingDone[i] = true;
+            }
+            else if (context.currentGenerateLengths[i] == 1 && lastTok != startOfChannelId && lastTok != startOfThinkId)
+            {
+                thinkingDone[i] = true;
+                LOG_DEBUG("Batch %d: first token %d is not thinking-start, marking thinkingDone", i, lastTok);
+            }
+        }
+    };
 
     // Lambda to update finish states based on EOS and max_length. Latches
     // terminalReason atomically with the state flip — the !finishedStates guard
@@ -668,13 +733,23 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
             }
             else
             {
-                // Check EOS
-                if (!context.tokenIds[i].empty() && context.tokenIds[i].back() == mTokenizer->getEosId())
+                // Check EOS (supports multiple EOS tokens, e.g. Gemma4 [1, 106]).
+                // In thinking mode, suppress secondary EOS until thinking is complete.
+                if (!context.tokenIds[i].empty())
                 {
-                    context.finishedStates[i] = 1;
-                    s.terminalReason = FinishReason::kEndId;
-                    LOG_DEBUG("Batch %d finished, reason: EOS", i);
-                    continue;
+                    auto lastToken = context.tokenIds[i].back();
+                    bool isEos = mTokenizer->isEosToken(lastToken);
+                    if (isEos && request.enableThinking && lastToken != mTokenizer->getEosId() && !thinkingDone[i])
+                    {
+                        isEos = false;
+                    }
+                    if (isEos)
+                    {
+                        context.finishedStates[i] = 1;
+                        s.terminalReason = FinishReason::kEndId;
+                        LOG_DEBUG("Batch %d finished, reason: EOS", i);
+                        continue;
+                    }
                 }
             }
             // Check max length
@@ -708,6 +783,9 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     //   cancel → decode (emitDelta + stop match) → finalize (EOS/length/stop) → emit
     applyCancellationToFinishStates(context);
     decodePerSlot(context, *mTokenizer);
+
+    updateThinkingDone();
+
     updateFinishStates();
     emitChunks(context);
 
@@ -736,8 +814,15 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
 
         // Per-iter pipeline: decode → finalize finish state → emit chunks.
         decodePerSlot(context, *mTokenizer);
+
+        // Update thinking-done state: check if the last generated token is an
+        // end-of-thinking marker (<channel|> for Gemma4, </think> for Qwen3/Nemotron).
+        updateThinkingDone();
+
         updateFinishStates();
         emitChunks(context);
+
+        emitTokenCallbacks(context);
         context.generationRound += 1;
 
         // Perform batch eviction if needed (after verification, before updating finish states)
@@ -880,17 +965,6 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
                 response.outputTrajectories[i] = std::move(trajectories[i]);
             }
         }
-    }
-
-    // Reshape engine-output hidden states to the actual prefill size and register layer N
-    // (acceptHiddenLayer) in the portal. The buffers live on PipelineIO; the registry
-    // here just records non-owning pointers consumers fetch via getBaseModelHiddenStates().
-    if (outputThinkerEmbeddings)
-    {
-        rt::Tensor& outputHiddenStates = mPipelineIO->outputHiddenStates;
-        check::check(outputHiddenStates.reshape({activeBatchSize, prefillSequenceLength, mDeployment.base.hiddenSize}),
-            "Tensor reshape failed");
-        mHiddenStatesRegistry[request.acceptHiddenLayer] = &outputHiddenStates;
     }
 
     return true;
@@ -1115,6 +1189,18 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     // deepstack slots are populated from features or zero-filled depending on the request.
     mEmbeddingPre->embed(mIdsInput, context.visualEmbeddings, context.audioEmbeddings, *mPipelineIO, context.stream);
     mEmbeddingPre->prepareDeepstack(mIdsInput, context.deepstackFeatures, *mPipelineIO, context.stream);
+    if (mGemma4Ple)
+    {
+        mGemma4Ple->embed(mIdsInput, context.stream);
+    }
+
+    // Zero padding positions in embeddings/PLE to prevent fp16 overflow in FFPA layers.
+    // FFPA (headDim=512) has no cu_seqlens and processes all positions uniformly.
+    // Non-FFPA models (Llama/Qwen) handle padding via cu_seqlens, so skip the memsets.
+    if (activeBatchSize > 1 && mHasFFPALayer)
+    {
+        zeroPaddingForFFPA(hostCtxLenData, activeBatchSize, inputIdsLength, context.stream);
+    }
 
     // Dispatch per-step sequence prep (context lengths H2D, selectTokenIndices).
     mStepPreparer->prepare(
@@ -1130,6 +1216,7 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     // (0 for the "initial prefill" sentinel, else batch).
     bool const baseKVAllEmpty = mSharedResources->cacheManagers[0]->getKVCacheAllEmpty();
     auto const prefillDims = mDeployment.base.prefillDims(activeBatchSize, inputIdsLength, baseKVAllEmpty);
+
     check::check(mBaseExecutor->prepare(kPrefillProfile, prefillDims, mBaseTensorMap, context.stream),
         "Failed to prepare base model for prefill step.");
     check::check(mBaseExecutor->execute(context.stream), "Failed to execute base model for prefill step.");
@@ -1171,18 +1258,9 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
         {
             context.tokenIds[i].push_back(hostSelectedTokenIdsData[i]);
             context.currentGenerateLengths[i] += 1;
-
-            // Fire the per-token callback for the prefill-sampled token. runVanillaDecoding
-            // dispatches the callback for every decode token, so emitting here keeps the sequence
-            // complete for streaming consumers (e.g. the Qwen3-Omni Thinker-Talker pipeline).
-            if (context.onTokenGenerated.has_value())
-            {
-                bool const isFinished = context.finishedStates[i] != 0;
-                TokenCallbackInfo info{hostSelectedTokenIdsData[i], i, context.generationRound, isFinished};
-                context.onTokenGenerated.value()(info);
-            }
         }
     }
+    emitTokenCallbacks(context);
     return true;
 }
 
@@ -1667,6 +1745,51 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
     context.activeBatchSize = newActiveBatch;
 
     return true;
+}
+
+void LLMInferenceRuntime::zeroPaddingForFFPA(
+    int32_t const* contextLengths, int32_t batchSize, int32_t inputIdsLength, cudaStream_t stream)
+{
+    int32_t const hiddenSize = mDeployment.base.hiddenSize;
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        int32_t const validLen = contextLengths[b];
+        if (validLen < inputIdsLength)
+        {
+            int32_t const padLen = inputIdsLength - validLen;
+            size_t const padOffset = (static_cast<size_t>(b) * inputIdsLength + validLen) * hiddenSize * sizeof(half);
+            size_t const padBytes = static_cast<size_t>(padLen) * hiddenSize * sizeof(half);
+            CUDA_CHECK(cudaMemsetAsync(
+                static_cast<char*>(mPipelineIO->inputsEmbeds.rawPointer()) + padOffset, 0, padBytes, stream));
+        }
+    }
+
+    // Zero PLE at padding positions.
+    if (mGemma4Ple)
+    {
+        int32_t const pleHiddenSize = mDeployment.base.pleHiddenSize;
+        int32_t const numPleInputs = mDeployment.base.numPleInputs;
+        for (int32_t b = 0; b < batchSize; ++b)
+        {
+            int32_t const validLen = contextLengths[b];
+            if (validLen < inputIdsLength)
+            {
+                int32_t const padLen = inputIdsLength - validLen;
+                for (int32_t pleIdx = 0; pleIdx < numPleInputs; ++pleIdx)
+                {
+                    rt::Tensor* pleTensor = mBaseTensorMap.get(binding_names::formatPleTokenEmbedsName(pleIdx));
+                    if (pleTensor)
+                    {
+                        size_t const padOffset
+                            = (static_cast<size_t>(b) * inputIdsLength + validLen) * pleHiddenSize * sizeof(half);
+                        size_t const padBytes = static_cast<size_t>(padLen) * pleHiddenSize * sizeof(half);
+                        CUDA_CHECK(cudaMemsetAsync(
+                            static_cast<char*>(pleTensor->rawPointer()) + padOffset, 0, padBytes, stream));
+                    }
+                }
+            }
+        }
+    }
 }
 
 } // namespace rt

@@ -22,36 +22,23 @@ unnecessary abstraction layers.
 
 import json
 import os
-import sys
 from typing import Any, Dict, Optional
 
 import pytest
 from conftest import EnvironmentConfig, RemoteConfig
-from pytest_helpers import check_file_exists, run_command, run_with_trt_env
+from pytest_helpers import check_file_exists, run_with_trt_env
 
 from ..config import ModelType, TaskType, TestConfig
 from .accuracy import check_accuracy_with_dataset
 from .baseline import (get_baseline, map_accuracy_result_to_csv,
-                       parse_perf_from_output, save_to_baseline)
+                       parse_perf_from_output, promote_baseline_if_better,
+                       save_to_baseline)
 from .command_generation import (generate_build_commands,
                                  generate_e2e_bench_commands,
                                  generate_inference_commands,
                                  generate_kernel_bench_commands)
 
-# Raw audio extensions handled by tensorrt_edgellm.scripts.preprocess_audio.
-# When the test case JSON references one of these, the file is converted to a
-# .safetensors mel-spectrogram on the fly because the C++ requestFileParser
-# only accepts safetensors today.
-_RAW_AUDIO_EXTENSIONS = (".flac", ".wav", ".mp3", ".ogg", ".m4a")
-
-
-def _audio_feature_extractor(model_name: str) -> str:
-    """Return the preprocess_audio --feature_extractor for *model_name*.
-
-    Nemotron-Omni uses Parakeet mel features; everything else (Qwen3-Omni,
-    Qwen3-ASR, ...) uses the Whisper default.
-    """
-    return "parakeet" if "nemotron" in model_name.lower() else "whisper"
+_ALPAMAYO_DATASET_PLACEHOLDER = "$ALPAMAYO_DATASET_DIR"
 
 
 def _source_test_case_file(config: TestConfig) -> Optional[str]:
@@ -148,170 +135,6 @@ def _substitute_placeholder_in_test_case(config: TestConfig, placeholder: str,
         }
 
 
-def _iter_audio_items(test_case_data: Dict[str, Any]):
-    """Yield each ``{"type": "audio", "audio": <path>}`` content dict.
-
-    Returning the dict (not just the path) lets the caller rewrite ``audio``
-    in place on the parsed document — the document is then serialized to a
-    per-config preprocessed copy, never back to the source JSON.
-    """
-    for req in test_case_data.get("requests", []):
-        for msg in req.get("messages", []):
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            for item in content:
-                if (isinstance(item, dict) and item.get("type") == "audio"
-                        and isinstance(item.get("audio"), str)):
-                    yield item
-
-
-def _assert_audio_path_under_cwd(audio_path: str, source_file: str) -> None:
-    """Reject audio paths that resolve outside the current working directory.
-
-    Test-case JSONs are version-controlled, but a crafted ``..``-style path
-    would otherwise let the preprocess subprocess write its
-    ``_<extractor>.safetensors`` output to an arbitrary location reachable
-    from the test runner's cwd.
-    """
-    cwd = os.path.realpath(os.getcwd())
-    real = os.path.realpath(audio_path)
-    if real != cwd and not real.startswith(cwd + os.sep):
-        pytest.fail(f"Audio path escapes repo root: {audio_path} "
-                    f"(referenced by {source_file})")
-
-
-def _copy_preprocessed_audio_to_remote(sf_path: str,
-                                       remote_config: Optional[RemoteConfig],
-                                       logger) -> None:
-    if remote_config is None:
-        return
-
-    remote_dir = os.path.dirname(sf_path)
-    if remote_dir:
-        result = run_command(["mkdir", "-p", remote_dir],
-                             remote_config=remote_config,
-                             timeout=60,
-                             logger=logger)
-        if not result["success"]:
-            pytest.fail(
-                f"Failed to create remote audio cache directory "
-                f"{remote_dir}: {result.get('error', 'Unknown error')}")
-
-    remote_target = os.path.join(remote_config.remote_workspace, sf_path)
-    result = run_command([
-        "sshpass",
-        "-e",
-        "scp",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "ConnectTimeout=30",
-        sf_path,
-        f"{remote_config.user}@{remote_config.host}:{remote_target}",
-    ],
-                         remote_config=None,
-                         timeout=120,
-                         logger=logger,
-                         env_vars={"SSHPASS": remote_config.password})
-    if not result["success"]:
-        pytest.fail(f"Failed to copy preprocessed audio to remote workspace: "
-                    f"{result.get('error', 'Unknown error')}")
-
-
-def _preprocess_audio_in_test_case(
-        config: TestConfig, logger,
-        remote_config: Optional[RemoteConfig]) -> None:
-    """Convert raw-audio entries in the ASR/OMNI test case JSON to safetensors.
-
-    For each ``"type": "audio"`` request whose path ends in a raw extension
-    (.flac/.wav/.mp3/.ogg/.m4a), runs
-    ``python tensorrt_edgellm/scripts/preprocess_audio.py`` to emit a
-    ``<basename>_<extractor>.safetensors`` next to the source. The rewritten
-    test case (with ``audio`` fields pointing at the generated safetensors) is
-    written to a per-config copy under ``config.test_log_dir`` and exposed via
-    ``config._test_case_file_override``; the version-controlled source JSON
-    is *never* mutated. This makes the helper safe under pytest-xdist (each
-    config has its own preprocessed copy) and avoids cross-contamination
-    between models that share a fixture (e.g. ASR vs OMNI both consuming
-    ``asr_basic.json``).
-
-    Feature extractor selection is by model name: ``parakeet`` for Nemotron-
-    Omni, ``whisper`` everywhere else. The generated mel cache is keyed on
-    extractor, so the two flavors never share a file.
-
-    No-op for non-ASR/OMNI configs or when the test case has no raw audio.
-    In remote execution mode, the generated safetensors file is also copied
-    into the same relative path under the remote workspace because inference
-    runs on the device.
-    """
-    if config.model_type not in (ModelType.ASR, ModelType.OMNI):
-        return
-
-    source_file = _source_test_case_file(config)
-    if source_file is None or not os.path.isfile(source_file):
-        return
-
-    with open(source_file) as f:
-        data = json.load(f)
-
-    extractor = _audio_feature_extractor(config.model_name)
-    # Cache: raw-audio path -> generated safetensors. Dedups preprocess
-    # invocations across multiple audio items pointing at the same source.
-    converted: Dict[str, str] = {}
-    items_to_rewrite = []
-
-    for item in _iter_audio_items(data):
-        audio_path = item["audio"]
-        if not audio_path.endswith(_RAW_AUDIO_EXTENSIONS):
-            continue
-        _assert_audio_path_under_cwd(audio_path, source_file)
-        if not os.path.isfile(audio_path):
-            pytest.fail(
-                f"Audio fixture not found: {audio_path} (referenced by "
-                f"{source_file})")
-
-        if audio_path not in converted:
-            base, _ext = os.path.splitext(audio_path)
-            sf_path = f"{base}_{extractor}.safetensors"
-            if not os.path.isfile(sf_path):
-                cmd = [
-                    sys.executable,
-                    os.path.join("tensorrt_edgellm", "scripts",
-                                 "preprocess_audio.py"),
-                    "--input",
-                    audio_path,
-                    "--output",
-                    sf_path,
-                    "--feature_extractor",
-                    extractor,
-                ]
-                if logger:
-                    logger.info(
-                        "Preprocessing %s -> %s (feature_extractor=%s)",
-                        audio_path, sf_path, extractor)
-                result = run_command(cmd,
-                                     remote_config=None,
-                                     timeout=300,
-                                     logger=logger)
-                if not result["success"]:
-                    pytest.fail(f"preprocess_audio failed for {audio_path}: "
-                                f"{result.get('error', 'Unknown error')}")
-            _copy_preprocessed_audio_to_remote(sf_path, remote_config, logger)
-            converted[audio_path] = sf_path
-
-        items_to_rewrite.append(item)
-
-    if not items_to_rewrite:
-        return
-
-    for item in items_to_rewrite:
-        item["audio"] = converted[item["audio"]]
-
-    config._test_case_file_override = _write_preprocessed_test_case(
-        config, data, logger)
-
-
 def check_result_failures(result: Dict[str, Any]) -> None:
     """Check baseline regressions first, then static threshold failures.
 
@@ -329,7 +152,16 @@ def check_result_failures(result: Dict[str, Any]) -> None:
 
 def _try_save_baseline(config: TestConfig, test_func: str,
                        result: Dict[str, Any], logger) -> None:
-    """Save current result to baseline CSV when BASELINE_CSV is set but has no entry."""
+    """Seed the baseline CSV with the current result.
+
+    Opt-in only: requires BASELINE_AUTOSAVE=1. Without that env var, the
+    baseline CSV is treated as read-only during regression runs — missing
+    entries are reported (see caller) but never written, so baselines are
+    not silently polluted by ad-hoc test runs.
+    """
+    if os.environ.get('BASELINE_AUTOSAVE',
+                      '').strip().lower() not in ('1', 'true'):
+        return
     csv_path = os.environ.get('BASELINE_CSV', 'logs/baseline.csv')
     if not result.get('success', False):
         return
@@ -340,7 +172,8 @@ def _try_save_baseline(config: TestConfig, test_func: str,
     if logger:
         logger.info(
             "No baseline entry for [%s]. "
-            "Saved current result to %s", config.param_str, csv_path)
+            "Saved current result to %s (BASELINE_AUTOSAVE=1)",
+            config.param_str, csv_path)
 
 
 def _check_baseline_regression(config: TestConfig,
@@ -352,13 +185,18 @@ def _check_baseline_regression(config: TestConfig,
 
     Returns True if baseline entry was found (regardless of pass/fail).
     When baseline is found, threshold_failure is cleared since baseline takes priority.
-    If no baseline exists, saves the current result for future runs.
+    If no baseline exists, the current result is NOT written back — baseline
+    CSVs are managed externally. Set BASELINE_AUTOSAVE=1 to opt in to seeding.
 
     Args:
         check_perf: only True for benchmark tests; inference skips perf comparison.
     """
     baseline = get_baseline()
     if baseline is None:
+        if logger:
+            logger.info(
+                "No baseline loaded for [%s]; skipping regression check",
+                config.param_str)
         _try_save_baseline(config, test_func, result, logger)
         return False
 
@@ -366,6 +204,10 @@ def _check_baseline_regression(config: TestConfig,
                                    test_func,
                                    model_type_value=config.model_type.value)
     if entry is None:
+        if logger:
+            logger.info(
+                "No baseline entry for [%s]; skipping regression check",
+                config.param_str)
         _try_save_baseline(config, test_func, result, logger)
         return False
 
@@ -403,6 +245,12 @@ def _check_baseline_regression(config: TestConfig,
 
     # Baseline found → it takes priority, discard static threshold result
     result.pop('threshold_failure', None)
+
+    # Optional auto-promote: PROMOTE_BASELINE=1 overwrites baseline cells
+    # where the current run is >1% better.
+    csv_path = os.environ.get('BASELINE_CSV', 'logs/baseline.csv')
+    promote_baseline_if_better(csv_path, config.model_type.value, test_func,
+                               config.param_str, result, logger)
     return True
 
 
@@ -424,6 +272,8 @@ def execute_build_test(
             os.path.join("audio", "audio_encoder.engine"),
             os.path.join("code2wav", "code2wav.engine"),
         ],
+        executable_files['action_build']:
+        [os.path.join("action", "action.engine")],
     }
 
     for i, (cmd, timeout) in enumerate(commands):
@@ -487,7 +337,13 @@ def execute_e2e_bench_test(
             result['test_type'] = TaskType.E2E_BENCH.value
             return result
 
-    _preprocess_audio_in_test_case(config, logger, remote_config)
+    if config.model_type == ModelType.VLA:
+        result = _substitute_placeholder_in_test_case(
+            config, _ALPAMAYO_DATASET_PLACEHOLDER,
+            config.get_alpamayo_dataset_dir(), logger)
+        if not result['success']:
+            result['test_type'] = TaskType.E2E_BENCH.value
+            return result
 
     # Generate all e2e benchmark commands
     commands = generate_e2e_bench_commands(config, executable_files)
@@ -561,7 +417,13 @@ def execute_inference_test(
             result['test_type'] = TaskType.INFERENCE.value
             return result
 
-    _preprocess_audio_in_test_case(config, logger, remote_config)
+    if config.model_type == ModelType.VLA:
+        result = _substitute_placeholder_in_test_case(
+            config, _ALPAMAYO_DATASET_PLACEHOLDER,
+            config.get_alpamayo_dataset_dir(), logger)
+        if not result['success']:
+            result['test_type'] = TaskType.INFERENCE.value
+            return result
 
     # Generate all inference commands
     commands = generate_inference_commands(config, executable_files)

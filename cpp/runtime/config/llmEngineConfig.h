@@ -42,6 +42,7 @@ enum class SpecDecodeMode : int32_t
     kNONE,
     kEAGLE,
     kMTP,
+    kDFlash,
 };
 
 //! Unified configuration for base, vanilla decode, and SpecDecode draft engines.
@@ -69,7 +70,7 @@ struct LLMEngineConfig
     bool useTrtNativeOps{false};  //!< Use TRT native ops instead of custom plugin
     bool isSpecDecodeBase{false}; //!< Base engine exposes speculative decoding verification bindings
     SpecDecodeMode specDecodeType{
-        SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from model_type)
+        SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from spec_decode_type)
     //! KV cache data type. Parsed from required top-level `kv_cache_dtype` in
     //! `config.json` (written by `llm_export.py`). Accepted values:
     //! "fp16" → kHALF, "fp8" → kFP8, "int8" → kINT8, "bf16" → kBF16.
@@ -86,15 +87,28 @@ struct LLMEngineConfig
 
     // --- RoPE ---
     RopeConfig ropeConfig{};             //!< Full RoPE configuration
+    bool useDualRope{false};             //!< Use separate RoPE caches for sliding/full attention
+    RopeConfig slidingRopeConfig{};      //!< RoPE configuration for sliding attention layers
+    RopeConfig fullRopeConfig{};         //!< RoPE configuration for full attention layers
+    int32_t slidingRotaryDim{};          //!< Rotary dimension for sliding attention RoPE
+    int32_t fullRotaryDim{};             //!< Rotary dimension for full attention RoPE
     bool useContextDependentRope{false}; //!< Use context-dependent RoPE
 
     // --- Optional feature fields ---
     int32_t numDeepstackFeatures{0}; //!< Deepstack features (Qwen3-VL/Qwen3-Omni)
+    bool pleEnabled{false};          //!< Gemma4 PLE runtime preprocessor enabled
+    int32_t numPleInputs{0};         //!< Number of PLE tensors bound into the engine (0 = disabled)
+    int32_t pleHiddenSize{0};        //!< Hidden dimension of each PLE tensor (0 = disabled)
     int32_t maxSupportedLoraRank{0}; //!< Maximum LoRA rank (0 = no LoRA)
 
     // --- Multimodal token IDs ---
     int32_t imageTokenId{-1}; //!< Special token ID for image (-1 = unused)
     int32_t audioTokenId{-1}; //!< Special token ID for audio (-1 = unused)
+
+    //! Additional EOS token IDs parsed from config.json `eos_token_id` array.
+    //! Models like Gemma4 have multiple EOS tokens (e.g. [1, 106] for <eos> and <turn|>).
+    //! Empty if `eos_token_id` is absent or scalar.
+    std::vector<int32_t> eosTokenIds{};
 
     // --- Hybrid model (Mamba/GDN) state dimensions ---
     int32_t numLinearAttnLayers{0};    //!< Number of linear attention / recurrent layers
@@ -126,6 +140,16 @@ struct LLMEngineConfig
     //! `DeploymentConfig::specDecode->baseOutputHiddenDim`.
     int32_t baseModelHiddenSize{0};
 
+    //! DFlash draft block size. Parsed from `dflash_config.block_size` or
+    //! top-level `block_size` on DFlash base/draft configs.
+    int32_t dflashBlockSize{0};
+
+    //! DFlash mask token ID used to seed draft input blocks.
+    int32_t dflashMaskTokenId{0};
+
+    //! Target decoder-layer IDs whose hidden states are concatenated for DFlash.
+    std::vector<int32_t> dflashTargetLayerIds{};
+
     // --- Per-layer type routing (hybrid cache) ---
 
     //! Absolute decoder-layer -> attention|mamba. Populated either from the
@@ -139,6 +163,13 @@ struct LLMEngineConfig
     //! `layerTypes`. Indexed by LOCAL attention-layer index (0..numAttn-1),
     //! NOT absolute decoder-layer index.
     std::vector<KVLayerConfig> kvLayerConfigs{};
+
+    //! Per-attention-layer KV sharing donor index. Size equals the attention count
+    //! in `layerTypes`. Value of -1 means the layer owns its own KV cache (normal).
+    //! A value >= 0 means this layer shares the KV cache from the donor attention
+    //! layer at that LOCAL index (the donor's cache is bound to this layer's KV input).
+    //! Used for Gemma4's KV sharing where the last N layers reuse a donor's cache.
+    std::vector<int32_t> kvSharingDonors{};
 
     // ------------------------------------------------------------------
     // InferenceDims recipe methods
@@ -198,7 +229,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath);
 
 //! Parse a SpecDecode draft engine's `config.json` into an `LLMEngineConfig`.
 //!
-//! The draft config carries a reduced field set (no `builder_config.eagle_base`,
+//! The draft config carries a reduced field set (no `builder_config.spec_base`,
 //! its own `draft_vocab_size`). `max_draft_tree_size` is required and is
 //! parsed into `cfg.maxDraftTreeSize`; `cfg.maxVerifyTreeSize` stays at 0 on
 //! the draft side. `isSpecDecodeBase` is left false because this is the

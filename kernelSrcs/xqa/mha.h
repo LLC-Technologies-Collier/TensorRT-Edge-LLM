@@ -21,10 +21,17 @@
 #endif
 using CacheElem = ElemType<CACHE_ELEM_ENUM>;
 constexpr uint32_t validElemsPerHead = HEAD_ELEMS;
+constexpr bool twoCtaHeadDim512 = XQA_2CTA_HEAD_DIM512;
+constexpr uint32_t smemValidElemsPerHead = twoCtaHeadDim512 ? 256U : validElemsPerHead;
 constexpr bool isMLA = IS_MLA;
-static_assert((isMLA || validElemsPerHead <= 256) && (sizeof(CacheElem) * validElemsPerHead) % 16 == 0);
-constexpr uint32_t headElems = validElemsPerHead <= 64 ? 64 : (validElemsPerHead <= 128 ? 128 : (isMLA ? 576 : 256));
-static_assert(headElems == 64 || headElems == 128 || headElems == 256 || headElems == 576, "not implemented");
+static_assert((isMLA || validElemsPerHead <= 512) && (sizeof(CacheElem) * validElemsPerHead) % 16 == 0);
+constexpr uint32_t headElems = smemValidElemsPerHead <= 64 ? 64
+    : (smemValidElemsPerHead <= 128)                       ? 128
+    : (smemValidElemsPerHead <= 256)                       ? 256
+    : isMLA                                                ? 576
+                                                           : 512;
+static_assert(
+    headElems == 64 || headElems == 128 || headElems == 256 || headElems == 512 || headElems == 576, "not implemented");
 constexpr uint32_t beamWidth = BEAM_WIDTH;
 constexpr uint32_t headGrpSize = HEAD_GRP_SIZE;
 #if SPEC_DEC
@@ -67,7 +74,7 @@ using PaddedInputHead = Vec<InputElem, headElems>;
 using PaddedCacheHead = Vec<CacheElem, headElems>;
 
 // impl detail, may be moved to mha.cu/mha_sm90.cu
-constexpr bool isHeadPadded = (validElemsPerHead != headElems);
+constexpr bool isHeadPadded = !twoCtaHeadDim512 && (validElemsPerHead != headElems);
 
 constexpr bool useInputKV = USE_INPUT_KV;
 

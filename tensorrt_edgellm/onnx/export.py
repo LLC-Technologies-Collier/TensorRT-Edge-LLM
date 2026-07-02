@@ -75,12 +75,13 @@ def export_onnx(
     fp8_embedding: bool = False,
     reduced_vocab_dir: str = "",
     externalize_weights=None,
+    config_filename: str = "config.json",
 ) -> None:
     """Export *model* to ONNX using the dynamo exporter.
 
-    Writes ``model.onnx``, ``model.onnx.data``, ``config.json``,
-    ``embedding.safetensors``, and any tokenizer files present in
-    *model_dir* to the same output directory.
+    Writes ``model.onnx``, ``model.onnx.data``, the runtime config (named
+    *config_filename*), ``embedding.safetensors``, and any tokenizer files
+    present in *model_dir* to the same output directory.
 
     Args:
         model:       A :class:`~modules.CausalLM` with weights loaded.
@@ -95,7 +96,11 @@ def export_onnx(
                              ONNX inputs and save to safetensors external
                              weight files.
                              Supported kinds: ``int4_ffn``, ``int4_moe``,
-                             ``lm_head``, and ``all``.
+                             ``nvfp4_moe``, ``lm_head``, and ``all``.
+        config_filename: Filename for the runtime config beside the ONNX.
+                         Use ``"config.json"`` for single-device exports
+                         or ``"config_tp{N}_rank{R}.json"`` for per-rank
+                         TP exports so each rank is self-describing.
     """
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
@@ -115,7 +120,8 @@ def export_onnx(
                             model_dir,
                             out_dir,
                             fp8_embedding=fp8_embedding,
-                            reduced_vocab_dir=reduced_vocab_dir)
+                            reduced_vocab_dir=reduced_vocab_dir,
+                            config_filename=config_filename)
     if external_weight_files:
         patch_external_weight_manifest(out_dir, external_weight_files)
 
@@ -439,6 +445,8 @@ def _setup_fp8kv_scales_for_export(model: "CausalLM") -> None:
             continue
         k_buf = getattr(getattr(module, "k_proj", None), "k_scale", None)
         v_buf = getattr(getattr(module, "v_proj", None), "v_scale", None)
+        if v_buf is None and getattr(module, "attention_k_eq_v", False):
+            v_buf = k_buf
         module._qkv_scales_float = [
             1.0,
             float(k_buf.item()) if k_buf is not None else 1.0,
@@ -452,6 +460,7 @@ def _fix_initializer_dtypes(
     cast_fp32_weights_to_fp16: bool = True,
     preserve_fp32_patterns: "tuple[str, ...]" = (),
     match_fp32_matmul_initializers: bool = False,
+    match_fp32_elementwise_initializers: bool = False,
 ) -> None:
     """Single-pass ONNX initializer fixup for TRT compatibility.
 
@@ -479,6 +488,14 @@ def _fix_initializer_dtypes(
     3. **Plugin FP32 inputs**: ONNX constant folding may collapse plugin
        FP32 input expressions into initializers.  Any such initializer is
        kept (or restored to) FP32 when the consuming plugin requires FP32.
+
+    4. **Element-wise FP32 input matching** (when
+       *match_fp32_elementwise_initializers* is True): promote FP16
+       initializers to FP32 when they feed a ``Mul`` / ``Add`` / ``Sub``
+       / ``Div`` node whose other input is FP32.  This fixes the ONNX
+       dynamo exporter folding float32 buffers (e.g. RoPE ``inv_freq``)
+       into FP16 initializers — TRT rejects mixed-type element-wise ops.
+       Used by the DFlash draft model export.
     """
     import numpy as np
 
@@ -493,24 +510,23 @@ def _fix_initializer_dtypes(
     # Collect plugin initializer names that must stay FP32.
     # - Mamba2 update_ssm_state: input[1] = ssm_A
     # - gated_delta_net: input[5] = A_log
-    # - Nvfp4MoePlugin: input[11] = e_score_correction_bias
-    # - NvFP4MoEPluginGeforce: inputs[4,7,8,9] are FP32 scale vectors
+    # - Nvfp4MoePlugin / NvFP4MoEPluginGeforce: inputs[4,7,8,9] are FP32 scale
+    #   vectors; input[10] is the FP32 router correction bias. Both plugins
+    #   share the same 11-input ONNX surface.
     plugin_fp32_init_names: set = set()
     for node in model.graph.node:
         if node.op_type == "update_ssm_state" and len(node.input) > 1:
             plugin_fp32_init_names.add(node.input[1])
         if node.op_type == "gated_delta_net" and len(node.input) > 5:
             plugin_fp32_init_names.add(node.input[5])
-        if node.op_type == "Nvfp4MoePlugin" and len(node.input) > 11:
-            plugin_fp32_init_names.add(node.input[11])
-        if node.op_type == "NvFP4MoEPluginGeforce":
-            for input_idx in (4, 7, 8, 9):
+        if node.op_type in ("Nvfp4MoePlugin", "NvFP4MoEPluginGeforce"):
+            for input_idx in (4, 7, 8, 9, 10):
                 if len(node.input) > input_idx:
                     plugin_fp32_init_names.add(node.input[input_idx])
 
     init_map = {init.name: init for init in model.graph.initializer}
     elem_types: dict[str, int] = {}
-    if match_fp32_matmul_initializers:
+    if match_fp32_matmul_initializers or match_fp32_elementwise_initializers:
         for value in (list(model.graph.input) + list(model.graph.value_info) +
                       list(model.graph.output)):
             tensor_type = value.type.tensor_type
@@ -530,6 +546,20 @@ def _fix_initializer_dtypes(
                     continue
                 if elem_types.get(node.input[other_idx]) == 1:  # FLOAT
                     matmul_fp32_init_names.add(init.name)
+
+    # Pre-collect element-wise FP32 init names so the downgrade pass skips them.
+    _EW_OPS = frozenset({"Mul", "Add", "Sub", "Div"})
+    elementwise_fp32_init_names: set = set()
+    if match_fp32_elementwise_initializers:
+        for node in model.graph.node:
+            if node.op_type not in _EW_OPS or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None:
+                    continue
+                if elem_types.get(node.input[other_idx]) == 1:  # FLOAT
+                    elementwise_fp32_init_names.add(init.name)
 
     def _is_preserved_fp32(init_name: str) -> bool:
         """Does ``init_name`` match any caller-supplied preserve pattern?"""
@@ -565,6 +595,11 @@ def _fix_initializer_dtypes(
         if init.name in matmul_fp32_init_names:
             logger.info(
                 "_fix_initializer_dtypes: %s %s kept FP32 (MatMul FP32 input)",
+                init.name, list(init.dims))
+            continue
+        if init.name in elementwise_fp32_init_names:
+            logger.info(
+                "_fix_initializer_dtypes: %s %s kept FP32 (element-wise FP32 input)",
                 init.name, list(init.dims))
             continue
         dims = list(init.dims)
@@ -605,6 +640,31 @@ def _fix_initializer_dtypes(
                     "_fix_initializer_dtypes: %s %s FP16→FP32 "
                     "(MatMul FP32 input match)", init.name, list(init.dims))
 
+    if match_fp32_elementwise_initializers:
+        # Refresh elem_types after prior passes may have changed dtypes.
+        for init in model.graph.initializer:
+            elem_types[init.name] = init.data_type
+
+        _EW_OPS = frozenset({"Mul", "Add", "Sub", "Div"})
+        for node in model.graph.node:
+            if node.op_type not in _EW_OPS or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None or init.data_type != 10:  # FLOAT16
+                    continue
+                if elem_types.get(node.input[other_idx]) != 1:  # FLOAT
+                    continue
+                data = _onnx.numpy_helper.to_array(init).astype(np.float32)
+                init.CopyFrom(
+                    _onnx.numpy_helper.from_array(data, name=init.name))
+                elem_types[init.name] = init.data_type
+                n_to_fp32 += 1
+                logger.info(
+                    "_fix_initializer_dtypes: %s %s FP16→FP32 "
+                    "(%s FP32 input match)", init.name, list(init.dims),
+                    node.op_type)
+
     if n_to_fp16 == 0 and n_to_fp32 == 0 and n_deduped == 0:
         return
 
@@ -620,7 +680,11 @@ def _fix_initializer_dtypes(
     # Delete existing external data file before re-saving.  onnx.save_model
     # opens the file in r+b mode and appends new tensors at the end, so the
     # old data would remain as unreferenced garbage, doubling the file size.
-    ext_path = os.path.join(os.path.dirname(onnx_path), "model.onnx.data")
+    # Derive the data filename from onnx_path so per-rank TP exports
+    # (model_tp{N}_rank{R}.onnx) get distinct .data files instead of
+    # all overwriting the same model.onnx.data.
+    data_file = os.path.basename(onnx_path) + ".data"
+    ext_path = os.path.join(os.path.dirname(onnx_path), data_file)
     if os.path.isfile(ext_path):
         old_size = os.path.getsize(ext_path)
         logger.info("Removing stale external data %s (%.2f GB) before re-save",
@@ -631,7 +695,7 @@ def _fix_initializer_dtypes(
         onnx_path,
         save_as_external_data=True,
         all_tensors_to_one_file=True,
-        location="model.onnx.data",
+        location=data_file,
         convert_attribute=True,
     )
 
@@ -681,6 +745,10 @@ def _export_model(
                             match_fp32_matmul_initializers=bool(
                                 getattr(model,
                                         "match_fp32_matmul_initializers",
+                                        False)),
+                            match_fp32_elementwise_initializers=bool(
+                                getattr(model,
+                                        "match_fp32_elementwise_initializers",
                                         False)))
     _strip_attention_plugin_optional_inputs(output_path)
     external_weight_files = externalize_model_weights(
