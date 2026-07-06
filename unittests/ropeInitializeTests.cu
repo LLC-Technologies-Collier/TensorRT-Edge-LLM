@@ -90,7 +90,9 @@ TEST(InitializeNormalRopeCosSin, Accuracy)
     TestNormalRopeCosSin(64, 256);
     TestNormalRopeCosSin(96, 256);
     TestNormalRopeCosSin(128, 256);
+    TestNormalRopeCosSin(256, 256);
     TestNormalRopeCosSin(256, 256, 10000.0F, 0.5F, 0.5F);
+    TestNormalRopeCosSin(512, 256);
 }
 
 void TestLongRopeCosSin(int32_t rotaryDim, int32_t kvCacheCapacity, int32_t maxPositionEmbeddings = 131072,

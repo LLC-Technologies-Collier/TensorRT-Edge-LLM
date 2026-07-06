@@ -49,16 +49,16 @@ namespace trt_edgellm
  */
 inline int64_t getRotaryDim(nlohmann::json const& configJson, int64_t headDim)
 {
+    float const partialRotaryFactor = configJson.value("partial_rotary_factor", 1.0F);
+    std::string ropeType = configJson.value("rope_type", "");
     if (configJson.contains("rope_scaling") && configJson["rope_scaling"].is_object())
     {
-        nlohmann::json const& ropeScaling = configJson["rope_scaling"];
-        std::string const ropeType = ropeScaling.value("type", ropeScaling.value("rope_type", std::string{}));
-        if (ropeType == "proportional")
-        {
-            return headDim;
-        }
+        ropeType = configJson["rope_scaling"].value("type", ropeType);
     }
-    float const partialRotaryFactor = configJson.value("partial_rotary_factor", 1.0F);
+    if (ropeType == "proportional" || ropeType == "Proportional")
+    {
+        return headDim;
+    }
     return static_cast<int64_t>(static_cast<float>(headDim) * partialRotaryFactor);
 }
 

@@ -15,6 +15,24 @@
  * limitations under the License.
  */
 
+/*
+ * SPDX-FileCopyrightText: Copyright 2026 Google LLC and contributors
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "common/checkMacros.h"
 #include "initializeCosSinCache.h"
 
@@ -302,6 +320,7 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
     case 64: kernelPtr = (void*) initializeLongRopeCosSinKernel<64>; break;
     case 96: kernelPtr = (void*) initializeLongRopeCosSinKernel<96>; break;
     case 128: kernelPtr = (void*) initializeLongRopeCosSinKernel<128>; break;
+    case 256: kernelPtr = (void*) initializeLongRopeCosSinKernel<256>; break;
     default:
         throw std::runtime_error("Un-implemented rotaryDim for initializeLongRopeCosSin: " + std::to_string(rotaryDim));
     }
@@ -463,6 +482,7 @@ void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float 
     {
     case 64: kernelPtr = (void*) initializeMRopeCosSinKernel<64>; break;
     case 128: kernelPtr = (void*) initializeMRopeCosSinKernel<128>; break;
+    case 256: kernelPtr = (void*) initializeMRopeCosSinKernel<256>; break;
     default:
         throw std::runtime_error("Un-implemented rotaryDim for initializeMRopeCosSin: " + std::to_string(rotaryDim));
     }
