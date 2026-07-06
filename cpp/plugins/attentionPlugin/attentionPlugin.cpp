@@ -784,6 +784,16 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
         check::check(kInputDesc.dims.d[1] == vInputDesc.dims.d[1], "K and V sequence lengths must be consistent.");
         check::check(
             kvSeqLen == runtimeSeqLen, "K/V sequence length must equal Q sequence length when not in shared-KV mode.");
+        if (kInputDesc.dims.d[2] != mNumKVHeads * mHeadSize || vInputDesc.dims.d[2] != mNumKVHeads * mHeadSize)
+        {
+            fprintf(stderr,
+                "\n[FATAL_SHAPE_DIAGNOSTIC] AttentionPlugin[%s] Shape Mismatch: "
+                "kInputDesc.dims.d[2]=%d, vInputDesc.dims.d[2]=%d, "
+                "expected mNumKVHeads * mHeadSize (%d * %d = %d)\n",
+                mLayerName.c_str(), (int) kInputDesc.dims.d[2], (int) vInputDesc.dims.d[2], (int) mNumKVHeads,
+                (int) mHeadSize, (int) (mNumKVHeads * mHeadSize));
+            fflush(stderr);
+        }
         check::check(kInputDesc.dims.d[2] == mNumKVHeads * mHeadSize, "K input shape shall be consistent.");
         check::check(vInputDesc.dims.d[2] == mNumKVHeads * mHeadSize, "V input shape shall be consistent.");
     }

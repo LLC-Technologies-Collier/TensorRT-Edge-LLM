@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright 2026 Google LLC and contributors
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -167,11 +168,28 @@ class RMSNorm(nn.Module):
     Buffer: ``weight`` [hidden_size].
     """
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 eps: float = 1e-6,
+                 config: ModelConfig = None,
+                 use_gemma2_format: bool = None) -> None:
         super().__init__()
         self.variance_epsilon = eps
         self.weight = nn.Parameter(torch.ones(hidden_size,
                                               dtype=torch.float16))
+        if use_gemma2_format is not None:
+            self.use_gemma2_format = use_gemma2_format
+        else:
+            self.use_gemma2_format = False
+            if config is not None:
+                text_config = getattr(config, "text_config", config)
+                global_head_dim = getattr(
+                    text_config, "global_head_dim", 0) if not isinstance(
+                        text_config, dict) else text_config.get(
+                            "global_head_dim", 0)
+                model_type = getattr(config, "model_type", "")
+                if global_head_dim and "gemma4" not in model_type:
+                    self.use_gemma2_format = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
@@ -180,6 +198,9 @@ class RMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance +
                                                     self.variance_epsilon)
         hidden_states = hidden_states.to(input_dtype)
+        if self.use_gemma2_format:
+            weight = self.weight.to(input_dtype)
+            return (weight + torch.ones_like(weight)) * hidden_states
         return self.weight.to(input_dtype) * hidden_states
 
 
@@ -201,9 +222,52 @@ class Attention(nn.Module):
                  layer_idx: int,
                  in_features: int = 0) -> None:
         super().__init__()
+        self.config = config
         num_attention_heads = config.num_attention_heads
         num_key_value_heads = config.num_key_value_heads
         head_dim = config.head_dim
+
+        # Standard configs are overridden dynamically for heterogeneous GQA (Gemma 4 configurations)
+        text_config = getattr(config, "text_config", config)
+        global_head_dim = getattr(
+            text_config, "global_head_dim",
+            0) if not isinstance(text_config, dict) else text_config.get(
+                "global_head_dim", 0)
+
+        is_k_eq_v = False
+        if global_head_dim:
+            from tensorrt_edgellm.models.gemma4.modeling_gemma4_text import (
+                _attention_type_for_layer, _head_dim_for_attention_type,
+                _num_kv_heads_for_attention_type)
+
+            class DictWrapper:
+
+                def __init__(self, d):
+                    self._d = d
+
+                def __getattr__(self, k):
+                    if k in self._d:
+                        v = self._d[k]
+                        if isinstance(v, dict):
+                            return DictWrapper(v)
+                        return v
+                    raise AttributeError(k)
+
+            lookup_config = DictWrapper(text_config) if isinstance(
+                text_config, dict) else text_config
+            attention_type = _attention_type_for_layer(lookup_config,
+                                                       layer_idx)
+            head_dim = _head_dim_for_attention_type(lookup_config,
+                                                    attention_type)
+            num_key_value_heads = _num_kv_heads_for_attention_type(
+                lookup_config, attention_type)
+
+            # Check for k_eq_v sharing
+            attention_k_eq_v = getattr(lookup_config, "attention_k_eq_v",
+                                       False)
+            if attention_k_eq_v and attention_type == "full_attention":
+                is_k_eq_v = True
+
         hidden_size = config.hidden_size
         # in_features overrides the QKV projection input dimension.
         # When 0 (default), QKV projections use hidden_size as input.
@@ -215,6 +279,8 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = config.sliding_window_size  # -1 means no sliding window
+        if global_head_dim and attention_type == "full_attention":
+            self.sliding_window_size = -1
         module_prefix = f"layers.{layer_idx}.self_attn"
 
         self.q_proj = make_linear(config,
@@ -229,18 +295,23 @@ class Attention(nn.Module):
                                   bias=config.attention_bias,
                                   module_name=f"{module_prefix}.k_proj",
                                   tp_mode=TPMode.COL)
-        self.v_proj = make_linear(config,
-                                  qkv_in_features,
-                                  num_key_value_heads * head_dim,
-                                  bias=config.attention_bias,
-                                  module_name=f"{module_prefix}.v_proj",
-                                  tp_mode=TPMode.COL)
+
+        if is_k_eq_v:
+            self.v_proj = self.k_proj
+        else:
+            self.v_proj = make_linear(config,
+                                      qkv_in_features,
+                                      num_key_value_heads * head_dim,
+                                      bias=config.attention_bias,
+                                      module_name=f"{module_prefix}.v_proj",
+                                      tp_mode=TPMode.COL)
         # FP8 KV-cache scales live on the proj modules (checkpoint keys
         # ``...k_proj.k_scale`` / ``...v_proj.v_scale``); they are not part of
         # FP8Linear's per-tensor weight/input scales.
         if self.enable_fp8_kv_cache:
             self.k_proj.register_buffer("k_scale", torch.ones(1))
-            self.v_proj.register_buffer("v_scale", torch.ones(1))
+            if not is_k_eq_v:
+                self.v_proj.register_buffer("v_scale", torch.ones(1))
 
         self.o_proj = make_linear(config,
                                   num_attention_heads * head_dim,
@@ -249,8 +320,14 @@ class Attention(nn.Module):
                                   tp_mode=TPMode.ROW)
 
         if config.has_qk_norm:
-            self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
-            self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
+            self.q_norm = RMSNorm(head_dim,
+                                  eps=config.rms_norm_eps,
+                                  config=config,
+                                  use_gemma2_format=False)
+            self.k_norm = RMSNorm(head_dim,
+                                  eps=config.rms_norm_eps,
+                                  config=config,
+                                  use_gemma2_format=False)
         else:
             self.q_norm = None
             self.k_norm = None
@@ -277,6 +354,9 @@ class Attention(nn.Module):
                                      self.head_dim)).reshape(
                                          batch_size, seq_len,
                                          self.num_heads * self.head_dim)
+            # Re-align attention query scaling dynamically (for heterogeneous 512-dim dense layers)
+            if self.head_dim == 512:
+                query_states = query_states * 1.41421356
         if self.k_norm is not None:
             key_states = self.k_norm(
                 key_states.reshape(batch_size, seq_len, self.num_kv_heads,
@@ -329,21 +409,50 @@ class MLP(nn.Module):
     def __init__(self, config: ModelConfig, layer_idx: int = -1) -> None:
         super().__init__()
         module_prefix = f"layers.{layer_idx}.mlp" if layer_idx >= 0 else ""
+        intermediate_size = config.intermediate_size
+
+        text_config = getattr(config, "text_config", config)
+        global_head_dim = getattr(
+            text_config, "global_head_dim",
+            0) if not isinstance(text_config, dict) else text_config.get(
+                "global_head_dim", 0)
+        if global_head_dim and layer_idx >= 0:
+            from tensorrt_edgellm.models.gemma4.modeling_gemma4_text import \
+                _mlp_intermediate_size_for_layer
+
+            class DictWrapper:
+
+                def __init__(self, d):
+                    self._d = d
+
+                def __getattr__(self, k):
+                    if k in self._d:
+                        v = self._d[k]
+                        if isinstance(v, dict):
+                            return DictWrapper(v)
+                        return v
+                    raise AttributeError(k)
+
+            lookup_config = DictWrapper(text_config) if isinstance(
+                text_config, dict) else text_config
+            intermediate_size = _mlp_intermediate_size_for_layer(
+                lookup_config, layer_idx)
+
         self.gate_proj = make_linear(
             config,
             config.hidden_size,
-            config.intermediate_size,
+            intermediate_size,
             module_name=f"{module_prefix}.gate_proj" if module_prefix else "",
             tp_mode=TPMode.COL)
         self.up_proj = make_linear(
             config,
             config.hidden_size,
-            config.intermediate_size,
+            intermediate_size,
             module_name=f"{module_prefix}.up_proj" if module_prefix else "",
             tp_mode=TPMode.COL)
         self.down_proj = make_linear(
             config,
-            config.intermediate_size,
+            intermediate_size,
             config.hidden_size,
             module_name=f"{module_prefix}.down_proj" if module_prefix else "",
             tp_mode=TPMode.ROW)
@@ -371,9 +480,20 @@ class DecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.self_attn = Attention(config, layer_idx=layer_idx)
         self.mlp = MLP(config, layer_idx=layer_idx)
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size,
+                                       config.rms_norm_eps,
+                                       config=config)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                config.rms_norm_eps)
+                                                config.rms_norm_eps,
+                                                config=config)
+        self.use_gemma2_format = self.input_layernorm.use_gemma2_format
+        if self.use_gemma2_format:
+            self.pre_feedforward_layernorm = RMSNorm(config.hidden_size,
+                                                     config.rms_norm_eps,
+                                                     config=config)
+            self.post_feedforward_layernorm = RMSNorm(config.hidden_size,
+                                                      config.rms_norm_eps,
+                                                      config=config)
 
     def forward(
         self,
@@ -395,11 +515,17 @@ class DecoderLayer(nn.Module):
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
         )
-        hidden_states = residual + attn_output
-
-        residual = hidden_states
-        hidden_states = residual + self.mlp(
-            self.post_attention_layernorm(hidden_states))
+        if self.use_gemma2_format:
+            hidden_states = residual + self.post_attention_layernorm(
+                attn_output)
+            residual = hidden_states
+            hidden_states = residual + self.post_feedforward_layernorm(
+                self.mlp(self.pre_feedforward_layernorm(hidden_states)))
+        else:
+            hidden_states = residual + attn_output
+            residual = hidden_states
+            hidden_states = residual + self.mlp(
+                self.post_attention_layernorm(hidden_states))
 
         return hidden_states, present_key_value
 
@@ -429,7 +555,9 @@ class Transformer(nn.Module):
             DecoderLayer(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size,
+                            config.rms_norm_eps,
+                            config=config)
         # Populated at the end of each forward; see module docstring.
         self.last_pre_norm_hidden_states: "torch.Tensor | None" = None
 
@@ -446,6 +574,9 @@ class Transformer(nn.Module):
         output_hidden_states: bool = False,
         dflash_target_layer_ids: "List[int] | None" = None,
     ) -> Tuple[torch.Tensor, Tuple, "Tuple | None", "torch.Tensor | None"]:
+        if self.norm.use_gemma2_format:
+            inputs_embeds = inputs_embeds * (self.norm.weight.shape[0]**0.5)
+
         hidden_states = inputs_embeds
         present_key_values_list: List[torch.Tensor] = []
         all_hidden_states: list = []
@@ -650,7 +781,7 @@ class CausalLM(nn.Module):
             all_shapes.append({0: batch, 3: past})  # past_key_values_i
         all_shapes.append({0: rope_batch, 1: pos})  # rope_rotary_cos_sin
         all_shapes.append({0: batch})  # context_lengths
-        all_shapes.append({0: kv_batch})  # kvcache_start_index
+        all_shapes.append({0: batch})  # kvcache_start_index
         if eagle_base:
             all_shapes.append({0: batch, 1: num_selected})  # last_token_ids
         else:
@@ -743,6 +874,16 @@ class CausalLM(nn.Module):
             hidden_states, last_token_ids)
 
         logits = self.lm_head(selected_hidden_states).to(torch.float32)
+
+        # Apply final logit softcapping if configured (for Gemma 2/4)
+        text_config = getattr(self.config, "text_config", self.config)
+        final_logit_softcapping = getattr(
+            text_config, "final_logit_softcapping",
+            0.0) if not isinstance(text_config, dict) else text_config.get(
+                "final_logit_softcapping", 0.0)
+        if final_logit_softcapping > 0.0:
+            logits = torch.tanh(
+                logits / final_logit_softcapping) * final_logit_softcapping
 
         if dflash_base and dflash_hidden_concat is not None:
             # DFlash base: concatenate hidden states from target layers.

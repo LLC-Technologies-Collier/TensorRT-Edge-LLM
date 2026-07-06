@@ -56,24 +56,45 @@ def _attention_type_for_layer(config: ModelConfig, layer_idx: int) -> str:
 
 def _uses_attention_k_eq_v(config: ModelConfig, attention_type: str) -> bool:
     """Return whether a Gemma4 attention layer reuses K as the V source."""
-    return bool(config.attention_k_eq_v and attention_type == "full_attention")
+    text_config = getattr(config, "text_config", config)
+    attention_k_eq_v = getattr(
+        text_config, "attention_k_eq_v",
+        False) if not isinstance(text_config, dict) else text_config.get(
+            "attention_k_eq_v", False)
+    return bool(attention_k_eq_v and attention_type == "full_attention")
 
 
 def _head_dim_for_attention_type(config: ModelConfig,
                                  attention_type: str) -> int:
     """Return Gemma4's per-layer attention head dimension."""
-    if attention_type == "full_attention" and config.global_head_dim:
-        return int(config.global_head_dim)
-    return int(config.head_dim)
+    text_config = getattr(config, "text_config", config)
+    global_head_dim = getattr(
+        text_config, "global_head_dim",
+        0) if not isinstance(text_config, dict) else text_config.get(
+            "global_head_dim", 0)
+    if attention_type == "full_attention" and global_head_dim:
+        return int(global_head_dim)
+    head_dim = getattr(text_config, "head_dim", 256) if not isinstance(
+        text_config, dict) else text_config.get("head_dim", 256)
+    return int(head_dim)
 
 
 def _num_kv_heads_for_attention_type(config: ModelConfig,
                                      attention_type: str) -> int:
     """Return Gemma4's per-layer KV head count."""
+    text_config = getattr(config, "text_config", config)
+    num_global_key_value_heads = getattr(
+        text_config, "num_global_key_value_heads",
+        0) if not isinstance(text_config, dict) else text_config.get(
+            "num_global_key_value_heads", 0)
     if (_uses_attention_k_eq_v(config, attention_type)
-            and config.num_global_key_value_heads):
-        return int(config.num_global_key_value_heads)
-    return int(config.num_key_value_heads)
+            and num_global_key_value_heads):
+        return int(num_global_key_value_heads)
+    num_key_value_heads = getattr(
+        text_config, "num_key_value_heads",
+        8) if not isinstance(text_config, dict) else text_config.get(
+            "num_key_value_heads", 8)
+    return int(num_key_value_heads)
 
 
 def _kv_cache_dims_for_layer(config: ModelConfig,
@@ -106,16 +127,14 @@ def _rotary_dim_from_rope_config(config: ModelConfig,
         rope_scaling = rope_config.get("rope_scaling")
         partial_rotary_factor = float(
             rope_config.get("partial_rotary_factor",
-                            config.partial_rotary_factor))
+                            getattr(config, "partial_rotary_factor", 1.0)))
     else:
-        rope_scaling = config.rope_scaling
-        partial_rotary_factor = config.partial_rotary_factor
+        rope_scaling = getattr(config, "rope_scaling", None)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
 
     if isinstance(rope_scaling, dict):
         rope_type = str(
             rope_scaling.get("rope_type", rope_scaling.get("type", "default")))
-        if rope_type in {"default", "proportional"}:
-            return layer_head_dim
     return int(layer_head_dim * partial_rotary_factor)
 
 
@@ -169,16 +188,20 @@ def _rotary_dim_from_rope_config(config: ModelConfig,
         rope_scaling = rope_config.get("rope_scaling")
         partial_rotary_factor = float(
             rope_config.get("partial_rotary_factor",
-                            config.partial_rotary_factor))
+                            getattr(config, "partial_rotary_factor", 1.0)))
     else:
-        rope_scaling = config.rope_scaling
-        partial_rotary_factor = config.partial_rotary_factor
+        rope_scaling = getattr(config, "rope_scaling", None)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
 
+    rope_type = ""
+    if isinstance(rope_config, dict):
+        rope_type = str(rope_config.get("rope_type", ""))
     if isinstance(rope_scaling, dict):
         rope_type = str(
-            rope_scaling.get("rope_type", rope_scaling.get("type", "default")))
-        if rope_type == "proportional":
-            return effective_head_dim
+            rope_scaling.get("rope_type", rope_scaling.get("type", rope_type)))
+    if rope_type == "proportional" or rope_type == "Proportional" or not rope_type:
+        if rope_type == "proportional" or rope_type == "Proportional":
+            return int(effective_head_dim)
     return int(effective_head_dim * partial_rotary_factor)
 
 
@@ -421,9 +444,8 @@ class Gemma4Attention(Attention):
             if hasattr(self, "k_norm") and self.k_norm is not None:
                 del self.k_norm
 
-        self.qk_scale = (float(config.attention_scaling)
-                         if config.attention_scaling > 0.0 else self.head_dim**
-                         -0.5)
+        self.qk_scale = float(config.attention_scaling) if getattr(
+            config, "attention_scaling", 0.0) > 0.0 else 1.0
         if not self.is_kv_shared:
             self.v_norm = (Gemma4ValueRMSNorm(self.head_dim,
                                               config.rms_norm_eps)
@@ -800,6 +822,11 @@ class Gemma4Transformer(nn.Module):
         rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
         rope_rotary_cos_sin_full: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, Tuple, Tuple | None]:
+        import sys
+        sys._CURRENT_SLIDING_ROPE = rope_rotary_cos_sin_sliding
+        sys._CURRENT_FULL_ROPE = rope_rotary_cos_sin_full
+        if self.norm.use_gemma2_format:
+            inputs_embeds = inputs_embeds * (self.norm.weight.shape[0]**0.5)
         hidden_states = inputs_embeds
         projected_per_layer_inputs = self._project_per_layer_inputs(
             inputs_embeds)
@@ -860,11 +887,17 @@ class Gemma4ForCausalLM(CausalLM):
 
     def onnx_export_spec(self) -> OnnxSpec:
         """Return Gemma4-specific ONNX export parameters."""
-        if not self.ple_enabled and not self.config.use_dual_rope:
+        text_config = getattr(self.config, "text_config", self.config)
+        use_dual_rope = getattr(
+            self.config, "use_dual_rope",
+            getattr(text_config, "use_dual_rope", False)) if not isinstance(
+                text_config, dict) else text_config.get(
+                    "use_dual_rope", False)
+        if not self.ple_enabled and not use_dual_rope:
             return super().onnx_export_spec()
 
         config = self.config
-        if config.use_dual_rope and config.eagle_base:
+        if use_dual_rope and config.eagle_base:
             raise NotImplementedError(
                 "Gemma4 dual RoPE export is not supported for EAGLE base models."
             )
@@ -914,7 +947,7 @@ class Gemma4ForCausalLM(CausalLM):
             [f"ple_token_embeds_{i}" for i in range(num_ple_inputs)] +
             [f"past_key_values_{i}" for i in range(Na)])
 
-        if config.use_dual_rope:
+        if use_dual_rope:
             sliding_head_dim = _head_dim_for_attention_type(
                 config, "sliding_attention")
             full_head_dim = _head_dim_for_attention_type(

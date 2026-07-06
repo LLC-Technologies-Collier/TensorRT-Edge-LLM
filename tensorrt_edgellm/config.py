@@ -259,7 +259,9 @@ def _get_has_value_norm(llm_dict: Dict[str, Any], model_type: str) -> bool:
         if llm_dict.get(key) is not None:
             return bool(llm_dict[key])
 
-    return str(model_type) in {"gemma4", "gemma4_text"}
+    return str(model_type) in {
+        "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"
+    }
 
 
 @dataclass

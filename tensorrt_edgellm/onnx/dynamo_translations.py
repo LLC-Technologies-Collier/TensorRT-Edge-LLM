@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright 2026 Google LLC and contributors
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -633,7 +634,7 @@ def _kv_cache_update_onnx_translation(
     new_kv: onnxscript.FLOAT16,
     cache_indices: onnxscript.INT32,
 ) -> onnxscript.FLOAT16:
-    return _trt.TensorScatter(cache, new_kv, cache_indices)
+    return _op21.ScatterElements(cache, cache_indices, new_kv, axis=2)
 
 
 @script()

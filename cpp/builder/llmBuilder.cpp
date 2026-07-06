@@ -15,6 +15,24 @@
  * limitations under the License.
  */
 
+/*
+ * SPDX-FileCopyrightText: Copyright 2026 Google LLC and contributors
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "llmBuilder.h"
 #include "builderUtils.h"
 #include "common/bindingNames.h"
@@ -165,6 +183,48 @@ bool LLMBuilder::build()
     if (!builder || !network)
     {
         return false;
+    }
+
+    // Force dynamic dimensions for inputs_embeds, past_key_values, last_token_ids, and rope_rotary_cos_sin
+    // to bypass any static tracing specialization bugs emitted by the PyTorch dynamo exporter.
+    for (int32_t i = 0; i < network->getNbInputs(); ++i)
+    {
+        auto* input = network->getInput(i);
+        std::string name = input->getName();
+        nvinfer1::Dims dims = input->getDimensions();
+        if (name == "inputs_embeds")
+        {
+            dims.d[0] = -1;
+            dims.d[1] = -1;
+            input->setDimensions(dims);
+            LOG_INFO("C++ override: forced %s to dynamic shape", name.c_str());
+        }
+        else if (name.find("past_key_values_") != std::string::npos)
+        {
+            dims.d[0] = -1;
+            dims.d[3] = -1;
+            input->setDimensions(dims);
+            LOG_INFO("C++ override: forced %s to dynamic shape", name.c_str());
+        }
+        else if (name == "last_token_ids")
+        {
+            dims.d[0] = -1;
+            input->setDimensions(dims);
+            LOG_INFO("C++ override: forced %s to dynamic shape", name.c_str());
+        }
+        else if (name == "kvcache_start_index")
+        {
+            dims.d[0] = -1;
+            input->setDimensions(dims);
+            LOG_INFO("C++ override: forced %s to dynamic shape", name.c_str());
+        }
+        else if (name.find("rope_rotary_cos_sin") != std::string::npos)
+        {
+            dims.d[0] = -1;
+            dims.d[1] = -1;
+            input->setDimensions(dims);
+            LOG_INFO("C++ override: forced %s to dynamic shape", name.c_str());
+        }
     }
 
     // Determine ONNX file path
@@ -1072,12 +1132,13 @@ bool LLMBuilder::setupKVCacheProfiles(
         // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
         for (int i = 0; i < mNbKVCacheInputs; ++i)
         {
+            int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
             int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
-            nvinfer1::Dims minKVCacheShape = createDims({1, 2, mNumKVHeads, 0, layerHeadSize});
+            nvinfer1::Dims minKVCacheShape = createDims({1, 2, layerNumKVHeads, 0, layerHeadSize});
             nvinfer1::Dims optKVCacheShape = createDims(
-                {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+                {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
             nvinfer1::Dims maxKVCacheShape = createDims(
-                {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+                {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
 
             result &= setOptimizationProfile(&contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
                 minKVCacheShape, optKVCacheShape, maxKVCacheShape);

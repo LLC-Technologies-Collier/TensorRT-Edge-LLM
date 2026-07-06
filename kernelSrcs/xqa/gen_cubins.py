@@ -533,7 +533,7 @@ def generate_compile_arch_macro_list(compile_macro_options: list):
                     option_macro_names, option_short_names, option_combination)
             ]
             macro_values = {macro.macro_name: macro.value for macro in compile_macros}
-            if macro_values.get('HEAD_ELEMS') == 512 and arch not in (80, 86, 87, 89, 100, 101, 120, 121):
+            if macro_values.get('HEAD_ELEMS') == 512 and arch not in (80, 86, 87, 89, 100, 101, 110, 120, 121):
                 continue
             if macro_values.get('HEAD_ELEMS') == 512 and arch in (80, 87) and macro_values.get('SPEC_DEC') == 1:
                 compile_macros = override_compile_macro(
@@ -544,7 +544,7 @@ def generate_compile_arch_macro_list(compile_macro_options: list):
                 compile_macros.append(
                     CompileMacro('TILED_QKV_STAGING_HEAD_DIM512', 'tiled_qkv_staging', 1))
                 input_file_name = "mha.cu"
-            elif macro_values.get('HEAD_ELEMS') == 512 and arch in (120, 121):
+            elif macro_values.get('HEAD_ELEMS') == 512 and arch in (110, 120, 121):
                 compile_macros.append(
                     CompileMacro('XQA_2CTA_HEAD_DIM512', '2cta_head_dim512', 1))
                 input_file_name = "mha.cu"
@@ -738,13 +738,14 @@ if __name__ == "__main__":
             # Gemma 4 global attention uses 512-wide heads.
             # nqpkv=4: E4B (8 Q heads / 2 KV heads)
             # nqpkv=8: E2B (8 Q heads / 1 KV head)
+            # nqpkv=16: 12B (16 Q heads / 1 KV head)
             CompileMacroOption('DTYPE', 'dt', ['__half']),
             CompileMacroOption('HEAD_ELEMS', 'd', [512]),
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
             CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
             CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
-            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [4, 8]),
+            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [4, 8, 16]),
             CompileMacroOption('M_TILESIZE', 'm', [8]),
             CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
         ],

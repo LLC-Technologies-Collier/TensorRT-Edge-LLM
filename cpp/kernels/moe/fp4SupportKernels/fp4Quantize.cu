@@ -166,8 +166,8 @@ inline __device__ uint32_t floatToE2m1(float val)
 /// Older architectures use the software floatToE2m1 fallback.
 inline __device__ uint32_t fp32VecToE2m1(float2 (&array)[4])
 {
-    // SM100 (1000), SM101 (1010), SM110 (1100).
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1010 || __CUDA_ARCH__ == 1100)
+// SM100 (1000), SM101 (1010).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1010)
     // Hardware path
     uint32_t val;
     asm volatile(

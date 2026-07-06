@@ -111,17 +111,18 @@ def _nested_config_to_dict(sub: Any) -> Dict[str, Any]:
 def _promote_llm_subconfig(config: Any, root: Dict[str,
                                                    Any]) -> Dict[str, Any]:
     """Return the dict used for LLM architecture fields (text / nested block)."""
-    if root.get("num_attention_heads") is not None:
-        return root
-
     for name in ("llm_config", "text_config", "language_config"):
         sub = getattr(config, name, None)
         if sub is None and name in root:
             sub = root[name]
-        sub_dict = _nested_config_to_dict(sub)
-        if (sub_dict.get("hidden_size") is not None
-                and sub_dict.get("num_attention_heads") is not None):
-            return sub_dict
+        if sub is not None:
+            sub_dict = _nested_config_to_dict(sub)
+            if (sub_dict.get("hidden_size") is not None
+                    and sub_dict.get("num_attention_heads") is not None):
+                return sub_dict
+
+    if root.get("num_attention_heads") is not None:
+        return root
 
     # Qwen3-ASR / Qwen3-Omni: LLM lives at thinker_config.text_config
     thinker = root.get("thinker_config")

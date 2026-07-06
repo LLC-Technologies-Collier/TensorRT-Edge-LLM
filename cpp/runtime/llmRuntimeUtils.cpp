@@ -105,7 +105,9 @@ bool canUseOptimizedNormalRopeKernel(RopeConfig const& config, int64_t rotaryDim
     switch (rotaryDim)
     {
     case 64:
-    case 128: return true;
+    case 128:
+    case 256:
+    case 512: return true;
     default: return false;
     }
 }
